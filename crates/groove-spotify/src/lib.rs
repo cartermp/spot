@@ -302,6 +302,26 @@ async fn apply_auth_result(
             if !user_playlists.is_empty() {
                 state.playlists = user_playlists;
                 let _ = event_tx.send(EngineEvent::PlaylistsLoaded(state.playlists.clone()));
+
+                // If the queue is currently empty, pre-load the user's first playlist tracks (paused at 0:00)
+                // so Now Playing and Up Next immediately display the user's real music.
+                if state.queue.is_empty() {
+                    if let Some(first_pl) = state.playlists.first().cloned() {
+                        let initial_tracks = web_client
+                            .fetch_playlist_tracks_with_session(
+                                Some(&auth_session.session),
+                                &first_pl.spotify_uri,
+                            )
+                            .await;
+                        if !initial_tracks.is_empty() {
+                            state.current_track = initial_tracks[0].clone();
+                            state.queue = initial_tracks;
+                            state.active_playlist_id = Some(first_pl.id);
+                            state.position_secs = 0.0;
+                            state.is_playing = false;
+                        }
+                    }
+                }
             }
 
             if let Some(old_player) = player.take() {
@@ -322,8 +342,8 @@ async fn apply_auth_result(
             );
             *player_has_loaded_track = false;
 
-            // If the user already selected a non-mockup track, load it into the new player.
-            if state.current_track.id != "higher-ground" {
+            // If the user already selected a track and started playback, load it into the new player.
+            if !state.current_track.id.is_empty() && state.is_playing {
                 load_track_on_player(
                     &new_player,
                     Some(&auth_session.session),
@@ -337,22 +357,6 @@ async fn apply_auth_result(
             *live_session = Some(auth_session.session.clone());
             *player = Some(new_player);
             *player_events = Some(new_events);
-
-            // Pre-warm the Search catalog with real Spotify artists, portraits, albums, and cover art
-            let warm_client = web_client.clone();
-            let warm_session = auth_session.session;
-            let warm_tx = event_tx.clone();
-            tokio::spawn(async move {
-                let featured = warm_client
-                    .search_catalog_with_session(Some(&warm_session), "")
-                    .await;
-                let _ = warm_tx.send(EngineEvent::SearchResults {
-                    query: String::new(),
-                    artists: featured.artists,
-                    albums: featured.albums,
-                    tracks: featured.tracks,
-                });
-            });
 
             state.connection = ConnectionStatus::Connected {
                 username,
@@ -1032,29 +1036,32 @@ mod tests {
         panic!("timed out waiting for expected EngineEvent");
     }
 
+    fn sample_track(id: &str, title: &str, duration_secs: u32) -> Track {
+        Track {
+            id: id.into(),
+            spotify_uri: format!("spotify:track:{id}"),
+            title: title.into(),
+            artist: "Test Artist".into(),
+            album: "Test Album".into(),
+            duration_secs,
+            liked: false,
+            cover_art_url: None,
+            artwork_theme: groove_core::ArtworkTheme::SunriseMountainLake,
+        }
+    }
+
     #[test]
     fn play_pause_commands_toggle_playback_state() {
         let (_analyzer, producer) = SpectrumAnalyzer::new();
         let handle = spawn_engine(producer);
 
-        // Initial StateSynced should arrive immediately with is_playing == true.
+        // Initial StateSynced should arrive immediately with is_playing == false and empty queue.
         let initial = recv_until(&handle.event_rx, |evt| match evt {
             EngineEvent::StateSynced(s) => Some(*s),
             _ => None,
         });
-        assert!(initial.is_playing);
-        assert_eq!(initial.current_track.id, "higher-ground");
-
-        // TogglePlayPause -> false
-        handle
-            .command_tx
-            .send(PlayerCommand::TogglePlayPause)
-            .unwrap();
-        let is_playing = recv_until(&handle.event_rx, |evt| match evt {
-            EngineEvent::PlayStateChanged(playing) => Some(playing),
-            _ => None,
-        });
-        assert!(!is_playing);
+        assert!(!initial.is_playing);
+        assert!(initial.queue.is_empty());
 
         // Play -> true
         handle.command_tx.send(PlayerCommand::Play).unwrap();
@@ -1064,8 +1071,11 @@ mod tests {
         });
         assert!(is_playing);
 
-        // Pause -> false
-        handle.command_tx.send(PlayerCommand::Pause).unwrap();
+        // TogglePlayPause -> false
+        handle
+            .command_tx
+            .send(PlayerCommand::TogglePlayPause)
+            .unwrap();
         let is_playing = recv_until(&handle.event_rx, |evt| match evt {
             EngineEvent::PlayStateChanged(playing) => Some(playing),
             _ => None,
@@ -1078,29 +1088,37 @@ mod tests {
         let (_analyzer, producer) = SpectrumAnalyzer::new();
         let handle = spawn_engine(producer);
 
-        // Drain initial StateSynced
         let _ = recv_until(&handle.event_rx, |evt| match evt {
             EngineEvent::StateSynced(s) => Some(*s),
             _ => None,
         });
 
-        // Pause first so timer ticks don't race position assertions
-        handle.command_tx.send(PlayerCommand::Pause).unwrap();
+        handle
+            .command_tx
+            .send(PlayerCommand::PlayTrack(sample_track("t1", "Track One", 200)))
+            .unwrap();
         let _ = recv_until(&handle.event_rx, |evt| match evt {
-            EngineEvent::PlayStateChanged(playing) => Some(playing),
+            EngineEvent::StateSynced(s) if s.current_track.id == "t1" => Some(*s),
             _ => None,
         });
 
-        // NextTrack -> "golden-hours" at position 0.0
+        handle
+            .command_tx
+            .send(PlayerCommand::PlayTrack(sample_track("t2", "Track Two", 180)))
+            .unwrap();
+        let _ = recv_until(&handle.event_rx, |evt| match evt {
+            EngineEvent::StateSynced(s) if s.current_track.id == "t2" => Some(*s),
+            _ => None,
+        });
+
         handle.command_tx.send(PlayerCommand::NextTrack).unwrap();
         let after_next = recv_until(&handle.event_rx, |evt| match evt {
             EngineEvent::StateSynced(s) => Some(*s),
             _ => None,
         });
-        assert_eq!(after_next.current_track.id, "golden-hours");
+        assert_eq!(after_next.current_track.id, "t1");
         assert_eq!(after_next.position_secs, 0.0);
 
-        // PreviousTrack -> back to "higher-ground" at position 0.0
         handle
             .command_tx
             .send(PlayerCommand::PreviousTrack)
@@ -1109,16 +1127,15 @@ mod tests {
             EngineEvent::StateSynced(s) => Some(*s),
             _ => None,
         });
-        assert_eq!(after_prev.current_track.id, "higher-ground");
+        assert_eq!(after_prev.current_track.id, "t2");
         assert_eq!(after_prev.position_secs, 0.0);
     }
 
     #[test]
-    fn playlist_selection_switches_context_and_loads_curated_tracks() {
+    fn playlist_selection_switches_context() {
         let (_analyzer, producer) = SpectrumAnalyzer::new();
         let handle = spawn_engine(producer);
 
-        // Drain initial StateSynced
         let _ = recv_until(&handle.event_rx, |evt| match evt {
             EngineEvent::StateSynced(s) => Some(*s),
             _ => None,
@@ -1126,7 +1143,7 @@ mod tests {
 
         handle
             .command_tx
-            .send(PlayerCommand::SelectPlaylist("deep-work".into()))
+            .send(PlayerCommand::SelectPlaylist("custom-playlist".into()))
             .unwrap();
 
         let synced = recv_until(&handle.event_rx, |evt| match evt {
@@ -1134,26 +1151,7 @@ mod tests {
             _ => None,
         });
 
-        assert_eq!(synced.active_playlist_id.as_deref(), Some("deep-work"));
-        assert_eq!(synced.current_track.id, "glass-architecture");
-        assert_eq!(synced.position_secs, 0.0);
-        assert!(synced.is_playing);
-        assert!(
-            synced
-                .playlists
-                .iter()
-                .find(|p| p.id == "deep-work")
-                .unwrap()
-                .is_playing_context
-        );
-        assert!(
-            !synced
-                .playlists
-                .iter()
-                .find(|p| p.id == "chill-focus")
-                .unwrap()
-                .is_playing_context
-        );
+        assert_eq!(synced.active_playlist_id.as_deref(), Some("custom-playlist"));
     }
 
     #[test]
@@ -1161,13 +1159,20 @@ mod tests {
         let (_analyzer, producer) = SpectrumAnalyzer::new();
         let handle = spawn_engine(producer);
 
-        let initial = recv_until(&handle.event_rx, |evt| match evt {
+        let _ = recv_until(&handle.event_rx, |evt| match evt {
             EngineEvent::StateSynced(s) => Some(*s),
             _ => None,
         });
-        let max_dur = initial.current_track.duration_secs as f32;
 
-        // Pause so only our explicit SeekSeconds emits PositionTick
+        handle
+            .command_tx
+            .send(PlayerCommand::PlayTrack(sample_track("t1", "Track One", 240)))
+            .unwrap();
+        let _ = recv_until(&handle.event_rx, |evt| match evt {
+            EngineEvent::StateSynced(s) if s.current_track.id == "t1" => Some(*s),
+            _ => None,
+        });
+
         handle.command_tx.send(PlayerCommand::Pause).unwrap();
         let _ = recv_until(&handle.event_rx, |evt| match evt {
             EngineEvent::PlayStateChanged(_) => Some(()),
@@ -1185,20 +1190,20 @@ mod tests {
         });
         assert!((pos - 95.5).abs() < 0.01);
 
-        // Seek past track duration -> clamps to duration_secs
+        // Seek past track duration -> clamps to 240.0
         handle
             .command_tx
-            .send(PlayerCommand::SeekSeconds(max_dur + 500.0))
+            .send(PlayerCommand::SeekSeconds(900.0))
             .unwrap();
         let clamped_pos = recv_until(&handle.event_rx, |evt| match evt {
-            EngineEvent::PositionTick(p) if (p - max_dur).abs() < 0.05 => Some(p),
+            EngineEvent::PositionTick(p) if (p - 240.0).abs() < 0.05 => Some(p),
             _ => None,
         });
-        assert!((clamped_pos - max_dur).abs() < 0.01);
+        assert!((clamped_pos - 240.0).abs() < 0.01);
     }
 
     #[test]
-    fn artist_search_and_detail_fetch_albums() {
+    fn artist_detail_fallback_loads_cleanly() {
         let (_analyzer, producer) = SpectrumAnalyzer::new();
         let handle = spawn_engine(producer);
 
@@ -1209,33 +1214,13 @@ mod tests {
 
         handle
             .command_tx
-            .send(PlayerCommand::SearchCatalog("Lume".into()))
-            .unwrap();
-        let (artists, albums, tracks) = recv_until(&handle.event_rx, |evt| match evt {
-            EngineEvent::SearchResults {
-                artists,
-                albums,
-                tracks,
-                ..
-            } => Some((artists, albums, tracks)),
-            _ => None,
-        });
-        assert!(!artists.is_empty());
-        assert_eq!(artists[0].name, "Lume");
-        assert!(!albums.is_empty());
-        assert!(!tracks.is_empty());
-
-        handle
-            .command_tx
-            .send(PlayerCommand::SelectArtist("Lume".into()))
+            .send(PlayerCommand::SelectArtist("Killer Mike".into()))
             .unwrap();
         let detail = recv_until(&handle.event_rx, |evt| match evt {
             EngineEvent::ArtistDetailLoaded(d) => Some(*d),
             _ => None,
         });
-        assert_eq!(detail.artist.name, "Lume");
-        assert!(!detail.albums.is_empty());
-        assert!(!detail.top_tracks.is_empty());
+        assert_eq!(detail.artist.name, "Killer Mike");
     }
 }
 

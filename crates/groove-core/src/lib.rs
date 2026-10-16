@@ -303,164 +303,45 @@ pub struct PlaybackState {
     pub connection: ConnectionStatus,
 }
 
+impl Default for PlaybackState {
+    fn default() -> Self {
+        Self::mockup_default()
+    }
+}
+
 impl PlaybackState {
-    /// Constructs the initial player state matching the Groove design mockup.
+    /// Constructs a clean initial player state without template/placeholder music.
     pub fn mockup_default() -> Self {
-        let queue = vec![
-            Track {
-                id: "higher-ground".into(),
-                spotify_uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".into(),
-                title: "Higher Ground".into(),
-                artist: "Lume".into(),
-                album: "Solstice".into(),
-                duration_secs: 4 * 60 + 28, // 4:28
-                liked: false,
-                cover_art_url: None,
-                artwork_theme: ArtworkTheme::SunriseMountainLake,
-            },
-            Track {
-                id: "golden-hours".into(),
-                spotify_uri: "spotify:track:5FVd6KXrgO9B3JPmC8OPst".into(),
-                title: "Golden Hours".into(),
-                artist: "Kairo".into(),
-                album: "Afterglow".into(),
-                duration_secs: 3 * 60 + 16, // 3:16
-                liked: true,
-                cover_art_url: None,
-                artwork_theme: ArtworkTheme::GoldenCanyon,
-            },
-            Track {
-                id: "echoes-in-bloom".into(),
-                spotify_uri: "spotify:track:0VjIjW4GlUZAMYd2vXMi3b".into(),
-                title: "Echoes in Bloom".into(),
-                artist: "Vallé".into(),
-                album: "Nocturne".into(),
-                duration_secs: 4 * 60 + 3, // 4:03
-                liked: false,
-                cover_art_url: None,
-                artwork_theme: ArtworkTheme::MoonlitClouds,
-            },
-            Track {
-                id: "still-here".into(),
-                spotify_uri: "spotify:track:7qiZfU4dY1lWllzX7mPBI3".into(),
-                title: "Still Here".into(),
-                artist: "Nyra".into(),
-                album: "Quiet Tides".into(),
-                duration_secs: 3 * 60 + 41, // 3:41
-                liked: false,
-                cover_art_url: None,
-                artwork_theme: ArtworkTheme::MistyArch,
-            },
-            Track {
-                id: "letters-to-you".into(),
-                spotify_uri: "spotify:track:3n3Ppam7vgaVa1iaRUc9Lp".into(),
-                title: "Letters to You".into(),
-                artist: "Caspian".into(),
-                album: "Far Shores".into(),
-                duration_secs: 5 * 60 + 2, // 5:02
-                liked: true,
-                cover_art_url: None,
-                artwork_theme: ArtworkTheme::CoastalIsland,
-            },
-        ];
-
-        let playlists = vec![
-            Playlist {
-                id: "chill-focus".into(),
-                spotify_uri: "spotify:playlist:37i9dQZF1DWZeKCadgRdKQ".into(),
-                name: "Chill Focus".into(),
-                subtitle: "Ambient & post-rock for deep flow".into(),
-                track_count: 42,
-                is_playing_context: true,
-                artwork_theme: ArtworkTheme::TwilightHorizon,
-            },
-            Playlist {
-                id: "morning-light".into(),
-                spotify_uri: "spotify:playlist:37i9dQZF1DXdd3gw5QVjt9".into(),
-                name: "Morning Light".into(),
-                subtitle: "Warm acoustic & folktronica".into(),
-                track_count: 28,
-                is_playing_context: false,
-                artwork_theme: ArtworkTheme::DawnReflection,
-            },
-            Playlist {
-                id: "deep-work".into(),
-                spotify_uri: "spotify:playlist:37i9dQZF1DWZqd5JICZI0u".into(),
-                name: "Deep Work".into(),
-                subtitle: "Minimalist synth & neo-classical".into(),
-                track_count: 64,
-                is_playing_context: false,
-                artwork_theme: ArtworkTheme::AlpineMist,
-            },
-            Playlist {
-                id: "indie-favourites".into(),
-                spotify_uri: "spotify:playlist:37i9dQZF1DX2Nc3B70tvx0".into(),
-                name: "Indie Favourites".into(),
-                subtitle: "Handpicked indie & dream pop".into(),
-                track_count: 51,
-                is_playing_context: false,
-                artwork_theme: ArtworkTheme::WarmDusk,
-            },
-            Playlist {
-                id: "on-repeat".into(),
-                spotify_uri: "spotify:playlist:37i9dQZF1EpzZ5fP2nJ1sR".into(),
-                name: "On Repeat".into(),
-                subtitle: "Songs you can't put down".into(),
-                track_count: 30,
-                is_playing_context: false,
-                artwork_theme: ArtworkTheme::EmeraldRing,
-            },
-            Playlist {
-                id: "discover-weekly".into(),
-                spotify_uri: "spotify:playlist:37i9dQZEVXcJZyENOWUFo7".into(),
-                name: "Discover Weekly".into(),
-                subtitle: "Your weekly mixtape of fresh music".into(),
-                track_count: 30,
-                is_playing_context: false,
-                artwork_theme: ArtworkTheme::VioletAura,
-            },
-        ];
-
         let default_device = AudioDevice {
-            id: "macbook-pro-speakers".into(),
-            name: "MacBook Pro Speakers".into(),
+            id: "system-default".into(),
+            name: "System Default Output".into(),
             is_default: true,
             is_spotify_connect: false,
         };
 
-        let devices = vec![
-            default_device.clone(),
-            AudioDevice {
-                id: "airpods-pro".into(),
-                name: "AirPods Pro".into(),
-                is_default: false,
-                is_spotify_connect: false,
-            },
-            AudioDevice {
-                id: "studio-display-speakers".into(),
-                name: "Studio Display Speakers".into(),
-                is_default: false,
-                is_spotify_connect: false,
-            },
-        ];
-
         Self {
-            current_track: queue[0].clone(),
-            queue,
-            playlists,
-            active_playlist_id: Some("chill-focus".into()),
-            is_playing: true,
-            position_secs: 2.0 * 60.0 + 17.0, // 2:17 from mockup
+            current_track: Track {
+                id: String::new(),
+                spotify_uri: String::new(),
+                title: "Ready to Play".into(),
+                artist: "Select a playlist, album, or track".into(),
+                album: String::new(),
+                duration_secs: 0,
+                liked: false,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::SunriseMountainLake,
+            },
+            queue: Vec::new(),
+            playlists: Vec::new(),
+            active_playlist_id: None,
+            is_playing: false,
+            position_secs: 0.0,
             volume: 0.45,
             shuffle: false,
             repeat: RepeatMode::Off,
-            devices,
+            devices: vec![default_device.clone()],
             selected_device: default_device,
-            connection: ConnectionStatus::Connected {
-                username: "Alex".into(),
-                is_premium: true,
-                live_session: false,
-            },
+            connection: ConnectionStatus::Disconnected { reason: None },
         }
     }
 }
@@ -536,10 +417,9 @@ mod tests {
     #[test]
     fn mockup_default_matches_design() {
         let state = PlaybackState::mockup_default();
-        assert_eq!(state.current_track.title, "Higher Ground");
-        assert_eq!(state.current_track.artist, "Lume");
-        assert_eq!(state.queue.len(), 5);
-        assert_eq!(state.playlists.len(), 6);
-        assert_eq!(state.position_secs as u32, 137);
+        assert_eq!(state.current_track.title, "Ready to Play");
+        assert!(state.queue.is_empty());
+        assert!(state.playlists.is_empty());
+        assert!(!state.is_playing);
     }
 }

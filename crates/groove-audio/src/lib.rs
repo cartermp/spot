@@ -665,12 +665,6 @@ mod tests {
     fn enumerate_output_devices_includes_unique_devices_and_fallbacks() {
         let devices = enumerate_output_devices();
         assert!(!devices.is_empty(), "device list should never be empty");
-        assert!(
-            devices
-                .iter()
-                .any(|d| d.name.eq_ignore_ascii_case("MacBook Pro Speakers")),
-            "expected MacBook Pro Speakers in device list: {devices:?}"
-        );
         assert_eq!(
             devices.iter().filter(|d| d.is_default).count(),
             1,
