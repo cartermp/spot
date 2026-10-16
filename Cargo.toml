@@ -5,6 +5,7 @@ members = [
     "crates/groove-audio",
     "crates/groove-spotify",
     "crates/groove-app",
+    "crates/groove-verify",
 ]
 default-members = ["crates/groove-app"]
 
@@ -18,6 +19,7 @@ authors = ["Groove Contributors"]
 groove-core = { path = "crates/groove-core" }
 groove-audio = { path = "crates/groove-audio" }
 groove-spotify = { path = "crates/groove-spotify" }
+groove-verify = { path = "crates/groove-verify" }
 
 tokio = { version = "1.40", features = ["full"] }
 flume = "0.11"
@@ -46,3 +48,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # GUI
 iced = { version = "0.13", features = ["tokio", "wgpu", "image", "svg", "canvas", "advanced"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Formal Verification & Model Checking
+stateright = "0.31"
+proptest = "1.5"

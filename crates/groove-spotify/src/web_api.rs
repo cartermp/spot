@@ -1042,58 +1042,9 @@ fn extract_librespot_image_url(images: &librespot_metadata::image::Images) -> Op
 
 /// Strips inline HTML tags (such as `<a href="spotify:artist:...">...</a>`) and decodes HTML
 /// entities from Spotify artist biographies while preserving clean paragraph breaks.
+/// Delegates to the formally verified `groove_core::formal::sanitize_spotify_biography`.
 pub fn sanitize_spotify_biography(raw: &str) -> String {
-    let mut stripped = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '<' {
-            let mut tag = String::new();
-            for tc in chars.by_ref() {
-                if tc == '>' {
-                    break;
-                }
-                tag.push(tc);
-            }
-            let tag_lower = tag.trim().to_ascii_lowercase();
-            if tag_lower.starts_with("br")
-                || tag_lower == "/p"
-                || tag_lower.starts_with("p ")
-                || tag_lower == "p"
-            {
-                stripped.push('\n');
-            }
-        } else {
-            stripped.push(ch);
-        }
-    }
-
-    let decoded = stripped
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&#x27;", "'")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&nbsp;", " ")
-        .replace("&ndash;", "–")
-        .replace("&mdash;", "—")
-        .replace("&hellip;", "…")
-        .replace("&#8211;", "–")
-        .replace("&#8212;", "—")
-        .replace("&#8217;", "’")
-        .replace("&#8220;", "“")
-        .replace("&#8221;", "”");
-
-    let mut paragraphs = Vec::new();
-    for line in decoded.lines() {
-        let collapsed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !collapsed.is_empty() {
-            paragraphs.push(collapsed);
-        }
-    }
-    paragraphs.join("\n\n")
+    groove_core::sanitize_spotify_biography(raw)
 }
 
 fn normalize_artist_uri(input: &str) -> Option<String> {

@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use groove_audio::AudioSampleProducer;
+use groove_core::sanitize_unit_float;
 use librespot_playback::{
     audio_backend::{self, Sink, SinkResult},
     config::AudioFormat,
@@ -31,7 +32,7 @@ impl Default for AtomicVolumeScaler {
 
 impl AtomicVolumeScaler {
     pub fn new(initial_volume: f32) -> Self {
-        let clamped = initial_volume.clamp(0.0, 1.0);
+        let clamped = sanitize_unit_float(initial_volume, 0.45);
         Self {
             volume_bits: Arc::new(AtomicU32::new(clamped.to_bits())),
         }
@@ -39,13 +40,13 @@ impl AtomicVolumeScaler {
 
     #[inline]
     pub fn set(&self, volume: f32) {
-        let clamped = volume.clamp(0.0, 1.0);
+        let clamped = sanitize_unit_float(volume, self.get());
         self.volume_bits.store(clamped.to_bits(), Ordering::Relaxed);
     }
 
     #[inline]
     pub fn get(&self) -> f32 {
-        f32::from_bits(self.volume_bits.load(Ordering::Relaxed)).clamp(0.0, 1.0)
+        sanitize_unit_float(f32::from_bits(self.volume_bits.load(Ordering::Relaxed)), 0.45)
     }
 }
 

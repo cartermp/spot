@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+pub mod formal;
+pub use formal::{
+    advance_queue_verified, coprime_shuffle_step, gcd_usize, merge_devices_verified,
+    resolve_playable_track_candidate, sanitize_pcm_sample, sanitize_position_secs,
+    sanitize_spotify_biography, sanitize_unit_float, select_device_verified, summarize_artist_bio,
+    FormalInvariant, InvariantViolation, NavHistoryMachine, NavRouteTarget, RecentSearchEntry,
+    RecentSearchKind, RecentSearchStore, VerifiedTransportAction,
+};
+
 /// Number of logarithmically spaced frequency bands used by the ribbon visualizer.
 pub const SPECTRUM_BANDS: usize = 32;
 
@@ -265,15 +274,25 @@ impl Default for SpectrumFrame {
 impl SpectrumFrame {
     /// Generates an organic, studio-grade multi-band spectrum envelope matching the mockup's wave shape
     /// when audio is paused or running in preview mode.
+    /// Total over all IEEE-754 `f32` values (`NaN`, `±Inf`, negative phases).
     pub fn calm_preview(phase: f32) -> Self {
+        let max_phase = 20.0 * std::f32::consts::TAU;
+        let clean_phase = if phase.is_finite() {
+            phase.rem_euclid(max_phase)
+        } else {
+            0.0
+        };
         let mut bands = [0.0f32; SPECTRUM_BANDS];
         for (i, band) in bands.iter_mut().enumerate() {
             let x = i as f32 / (SPECTRUM_BANDS - 1) as f32;
             let envelope = (x * std::f32::consts::PI).sin().powi(2);
-            let wave1 = (x * 6.5 + phase * 1.1).sin() * 0.28;
-            let wave2 = (x * 13.0 - phase * 0.7).cos() * 0.16;
+            let wave1 = (x * 6.5 + clean_phase * 1.1).sin() * 0.28;
+            let wave2 = (x * 13.0 - clean_phase * 0.7).cos() * 0.16;
             let center_boost = (-((x - 0.52) * 4.2).powi(2)).exp() * 0.38;
-            *band = ((0.36 + wave1 + wave2 + center_boost) * envelope).clamp(0.02, 1.0);
+            *band = sanitize_unit_float(
+                ((0.36 + wave1 + wave2 + center_boost) * envelope).clamp(0.02, 1.0),
+                0.02,
+            );
         }
         Self {
             bands,
@@ -281,7 +300,7 @@ impl SpectrumFrame {
             bass_energy: 0.62,
             mid_energy: 0.74,
             high_energy: 0.48,
-            phase,
+            phase: clean_phase,
         }
     }
 }

@@ -2,7 +2,10 @@ use std::f32::consts::{PI, TAU};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use groove_core::{AudioDevice, PlaybackState, SpectrumFrame, SPECTRUM_BANDS};
+use groove_core::{
+    sanitize_pcm_sample, sanitize_unit_float, AudioDevice, FormalInvariant, InvariantViolation,
+    PlaybackState, SpectrumFrame, SPECTRUM_BANDS,
+};
 use realfft::num_complex::Complex;
 use realfft::{RealFftPlanner, RealToComplex};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -63,11 +66,7 @@ impl AudioSampleProducer {
 
         if channels == 1 {
             for &sample in samples {
-                let clean = if sample.is_finite() {
-                    sample.clamp(-1.0, 1.0)
-                } else {
-                    0.0
-                };
+                let clean = sanitize_pcm_sample(sample);
                 if prod.push(clean).is_err() {
                     break;
                 }
@@ -76,11 +75,11 @@ impl AudioSampleProducer {
             for frame in samples.chunks(channels) {
                 let mut sum = 0.0f32;
                 for &sample in frame {
-                    if sample.is_finite() {
-                        sum += sample;
-                    }
+                    // Sanitize each channel to [-1.0, 1.0] BEFORE summing so multi-channel
+                    // extreme finite values (e.g. f32::MAX + -f32::MAX) never overflow to ±Inf / NaN.
+                    sum += sanitize_pcm_sample(sample);
                 }
-                let mono = (sum / frame.len() as f32).clamp(-1.0, 1.0);
+                let mono = sanitize_pcm_sample(sum / frame.len() as f32);
                 if prod.push(mono).is_err() {
                     break;
                 }
@@ -251,29 +250,32 @@ impl SpectrumAnalyzer {
         };
 
         for (smoothed, &target) in self.smoothed_bands.iter_mut().zip(target_bands.iter()) {
-            let clamped_target = target.clamp(0.0, 1.0);
-            let coeff = if clamped_target > *smoothed {
+            let clamped_target = sanitize_unit_float(target, 0.0);
+            let prev = sanitize_unit_float(*smoothed, 0.0);
+            let coeff = if clamped_target > prev {
                 ATTACK_COEFF
             } else {
                 RELEASE_COEFF
             };
-            *smoothed = (*smoothed + (clamped_target - *smoothed) * coeff).clamp(0.0, 1.0);
+            *smoothed = sanitize_unit_float(prev + (clamped_target - prev) * coeff, 0.0);
         }
 
         let sum_sq: f32 = self.smoothed_bands.iter().map(|&b| b * b).sum();
-        let rms_energy = (sum_sq / SPECTRUM_BANDS as f32).sqrt().clamp(0.0, 1.0);
-        let bass_energy = band_group_energy(&self.smoothed_bands[0..6]);
-        let mid_energy = band_group_energy(&self.smoothed_bands[6..20]);
-        let high_energy = band_group_energy(&self.smoothed_bands[20..32]);
+        let rms_energy = sanitize_unit_float((sum_sq / SPECTRUM_BANDS as f32).sqrt(), 0.0);
+        let bass_energy = sanitize_unit_float(band_group_energy(&self.smoothed_bands[0..6]), 0.0);
+        let mid_energy = sanitize_unit_float(band_group_energy(&self.smoothed_bands[6..20]), 0.0);
+        let high_energy = sanitize_unit_float(band_group_energy(&self.smoothed_bands[20..32]), 0.0);
 
-        SpectrumFrame {
+        let frame = SpectrumFrame {
             bands: self.smoothed_bands,
             rms_energy,
             bass_energy,
             mid_energy,
             high_energy,
             phase: self.phase,
-        }
+        };
+        debug_assert!(frame.check_invariants().is_ok());
+        frame
     }
 
     /// Runs the 2048-point Hann-windowed real FFT and maps bins `1..=900` into 32 normalized dB bands.
@@ -331,7 +333,7 @@ impl SpectrumAnalyzer {
 }
 
 /// Precomputes 33 strictly increasing logarithmic bin boundaries across bins `1..=900`.
-fn compute_log_bin_edges() -> [usize; SPECTRUM_BANDS + 1] {
+pub fn compute_log_bin_edges() -> [usize; SPECTRUM_BANDS + 1] {
     let mut edges = [MIN_FFT_BIN; SPECTRUM_BANDS + 1];
     let ratio = MAX_FFT_BIN as f32 / MIN_FFT_BIN as f32;
 
@@ -346,6 +348,43 @@ fn compute_log_bin_edges() -> [usize; SPECTRUM_BANDS + 1] {
 
     edges[SPECTRUM_BANDS] = MAX_FFT_BIN;
     edges
+}
+
+/// Formally verifies that `compute_log_bin_edges` forms a strictly increasing partition of `[MIN_FFT_BIN, MAX_FFT_BIN]`.
+pub fn verify_log_bin_edges_partition() -> Result<[usize; SPECTRUM_BANDS + 1], InvariantViolation> {
+    let edges = compute_log_bin_edges();
+    if edges[0] != MIN_FFT_BIN {
+        return Err(InvariantViolation {
+            code: "INV-D4",
+            subsystem: "SpectrumAnalyzer",
+            details: format!("edges[0] = {} != MIN_FFT_BIN ({MIN_FFT_BIN})", edges[0]),
+        });
+    }
+    if edges[SPECTRUM_BANDS] != MAX_FFT_BIN {
+        return Err(InvariantViolation {
+            code: "INV-D4",
+            subsystem: "SpectrumAnalyzer",
+            details: format!(
+                "edges[{SPECTRUM_BANDS}] = {} != MAX_FFT_BIN ({MAX_FFT_BIN})",
+                edges[SPECTRUM_BANDS]
+            ),
+        });
+    }
+    for k in 0..SPECTRUM_BANDS {
+        if edges[k] >= edges[k + 1] {
+            return Err(InvariantViolation {
+                code: "INV-D4",
+                subsystem: "SpectrumAnalyzer",
+                details: format!(
+                    "non-monotonic bin edges at band {k}: edges[{k}]={} >= edges[{}]={}",
+                    edges[k],
+                    k + 1,
+                    edges[k + 1]
+                ),
+            });
+        }
+    }
+    Ok(edges)
 }
 
 /// Synthesizes a rich, musical 32-band harmonic spectrum envelope when playing in preview/demo mode.

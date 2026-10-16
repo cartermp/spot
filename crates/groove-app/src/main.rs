@@ -6,9 +6,12 @@ mod visualizer;
 use artwork::{download_and_decode_artwork, ArtworkCache};
 use groove_audio::SpectrumAnalyzer;
 use groove_core::{
-    format_compact_count, format_seconds, AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary,
-    AudioDevice, ConnectionStatus, EngineEvent, NavSection, PlaybackState, PlayerCommand,
-    RepeatMode, SpectrumFrame, Track,
+    format_compact_count, format_seconds, merge_devices_verified, sanitize_position_secs,
+    sanitize_unit_float, select_device_verified, summarize_artist_bio, AlbumDetail, AlbumSummary,
+    ArtistDetail, ArtistSummary, AudioDevice, ConnectionStatus, EngineEvent, FormalInvariant,
+    InvariantViolation, NavHistoryMachine, NavRouteTarget, NavSection, PlaybackState,
+    PlayerCommand, RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode,
+    SpectrumFrame, Track, VerifiedTransportAction,
 };
 use groove_spotify::{spawn_engine, EngineHandle};
 use iced::alignment::{Horizontal, Vertical};
@@ -18,7 +21,6 @@ use iced::widget::{
 };
 use iced::window;
 use iced::{Alignment, Element, Length, Padding, Size, Subscription, Task, Theme};
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 use theme::{palette, INSTRUMENT_SERIF_BYTES, SERIF_FONT};
@@ -141,33 +143,10 @@ impl StageRoute {
     }
 }
 
-/// Kind of item stored in the "Recently Searched" history.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RecentSearchKind {
-    Query,
-    Artist { uri: String },
-    Album { uri: String, artist_name: String },
-    Track { uri: String, artist_name: String },
-}
-
-impl RecentSearchKind {
-    pub fn badge_label(&self) -> &'static str {
-        match self {
-            RecentSearchKind::Query => "SEARCH",
-            RecentSearchKind::Artist { .. } => "ARTIST",
-            RecentSearchKind::Album { .. } => "ALBUM",
-            RecentSearchKind::Track { .. } => "TRACK",
-        }
+impl NavRouteTarget for StageRoute {
+    fn matches_target(&self, other: &Self) -> bool {
+        StageRoute::matches_target(self, other)
     }
-}
-
-/// Persisted entry in the "Recently Searched" bar.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecentSearchEntry {
-    pub label: String,
-    pub subtitle: String,
-    pub query: String,
-    pub kind: RecentSearchKind,
 }
 
 #[derive(Debug, Clone)]
@@ -214,15 +193,14 @@ pub enum Message {
 pub struct GrooveApp {
     state: PlaybackState,
     active_nav: NavSection,
-    nav_history: Vec<StageRoute>,
-    nav_index: usize,
+    nav_history: NavHistoryMachine<StageRoute>,
     analyzer: SpectrumAnalyzer,
     spectrum: SpectrumFrame,
     engine: EngineHandle,
     artwork: ArtworkCache,
     scrubbing_position: Option<f32>,
     search_query: String,
-    recent_searches: Vec<RecentSearchEntry>,
+    recent_searches: RecentSearchStore,
     search_artists: Vec<ArtistSummary>,
     search_albums: Vec<AlbumSummary>,
     search_results: Vec<Track>,
@@ -233,22 +211,25 @@ pub struct GrooveApp {
     show_track_details_banner: bool,
 }
 
+impl FormalInvariant for GrooveApp {
+    fn check_invariants(&self) -> Result<(), InvariantViolation> {
+        self.state.check_invariants()?;
+        self.nav_history.check_invariants()?;
+        self.recent_searches.check_invariants()?;
+        self.spectrum.check_invariants()?;
+        Ok(())
+    }
+}
+
 impl GrooveApp {
     pub fn new() -> (Self, Task<Message>) {
         let (analyzer, sample_producer) = SpectrumAnalyzer::new();
         let engine = spawn_engine(sample_producer);
         let mut state = PlaybackState::mockup_default();
 
-        // Discover real CoreAudio output devices immediately on startup
+        // Discover real CoreAudio output devices immediately on startup while preserving INV-P6
         let discovered = groove_audio::enumerate_output_devices();
-        if !discovered.is_empty() {
-            if let Some(def) = discovered.iter().find(|d| d.is_default).cloned() {
-                state.selected_device = def;
-            } else if let Some(first) = discovered.first().cloned() {
-                state.selected_device = first;
-            }
-            state.devices = discovered;
-        }
+        merge_devices_verified(&mut state, discovered);
         tracing::info!(
             "[UI] GrooveApp initialized (selected_device='{}', is_default={})",
             state.selected_device.name,
@@ -257,72 +238,60 @@ impl GrooveApp {
 
         let recent_searches = load_recent_searches();
 
-        (
-            Self {
-                state,
-                active_nav: NavSection::NowPlaying,
-                nav_history: vec![StageRoute::Section(NavSection::NowPlaying)],
-                nav_index: 0,
-                analyzer,
-                spectrum: SpectrumFrame::calm_preview(0.0),
-                engine,
-                artwork: ArtworkCache::new(),
-                scrubbing_position: None,
-                search_query: String::new(),
-                recent_searches,
-                search_artists: Vec::new(),
-                search_albums: Vec::new(),
-                search_results: Vec::new(),
-                selected_artist: None,
-                selected_album: None,
-                artist_bio_expanded: false,
-                artist_top_tracks_expanded: false,
-                show_track_details_banner: false,
-            },
-            Task::none(),
-        )
+        let app = Self {
+            state,
+            active_nav: NavSection::NowPlaying,
+            nav_history: NavHistoryMachine::new(StageRoute::Section(NavSection::NowPlaying), 32),
+            analyzer,
+            spectrum: SpectrumFrame::calm_preview(0.0),
+            engine,
+            artwork: ArtworkCache::new(),
+            scrubbing_position: None,
+            search_query: String::new(),
+            recent_searches,
+            search_artists: Vec::new(),
+            search_albums: Vec::new(),
+            search_results: Vec::new(),
+            selected_artist: None,
+            selected_album: None,
+            artist_bio_expanded: false,
+            artist_top_tracks_expanded: false,
+            show_track_details_banner: false,
+        };
+        debug_assert!(app.check_invariants().is_ok());
+
+        (app, Task::none())
     }
 
     fn current_route(&self) -> &StageRoute {
-        self.nav_history
-            .get(self.nav_index)
-            .unwrap_or(&StageRoute::Section(NavSection::NowPlaying))
+        self.nav_history.current()
     }
 
     fn can_go_back(&self) -> bool {
-        self.nav_index > 0
+        self.nav_history.can_go_back()
     }
 
     fn can_go_forward(&self) -> bool {
-        self.nav_index + 1 < self.nav_history.len()
+        self.nav_history.can_go_forward()
     }
 
     fn push_route(&mut self, route: StageRoute) {
         if let StageRoute::Section(sec) = &route {
             self.active_nav = *sec;
         }
-        if self.current_route().matches_target(&route) {
-            if let Some(slot) = self.nav_history.get_mut(self.nav_index) {
-                *slot = route;
-            }
-            return;
-        }
-        self.nav_history.truncate(self.nav_index + 1);
         self.nav_history.push(route);
-        if self.nav_history.len() > 32 {
-            self.nav_history.remove(0);
-        }
-        self.nav_index = self.nav_history.len() - 1;
+        debug_assert!(self.nav_history.check_invariants().is_ok());
         let trail: Vec<String> = self
             .nav_history
+            .entries()
             .iter()
-            .take(self.nav_index + 1)
+            .take(self.nav_history.index() + 1)
             .map(|r| r.breadcrumb_label())
             .collect();
         tracing::info!(
             "[Nav] Route pushed (index={}/{}) -> {}",
-            self.nav_index,
-            self.nav_history.len(),
+            self.nav_history.index(),
+            self.nav_history.entries().len(),
             trail.join(" › ")
         );
     }
@@ -331,14 +300,15 @@ impl GrooveApp {
         let route = self.current_route().clone();
         let trail: Vec<String> = self
             .nav_history
+            .entries()
             .iter()
-            .take(self.nav_index + 1)
+            .take(self.nav_history.index() + 1)
             .map(|r| r.breadcrumb_label())
             .collect();
         tracing::info!(
             "[Nav] Activated history route (index={}/{}) -> {}",
-            self.nav_index,
-            self.nav_history.len(),
+            self.nav_history.index(),
+            self.nav_history.entries().len(),
             trail.join(" › ")
         );
 
@@ -481,13 +451,16 @@ impl GrooveApp {
     }
 
     fn record_recent_search_entry(&mut self, entry: RecentSearchEntry) {
-        record_recent_entry(&mut self.recent_searches, entry);
-        save_recent_searches(&self.recent_searches);
+        if self.recent_searches.record_entry(entry) {
+            debug_assert!(self.recent_searches.check_invariants().is_ok());
+            save_recent_searches(self.recent_searches.entries());
+        }
     }
 
     fn record_recent_query_from_search(&mut self, query: &str) {
-        if record_recent_query(&mut self.recent_searches, query) {
-            save_recent_searches(&self.recent_searches);
+        if self.recent_searches.record_typing_query(query) {
+            debug_assert!(self.recent_searches.check_invariants().is_ok());
+            save_recent_searches(self.recent_searches.entries());
         }
     }
 
@@ -534,20 +507,17 @@ impl GrooveApp {
                 }
             }
             Message::NavigateBack => {
-                if self.can_go_back() {
-                    self.nav_index -= 1;
+                if self.nav_history.go_back() {
                     self.activate_current_route();
                 }
             }
             Message::NavigateForward => {
-                if self.can_go_forward() {
-                    self.nav_index += 1;
+                if self.nav_history.go_forward() {
                     self.activate_current_route();
                 }
             }
             Message::NavigateHistory(idx) => {
-                if idx < self.nav_history.len() && idx != self.nav_index {
-                    self.nav_index = idx;
+                if idx != self.nav_history.index() && self.nav_history.jump_to(idx) {
                     self.activate_current_route();
                 }
             }
@@ -568,8 +538,9 @@ impl GrooveApp {
                 let _ = self.engine.command_tx.send(PlayerCommand::PreviousTrack);
             }
             Message::SeekChanged(val) => {
-                self.scrubbing_position = Some(val);
-                self.state.position_secs = val;
+                let sanitized = sanitize_position_secs(val, self.state.current_track.duration_secs);
+                self.scrubbing_position = Some(sanitized);
+                self.state.position_secs = sanitized;
             }
             Message::SeekReleased => {
                 if let Some(pos) = self.scrubbing_position.take() {
@@ -578,24 +549,24 @@ impl GrooveApp {
                 }
             }
             Message::VolumeChanged(vol) => {
-                self.state.volume = vol.clamp(0.0, 1.0);
+                self.state.volume = sanitize_unit_float(vol, self.state.volume);
                 let _ = self
                     .engine
                     .command_tx
                     .send(PlayerCommand::SetVolume(self.state.volume));
             }
             Message::ToggleShuffle => {
-                self.state.shuffle = !self.state.shuffle;
+                self.state.apply_verified_action(VerifiedTransportAction::ToggleShuffle);
                 tracing::info!("[UI] ToggleShuffle -> {}", self.state.shuffle);
                 let _ = self.engine.command_tx.send(PlayerCommand::ToggleShuffle);
             }
             Message::CycleRepeat => {
-                self.state.repeat = self.state.repeat.next();
+                self.state.apply_verified_action(VerifiedTransportAction::CycleRepeat);
                 tracing::info!("[UI] CycleRepeat -> {:?}", self.state.repeat);
                 let _ = self.engine.command_tx.send(PlayerCommand::CycleRepeat);
             }
             Message::ToggleLike => {
-                self.state.current_track.liked = !self.state.current_track.liked;
+                self.state.apply_verified_action(VerifiedTransportAction::ToggleLikeCurrent);
                 tracing::info!(
                     "[UI] ToggleLike ('{}') -> {}",
                     self.state.current_track.title,
@@ -679,8 +650,7 @@ impl GrooveApp {
                 tracing::info!("[UI] CloseArtistView -> NavigateBack");
                 self.artist_bio_expanded = false;
                 self.artist_top_tracks_expanded = false;
-                if self.can_go_back() {
-                    self.nav_index -= 1;
+                if self.nav_history.go_back() {
                     self.activate_current_route();
                 } else {
                     self.push_route(StageRoute::Section(NavSection::Search));
@@ -805,6 +775,10 @@ impl GrooveApp {
                             detail.album.title
                         );
                         self.state.queue = detail.tracks.clone();
+                        self.state
+                            .apply_verified_action(VerifiedTransportAction::PlayTrack(
+                                chosen.clone(),
+                            ));
                         let _ = self
                             .engine
                             .command_tx
@@ -849,7 +823,7 @@ impl GrooveApp {
                     device.name,
                     device.id
                 );
-                self.state.selected_device = device.clone();
+                select_device_verified(&mut self.state, device.clone());
                 let _ = self
                     .engine
                     .command_tx
@@ -941,16 +915,15 @@ impl GrooveApp {
                 }
             }
             Message::RemoveRecentSearch(idx) => {
-                if idx < self.recent_searches.len() {
-                    let removed = self.recent_searches.remove(idx);
+                if let Some(removed) = self.recent_searches.remove_at(idx) {
                     tracing::info!("[UI] RemoveRecentSearch({idx}) -> '{}'", removed.label);
-                    save_recent_searches(&self.recent_searches);
+                    save_recent_searches(self.recent_searches.entries());
                 }
             }
             Message::ClearRecentSearches => {
                 tracing::info!("[UI] ClearRecentSearches");
                 self.recent_searches.clear();
-                save_recent_searches(&self.recent_searches);
+                save_recent_searches(self.recent_searches.entries());
             }
             Message::ToggleTrackMenu => {
                 self.show_track_details_banner = !self.show_track_details_banner;
@@ -1051,7 +1024,8 @@ impl GrooveApp {
             }
             EngineEvent::PositionTick(pos) => {
                 if self.scrubbing_position.is_none() {
-                    self.state.position_secs = pos;
+                    self.state.position_secs =
+                        sanitize_position_secs(pos, self.state.current_track.duration_secs);
                 }
             }
             EngineEvent::PlayStateChanged(playing) => {
@@ -1082,7 +1056,7 @@ impl GrooveApp {
                     "[UI] EngineEvent::DevicesUpdated ({} devices)",
                     devices.len()
                 );
-                self.state.devices = devices;
+                merge_devices_verified(&mut self.state, devices);
             }
             EngineEvent::ConnectionUpdated(conn) => {
                 tracing::info!("[UI] EngineEvent::ConnectionUpdated -> {:?}", conn);
@@ -1122,9 +1096,7 @@ impl GrooveApp {
                 self.selected_artist = Some(*detail);
                 self.artist_bio_expanded = false;
                 self.artist_top_tracks_expanded = false;
-                if let Some(StageRoute::Artist { id_or_uri, label }) =
-                    self.nav_history.get_mut(self.nav_index)
-                {
+                if let StageRoute::Artist { id_or_uri, label } = self.nav_history.current_mut() {
                     *id_or_uri = loaded_uri;
                     *label = loaded_name;
                 }
@@ -1141,12 +1113,12 @@ impl GrooveApp {
                 let loaded_artist_name = detail.album.artist_name.clone();
                 let loaded_artist_uri = detail.artist_uri.clone();
                 self.selected_album = Some(*detail);
-                if let Some(StageRoute::Album {
+                if let StageRoute::Album {
                     id_or_uri,
                     label,
                     artist_name,
                     artist_uri,
-                }) = self.nav_history.get_mut(self.nav_index)
+                } = self.nav_history.current_mut()
                 {
                     *id_or_uri = loaded_uri;
                     *label = loaded_title;
@@ -1396,12 +1368,11 @@ impl GrooveApp {
                 artist_uri,
                 ..
             } => {
-                let prev_is_same_artist = self.nav_index > 0
-                    && matches!(
-                        (&self.nav_history.get(self.nav_index - 1), artist_name),
-                        (Some(StageRoute::Artist { label, .. }), Some(a_name))
-                            if label.eq_ignore_ascii_case(a_name)
-                    );
+                let prev_is_same_artist = matches!(
+                    (self.nav_history.previous_entry(), artist_name),
+                    (Some(StageRoute::Artist { label, .. }), Some(a_name))
+                        if label.eq_ignore_ascii_case(a_name)
+                );
 
                 if prev_is_same_artist {
                     let artist_label = artist_name
@@ -1425,7 +1396,7 @@ impl GrooveApp {
                     if self.can_go_back() {
                         let prev_label = self
                             .nav_history
-                            .get(self.nav_index.saturating_sub(1))
+                            .previous_entry()
                             .map(|r| truncate_nav_label(r.label(), 20))
                             .unwrap_or_else(|| "Back".to_string());
                         nav_row = nav_row.push(
@@ -1460,7 +1431,7 @@ impl GrooveApp {
             StageRoute::Artist { .. } => {
                 let back_label = self
                     .nav_history
-                    .get(self.nav_index.saturating_sub(1))
+                    .previous_entry()
                     .map(|r| truncate_nav_label(r.label(), 20))
                     .unwrap_or_else(|| "Search".to_string());
                 let back_msg = if self.can_go_back() {
@@ -1489,7 +1460,7 @@ impl GrooveApp {
         if self.can_go_forward() {
             if let Some(
                 StageRoute::Artist { label, .. } | StageRoute::Album { label, .. },
-            ) = self.nav_history.get(self.nav_index + 1)
+            ) = self.nav_history.next_entry()
             {
                 nav_row = nav_row.push(
                     button(
@@ -1933,8 +1904,13 @@ impl GrooveApp {
             .align_y(Alignment::Center);
 
             let mut chips_grid = column![].spacing(7);
-            let indexed_recent: Vec<(usize, &RecentSearchEntry)> =
-                self.recent_searches.iter().enumerate().take(6).collect();
+            let indexed_recent: Vec<(usize, &RecentSearchEntry)> = self
+                .recent_searches
+                .entries()
+                .iter()
+                .enumerate()
+                .take(6)
+                .collect();
             for chunk in indexed_recent.chunks(3) {
                 let mut r = row![].spacing(8);
                 for (idx, entry) in chunk {
@@ -2528,12 +2504,11 @@ impl GrooveApp {
             .clone()
             .unwrap_or_else(|| detail.album.artist_name.clone());
 
-        let prev_is_same_artist = self.nav_index > 0
-            && matches!(
-                self.nav_history.get(self.nav_index - 1),
-                Some(StageRoute::Artist { label, .. })
-                    if label.eq_ignore_ascii_case(&detail.album.artist_name)
-            );
+        let prev_is_same_artist = matches!(
+            self.nav_history.previous_entry(),
+            Some(StageRoute::Artist { label, .. })
+                if label.eq_ignore_ascii_case(&detail.album.artist_name)
+        );
 
         let to_artist_msg = if prev_is_same_artist {
             Message::NavigateBack
@@ -2829,41 +2804,6 @@ impl GrooveApp {
     }
 }
 
-/// Sanitizes an artist biography (stripping inline Spotify `<a href="...">` tags) and returns
-/// `(preview_excerpt, full_clean_bio, has_more_bio)`.
-fn summarize_artist_bio(raw: &str, max_chars: usize) -> (String, String, bool) {
-    let clean = groove_spotify::web_api::sanitize_spotify_biography(raw);
-    let single_line: String = clean.split_whitespace().collect::<Vec<_>>().join(" ");
-    if single_line.chars().count() <= max_chars {
-        return (single_line, clean, false);
-    }
-
-    // Prefer truncating at a sentence boundary if one falls in a nice range [90..=max_chars],
-    // otherwise truncate cleanly at the last word boundary <= max_chars.
-    let mut byte_cutoff = single_line.len();
-    for (char_idx, (byte_idx, _)) in single_line.char_indices().enumerate() {
-        if char_idx == max_chars {
-            byte_cutoff = byte_idx;
-            break;
-        }
-    }
-    let slice = &single_line[..byte_cutoff];
-
-    if let Some(dot_pos) = slice.rfind(". ") {
-        if slice[..=dot_pos].chars().count() >= 90 {
-            return (slice[..=dot_pos].trim().to_string(), clean, true);
-        }
-    }
-
-    let word_trimmed = match slice.rfind(' ') {
-        Some(space_pos) if space_pos > 40 => &slice[..space_pos],
-        _ => slice,
-    }
-    .trim_end_matches(|c: char| matches!(c, ',' | ';' | ':' | '-' | '–' | '—'));
-
-    (format!("{word_trimmed}…"), clean, true)
-}
-
 fn truncate_nav_label(label: &str, max_chars: usize) -> String {
     let trimmed = label.trim();
     if trimmed.chars().count() <= max_chars {
@@ -2880,16 +2820,13 @@ fn recent_searches_file_path() -> PathBuf {
         .join("recent_searches.json")
 }
 
-fn load_recent_searches() -> Vec<RecentSearchEntry> {
+fn load_recent_searches() -> RecentSearchStore {
     let path = recent_searches_file_path();
     let Ok(bytes) = std::fs::read(&path) else {
-        return Vec::new();
+        return RecentSearchStore::new(10);
     };
-    serde_json::from_slice::<Vec<RecentSearchEntry>>(&bytes)
-        .unwrap_or_default()
-        .into_iter()
-        .take(10)
-        .collect()
+    let raw = serde_json::from_slice::<Vec<RecentSearchEntry>>(&bytes).unwrap_or_default();
+    RecentSearchStore::from_loaded(raw, 10)
 }
 
 fn save_recent_searches(entries: &[RecentSearchEntry]) {
@@ -2900,53 +2837,6 @@ fn save_recent_searches(entries: &[RecentSearchEntry]) {
     if let Ok(json) = serde_json::to_vec_pretty(entries) {
         let _ = std::fs::write(&path, json);
     }
-}
-
-fn record_recent_entry(list: &mut Vec<RecentSearchEntry>, entry: RecentSearchEntry) {
-    if entry.label.trim().is_empty() {
-        return;
-    }
-    list.retain(|existing| {
-        !(existing.kind.badge_label() == entry.kind.badge_label()
-            && existing.label.eq_ignore_ascii_case(&entry.label))
-    });
-    list.insert(0, entry);
-    list.truncate(10);
-}
-
-/// Records a debounced search query while coalescing live typing prefixes
-/// (e.g. "m" -> "ma" -> "mas" -> "mastodon" updates the top entry in-place).
-fn record_recent_query(list: &mut Vec<RecentSearchEntry>, raw_query: &str) -> bool {
-    let query = raw_query.trim();
-    if query.chars().count() < 2 {
-        return false;
-    }
-
-    if let Some(first) = list.first_mut() {
-        if first.kind == RecentSearchKind::Query {
-            let prev_lower = first.label.to_lowercase();
-            let next_lower = query.to_lowercase();
-            if next_lower.starts_with(&prev_lower) || prev_lower.starts_with(&next_lower) {
-                if next_lower.len() >= prev_lower.len() {
-                    first.label = query.to_string();
-                    first.query = query.to_string();
-                    return true;
-                }
-                return false;
-            }
-        }
-    }
-
-    record_recent_entry(
-        list,
-        RecentSearchEntry {
-            label: query.to_string(),
-            subtitle: "Search query".to_string(),
-            query: query.to_string(),
-            kind: RecentSearchKind::Query,
-        },
-    );
-    true
 }
 
 #[cfg(test)]
@@ -2967,26 +2857,28 @@ mod tests {
 
     #[test]
     fn recent_query_coalesces_incremental_typing_and_deduplicates() {
-        let mut recent = Vec::new();
-        assert!(record_recent_query(&mut recent, "ma"));
-        assert!(record_recent_query(&mut recent, "mast"));
-        assert!(record_recent_query(&mut recent, "mastodon"));
+        let mut recent = RecentSearchStore::new(10);
+        assert!(recent.record_typing_query("ma"));
+        assert!(recent.record_typing_query("mast"));
+        assert!(recent.record_typing_query("mastodon"));
         assert_eq!(recent.len(), 1);
-        assert_eq!(recent[0].label, "mastodon");
+        assert_eq!(recent.entries()[0].label, "mastodon");
+        recent.assert_invariants();
 
-        record_recent_entry(
-            &mut recent,
-            RecentSearchEntry {
-                label: "Mastodon".into(),
-                subtitle: "Progressive Metal".into(),
-                query: "mastodon".into(),
-                kind: RecentSearchKind::Artist {
-                    uri: "spotify:artist:1DvfQQ39HxvCJ3GvfeIFuT".into(),
-                },
+        recent.record_entry(RecentSearchEntry {
+            label: "Mastodon".into(),
+            subtitle: "Progressive Metal".into(),
+            query: "mastodon".into(),
+            kind: RecentSearchKind::Artist {
+                uri: "spotify:artist:1DvfQQ39HxvCJ3GvfeIFuT".into(),
             },
-        );
+        });
         assert_eq!(recent.len(), 2);
-        assert!(matches!(recent[0].kind, RecentSearchKind::Artist { .. }));
+        assert!(matches!(
+            recent.entries()[0].kind,
+            RecentSearchKind::Artist { .. }
+        ));
+        recent.assert_invariants();
     }
 
     #[test]
@@ -2999,11 +2891,13 @@ mod tests {
     #[test]
     fn app_initializes_and_handles_multi_level_navigation_and_playback_messages() {
         let (mut app, _) = GrooveApp::new();
+        app.assert_invariants();
         assert!(app.state.queue.is_empty());
         assert_eq!(app.active_nav, NavSection::NowPlaying);
 
         let _ = app.update(Message::SelectNav(NavSection::Search));
         assert_eq!(app.active_nav, NavSection::Search);
+        app.assert_invariants();
 
         let _ = app.update(Message::ToggleArtistBio);
         assert!(app.artist_bio_expanded);
@@ -3013,24 +2907,27 @@ mod tests {
         assert!(!app.artist_bio_expanded);
         assert!(!app.artist_top_tracks_expanded);
         assert!(matches!(app.current_route(), StageRoute::Artist { .. }));
+        app.assert_invariants();
 
         // Navigate deeper from Artist -> Album -> Back to Artist -> Forward to Album
         let _ = app.update(Message::OpenAlbum("Marrow Deep".into()));
         assert!(matches!(app.current_route(), StageRoute::Album { .. }));
         assert!(app.selected_album.is_some());
+        app.assert_invariants();
 
         let _ = app.update(Message::NavigateBack);
         assert!(matches!(app.current_route(), StageRoute::Artist { .. }));
+        app.assert_invariants();
 
         let _ = app.update(Message::NavigateForward);
         assert!(matches!(app.current_route(), StageRoute::Album { .. }));
+        app.assert_invariants();
 
         let _ = app.update(Message::ToggleLike);
         assert!(app.state.current_track.liked);
+        app.assert_invariants();
 
         let _ = app.update(Message::AnimationTick);
-        for &band in &app.spectrum.bands {
-            assert!(band.is_finite() && (0.0..=1.0).contains(&band));
-        }
+        app.assert_invariants();
     }
 }

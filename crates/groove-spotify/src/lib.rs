@@ -7,7 +7,10 @@ use std::{sync::Arc, time::Duration};
 use flume::{Receiver, Sender};
 use groove_audio::{enumerate_output_devices, AudioSampleProducer};
 use groove_core::{
-    AudioDevice, ConnectionStatus, EngineEvent, PlaybackState, PlayerCommand, RepeatMode, Track,
+    advance_queue_verified, merge_devices_verified, resolve_playable_track_candidate,
+    sanitize_position_secs, sanitize_unit_float, select_device_verified, AudioDevice,
+    ConnectionStatus, EngineEvent, FormalInvariant, PlaybackState, PlayerCommand,
+    Track, VerifiedTransportAction,
 };
 use librespot_core::{session::Session, SpotifyUri};
 use librespot_playback::{
@@ -217,7 +220,8 @@ fn handle_librespot_event(
                 "[LibrespotPlayer] Event: Playing track={track_id:?} at position_ms={position_ms}"
             );
             state.is_playing = true;
-            state.position_secs = position_ms as f32 / 1000.0;
+            state.position_secs =
+                sanitize_position_secs(position_ms as f32 / 1000.0, state.current_track.duration_secs);
             let _ = event_tx.send(EngineEvent::PlayStateChanged(true));
         }
         PlayerEvent::Paused {
@@ -229,13 +233,15 @@ fn handle_librespot_event(
                 "[LibrespotPlayer] Event: Paused track={track_id:?} at position_ms={position_ms}"
             );
             state.is_playing = false;
-            state.position_secs = position_ms as f32 / 1000.0;
+            state.position_secs =
+                sanitize_position_secs(position_ms as f32 / 1000.0, state.current_track.duration_secs);
             let _ = event_tx.send(EngineEvent::PlayStateChanged(false));
         }
         PlayerEvent::PositionChanged { position_ms, .. }
         | PlayerEvent::PositionCorrection { position_ms, .. }
         | PlayerEvent::Seeked { position_ms, .. } => {
-            state.position_secs = position_ms as f32 / 1000.0;
+            state.position_secs =
+                sanitize_position_secs(position_ms as f32 / 1000.0, state.current_track.duration_secs);
             let _ = event_tx.send(EngineEvent::PositionTick(state.position_secs));
         }
         PlayerEvent::EndOfTrack { track_id, .. } => {
@@ -301,7 +307,10 @@ async fn apply_auth_result(
                 .await;
             if !user_playlists.is_empty() {
                 state.playlists = user_playlists;
-                let _ = event_tx.send(EngineEvent::PlaylistsLoaded(state.playlists.clone()));
+                for pl in &mut state.playlists {
+                    pl.is_playing_context = false;
+                }
+                state.active_playlist_id = None;
 
                 // If the queue is currently empty, pre-load the user's first playlist tracks (paused at 0:00)
                 // so Now Playing and Up Next immediately display the user's real music.
@@ -313,15 +322,14 @@ async fn apply_auth_result(
                                 &first_pl.spotify_uri,
                             )
                             .await;
-                        if !initial_tracks.is_empty() {
-                            state.current_track = initial_tracks[0].clone();
-                            state.queue = initial_tracks;
-                            state.active_playlist_id = Some(first_pl.id);
-                            state.position_secs = 0.0;
-                            state.is_playing = false;
-                        }
+                        state.apply_verified_action(VerifiedTransportAction::ActivatePlaylist {
+                            playlist_id: first_pl.id,
+                            tracks: initial_tracks,
+                            auto_play: false,
+                        });
                     }
                 }
+                let _ = event_tx.send(EngineEvent::PlaylistsLoaded(state.playlists.clone()));
             }
 
             if let Some(old_player) = player.take() {
@@ -512,13 +520,8 @@ async fn handle_command(
         }
 
         PlayerCommand::SeekSeconds(pos) => {
-            let max_dur = state.current_track.duration_secs as f32;
-            let clamped = if max_dur > 0.0 {
-                pos.clamp(0.0, max_dur)
-            } else {
-                pos.max(0.0)
-            };
-            state.position_secs = clamped;
+            state.apply_verified_action(VerifiedTransportAction::SeekSeconds(pos));
+            let clamped = state.position_secs;
             info!("[Engine] Command: SeekSeconds -> {clamped:.1}s");
             if let Some(active_player) = player.as_ref() {
                 active_player.seek((clamped * 1000.0) as u32);
@@ -527,8 +530,8 @@ async fn handle_command(
         }
 
         PlayerCommand::SetVolume(vol) => {
-            let clamped = vol.clamp(0.0, 1.0);
-            state.volume = clamped;
+            let clamped = sanitize_unit_float(vol, state.volume);
+            state.apply_verified_action(VerifiedTransportAction::SetVolume(clamped));
             volume_scaler.set(clamped);
             info!("[Engine] Command: SetVolume -> {:.0}%", clamped * 100.0);
             if let Some(active_player) = player.as_ref() {
@@ -539,47 +542,39 @@ async fn handle_command(
         }
 
         PlayerCommand::ToggleShuffle => {
-            state.shuffle = !state.shuffle;
+            state.apply_verified_action(VerifiedTransportAction::ToggleShuffle);
             info!("[Engine] Command: ToggleShuffle -> {}", state.shuffle);
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
         PlayerCommand::CycleRepeat => {
-            state.repeat = state.repeat.next();
+            state.apply_verified_action(VerifiedTransportAction::CycleRepeat);
             info!("[Engine] Command: CycleRepeat -> {:?}", state.repeat);
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
         PlayerCommand::ToggleLikeCurrent => {
-            state.current_track.liked = !state.current_track.liked;
-            let liked = state.current_track.liked;
-            let current_id = state.current_track.id.clone();
+            state.apply_verified_action(VerifiedTransportAction::ToggleLikeCurrent);
             info!(
-                "[Engine] Command: ToggleLikeCurrent ('{}') -> liked={liked}",
-                state.current_track.title
+                "[Engine] Command: ToggleLikeCurrent ('{}') -> liked={}",
+                state.current_track.title, state.current_track.liked
             );
-            for track in &mut state.queue {
-                if track.id == current_id {
-                    track.liked = liked;
-                }
-            }
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
         PlayerCommand::SelectQueueTrack(track_id) => {
-            if let Some(selected) = state
-                .queue
-                .iter()
-                .find(|t| t.id == track_id || t.spotify_uri == track_id)
-                .cloned()
+            let prev_id = state.current_track.id.clone();
+            state.apply_verified_action(VerifiedTransportAction::SelectQueueTrack(track_id.clone()));
+            if state.current_track.id == track_id
+                || state.current_track.spotify_uri == track_id
+                || state.current_track.id != prev_id
             {
                 info!(
                     "[Engine] Command: SelectQueueTrack -> '{}' by '{}' ({})",
-                    selected.title, selected.artist, selected.spotify_uri
+                    state.current_track.title,
+                    state.current_track.artist,
+                    state.current_track.spotify_uri
                 );
-                state.current_track = selected;
-                state.position_secs = 0.0;
-                state.is_playing = true;
                 if let Some(active_player) = player.as_ref() {
                     load_track_on_player(
                         active_player,
@@ -599,16 +594,7 @@ async fn handle_command(
                 "[Engine] Command: PlayTrack -> '{}' by '{}' (uri={}, cover={:?})",
                 track.title, track.artist, track.spotify_uri, track.cover_art_url
             );
-            if !state
-                .queue
-                .iter()
-                .any(|t| t.id == track.id || t.spotify_uri == track.spotify_uri)
-            {
-                state.queue.insert(0, track.clone());
-            }
-            state.current_track = track;
-            state.position_secs = 0.0;
-            state.is_playing = true;
+            state.apply_verified_action(VerifiedTransportAction::PlayTrack(track));
             if let Some(active_player) = player.as_ref() {
                 load_track_on_player(
                     active_player,
@@ -625,26 +611,27 @@ async fn handle_command(
         PlayerCommand::SelectPlaylist(playlist_id) => {
             info!("[Engine] Command: SelectPlaylist('{playlist_id}')");
             ensure_fresh_web_token(web_client, live_session).await;
-            let mut resolved_key = playlist_id.clone();
-            for playlist in &mut state.playlists {
-                let is_match = playlist.id == playlist_id
-                    || playlist.spotify_uri == playlist_id
-                    || playlist.name.eq_ignore_ascii_case(&playlist_id);
-                playlist.is_playing_context = is_match;
-                if is_match {
-                    resolved_key = playlist.id.clone();
-                }
-            }
-            state.active_playlist_id = Some(resolved_key.clone());
+            let resolved_key = state
+                .playlists
+                .iter()
+                .find(|p| {
+                    p.id == playlist_id
+                        || p.spotify_uri == playlist_id
+                        || p.name.eq_ignore_ascii_case(&playlist_id)
+                })
+                .map(|p| p.id.clone())
+                .unwrap_or_else(|| playlist_id.clone());
 
             let tracks = web_client
                 .fetch_playlist_tracks_with_session(live_session.as_ref(), &resolved_key)
                 .await;
-            if !tracks.is_empty() {
-                state.current_track = tracks[0].clone();
-                state.queue = tracks;
-                state.position_secs = 0.0;
-                state.is_playing = true;
+            let had_tracks = !tracks.is_empty();
+            state.apply_verified_action(VerifiedTransportAction::ActivatePlaylist {
+                playlist_id: resolved_key,
+                tracks,
+                auto_play: true,
+            });
+            if had_tracks {
                 if let Some(active_player) = player.as_ref() {
                     load_track_on_player(
                         active_player,
@@ -739,10 +726,7 @@ async fn handle_command(
                 "[Engine] Command: SelectOutputDevice -> '{}' (id={}, is_default={})",
                 device.name, device.id, device.is_default
             );
-            if !state.devices.iter().any(|d| d.id == device.id) {
-                state.devices.push(device.clone());
-            }
-            state.selected_device = device.clone();
+            select_device_verified(state, device.clone());
 
             if let Some(session) = live_session.as_ref() {
                 if let Some(old_player) = player.take() {
@@ -906,29 +890,48 @@ fn load_track_on_player(
                 if let Some(sess) = sess_clone {
                     use librespot_metadata::{Metadata, Track as LibrespotTrack};
                     if let Ok(meta) = LibrespotTrack::get(&sess, &resolved_uri).await {
-                        if meta.files.is_empty() {
+                        let primary_files = meta.files.len();
+                        let mut alt_candidates: Vec<(String, SpotifyUri, usize)> = Vec::new();
+                        if primary_files == 0 {
                             for alt_uri in meta.alternatives.iter() {
                                 if let Ok(alt_meta) = LibrespotTrack::get(&sess, alt_uri).await {
+                                    alt_candidates.push((
+                                        format!("{alt_uri:?}"),
+                                        alt_uri.clone(),
+                                        alt_meta.files.len(),
+                                    ));
                                     if !alt_meta.files.is_empty() {
-                                        info!(
-                                            "[LibrespotPlayer] Track '{}' ({}) had 0 direct files; resolved to playable alternative {:?} ({} files)",
-                                            title,
-                                            raw_uri_str,
-                                            alt_uri,
-                                            alt_meta.files.len()
-                                        );
-                                        resolved_uri = alt_uri.clone();
                                         break;
                                     }
                                 }
                             }
-                        } else {
-                            info!(
-                                "[LibrespotPlayer] Track '{}' ({}) verified with {} direct audio files",
-                                title,
-                                raw_uri_str,
-                                meta.files.len()
-                            );
+                        }
+                        let chosen = {
+                            let alt_refs: Vec<(&str, usize)> = alt_candidates
+                                .iter()
+                                .map(|(s, _, count)| (s.as_str(), *count))
+                                .collect();
+                            resolve_playable_track_candidate(&raw_uri_str, primary_files, &alt_refs)
+                                .map(|(label, files)| (label.to_string(), files))
+                        };
+                        if let Some((chosen_label, chosen_files)) = chosen {
+                            if primary_files == 0 {
+                                if let Some((_, chosen_uri, _)) = alt_candidates
+                                    .into_iter()
+                                    .find(|(label, _, _)| *label == chosen_label)
+                                {
+                                    info!(
+                                        "[LibrespotPlayer] Track '{}' ({}) had 0 direct files; resolved to playable alternative {:?} ({} files)",
+                                        title, raw_uri_str, chosen_uri, chosen_files
+                                    );
+                                    resolved_uri = chosen_uri;
+                                }
+                            } else {
+                                info!(
+                                    "[LibrespotPlayer] Track '{}' ({}) verified with {} direct audio files",
+                                    title, raw_uri_str, chosen_files
+                                );
+                            }
                         }
                     }
                 }
@@ -955,26 +958,8 @@ fn load_track_on_player(
 }
 
 fn merge_output_devices(state: &mut PlaybackState, detected: Vec<AudioDevice>) {
-    if detected.is_empty() {
-        return;
-    }
-
-    let current_id = state.selected_device.id.clone();
-    let had_real_default = detected
-        .iter()
-        .find(|d| d.id == current_id && d.is_default)
-        .cloned();
-    state.devices = detected;
-
-    if let Some(existing_default) = had_real_default {
-        state.selected_device = existing_default;
-    } else if let Some(default_dev) = state.devices.iter().find(|d| d.is_default).cloned() {
-        state.selected_device = default_dev;
-    } else if let Some(existing) = state.devices.iter().find(|d| d.id == current_id).cloned() {
-        state.selected_device = existing;
-    } else if let Some(first) = state.devices.first().cloned() {
-        state.selected_device = first;
-    }
+    merge_devices_verified(state, detected);
+    debug_assert!(state.check_invariants().is_ok());
     info!(
         "[Audio] Active output device selected: '{}' (id={}, is_default={})",
         state.selected_device.name, state.selected_device.id, state.selected_device.is_default
@@ -982,36 +967,8 @@ fn merge_output_devices(state: &mut PlaybackState, detected: Vec<AudioDevice>) {
 }
 
 fn advance_queue_track(state: &mut PlaybackState, forward: bool, auto_ended: bool) {
-    if state.queue.is_empty() {
-        state.position_secs = 0.0;
-        return;
-    }
-
-    if auto_ended && state.repeat == RepeatMode::Track {
-        state.position_secs = 0.0;
-        return;
-    }
-
-    let len = state.queue.len();
-    let current_idx = state
-        .queue
-        .iter()
-        .position(|t| t.id == state.current_track.id)
-        .unwrap_or(0);
-
-    let next_idx = if state.shuffle && len > 1 {
-        let step = if len > 2 { 2 } else { 1 };
-        (current_idx + step) % len
-    } else if forward {
-        (current_idx + 1) % len
-    } else if current_idx == 0 {
-        len - 1
-    } else {
-        current_idx - 1
-    };
-
-    state.current_track = state.queue[next_idx].clone();
-    state.position_secs = 0.0;
+    advance_queue_verified(state, forward, auto_ended);
+    debug_assert!(state.check_invariants().is_ok());
 }
 
 #[cfg(test)]
