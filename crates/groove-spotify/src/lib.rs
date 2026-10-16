@@ -405,7 +405,11 @@ async fn handle_command(
 ) {
     match cmd {
         PlayerCommand::TogglePlayPause => {
-            state.is_playing = !state.is_playing;
+            if player.is_some() && !*player_has_loaded_track {
+                state.is_playing = true;
+            } else {
+                state.is_playing = !state.is_playing;
+            }
             info!(
                 "[Engine] Command: TogglePlayPause -> is_playing={} (track='{}', uri='{}')",
                 state.is_playing, state.current_track.title, state.current_track.spotify_uri
@@ -424,7 +428,7 @@ async fn handle_command(
                     } else {
                         active_player.play();
                     }
-                } else {
+                } else if *player_has_loaded_track {
                     active_player.pause();
                 }
             }
@@ -458,7 +462,9 @@ async fn handle_command(
             state.is_playing = false;
             info!("[Engine] Command: Pause");
             if let Some(active_player) = player.as_ref() {
-                active_player.pause();
+                if *player_has_loaded_track {
+                    active_player.pause();
+                }
             }
             let _ = event_tx.send(EngineEvent::PlayStateChanged(false));
         }
@@ -672,12 +678,34 @@ async fn handle_command(
             *artist_abort_handle = Some(jh.abort_handle());
         }
 
+        PlayerCommand::SelectAlbum(album_id_or_uri) => {
+            info!("[Engine] Command: SelectAlbum('{album_id_or_uri}')");
+            let client = web_client.clone();
+            let sess = live_session.clone();
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                let detail = client
+                    .fetch_album_detail(sess.as_ref(), &album_id_or_uri)
+                    .await;
+                info!(
+                    "[Engine] AlbumDetailLoaded for '{}' by '{}' ({} tracks, artist_uri={:?})",
+                    detail.album.title,
+                    detail.album.artist_name,
+                    detail.tracks.len(),
+                    detail.artist_uri
+                );
+                let _ = tx.send(EngineEvent::AlbumDetailLoaded(Box::new(detail)));
+            });
+        }
+
         PlayerCommand::PlayAlbum(album_id_or_uri) => {
             info!("[Engine] Command: PlayAlbum('{album_id_or_uri}')");
             ensure_fresh_web_token(web_client, live_session).await;
-            let tracks = web_client
-                .fetch_album_tracks(live_session.as_ref(), &album_id_or_uri)
+            let detail = web_client
+                .fetch_album_detail(live_session.as_ref(), &album_id_or_uri)
                 .await;
+            let tracks = detail.tracks.clone();
+            let _ = event_tx.send(EngineEvent::AlbumDetailLoaded(Box::new(detail)));
             if !tracks.is_empty() {
                 info!(
                     "[Engine] PlayAlbum loaded {} tracks; starting with '{}'",

@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use groove_core::{
-    AlbumSummary, ArtistDetail, ArtistSummary, ArtworkTheme, PlaybackState, Playlist, Track,
+    AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, ArtworkTheme, PlaybackState, Playlist,
+    Track,
 };
 use librespot_core::{Session, SpotifyUri};
 use librespot_metadata::{
@@ -694,23 +695,42 @@ impl SpotifyWebClient {
         curated_artist_detail(trimmed)
     }
 
-    /// Fetches all playable tracks for an album (and attaches its cover artwork URL)
-    /// using `librespot_metadata::Album` or Spotify Web API `/v1/albums/{id}`.
-    pub async fn fetch_album_tracks(
+    /// Fetches full album detail (metadata, parent artist URI, cover art, and tracklist)
+    /// using `librespot_metadata::Album` (`spclient`) or Spotify Web API `/v1/albums/{id}`.
+    pub async fn fetch_album_detail(
         &self,
         session: Option<&Session>,
         album_id_or_uri: &str,
-    ) -> Vec<Track> {
+    ) -> AlbumDetail {
         let trimmed = album_id_or_uri.trim();
         info!(
-            "[AlbumTracks] Fetching tracks for album '{}' (has_live_session={})",
+            "[AlbumDetail] Fetching album detail for '{}' (has_live_session={})",
             trimmed,
             session.is_some()
         );
 
+        let mut resolved_uri = normalize_album_uri(trimmed);
+        if resolved_uri.is_none() && (session.is_some() || self.available_web_token().is_some()) {
+            let clean_query = trimmed
+                .strip_prefix("spotify:album:")
+                .unwrap_or(trimmed)
+                .replace('-', " ");
+            let search = self
+                .search_catalog_with_session(session, &clean_query)
+                .await;
+            if let Some(first) = search.albums.first() {
+                resolved_uri = normalize_album_uri(&first.spotify_uri)
+                    .or_else(|| normalize_album_uri(&first.id));
+                info!(
+                    "[AlbumDetail] Resolved album name '{}' (query='{}') -> URI {:?}",
+                    trimmed, clean_query, resolved_uri
+                );
+            }
+        }
+
         // 1. Try native `librespot_metadata::Album::get` over `session.spclient()`.
-        if let (Some(sess), Some(uri_str)) = (session, normalize_album_uri(trimmed)) {
-            if let Ok(album_uri) = SpotifyUri::from_uri(&uri_str) {
+        if let (Some(sess), Some(uri_str)) = (session, resolved_uri.as_deref()) {
+            if let Ok(album_uri) = SpotifyUri::from_uri(uri_str) {
                 let t0 = std::time::Instant::now();
                 if let Ok(meta_album) = LibrespotAlbum::get(sess, &album_uri).await {
                     let cover_url = extract_librespot_image_url(&meta_album.covers)
@@ -721,6 +741,19 @@ impl SpotifyWebClient {
                         .first()
                         .map(|a| a.name.clone())
                         .unwrap_or_else(|| "Artist".to_string());
+                    let artist_uri = meta_album
+                        .artists
+                        .first()
+                        .and_then(|a| a.id.to_uri().ok());
+                    let release_year = meta_album.date.year().to_string();
+                    let album_type = match meta_album.album_type {
+                        librespot_metadata::album::AlbumType::SINGLE => "Single".to_string(),
+                        librespot_metadata::album::AlbumType::COMPILATION => {
+                            "Compilation".to_string()
+                        }
+                        librespot_metadata::album::AlbumType::EP => "EP".to_string(),
+                        _ => "Album".to_string(),
+                    };
 
                     let track_uris: Vec<SpotifyUri> =
                         meta_album.tracks().take(24).cloned().collect();
@@ -751,14 +784,33 @@ impl SpotifyWebClient {
                         .collect();
 
                     if !tracks.is_empty() {
+                        let alb_id = uri_str
+                            .strip_prefix("spotify:album:")
+                            .unwrap_or(uri_str)
+                            .to_string();
                         info!(
-                            "[spclient] Loaded {} tracks for album '{}' in {:?} (cover={:?})",
-                            tracks.len(),
+                            "[spclient] Loaded album detail '{}' by '{}' ({} tracks, artist_uri={:?}) in {:?}",
                             album_title,
-                            t0.elapsed(),
-                            cover_url
+                            default_artist,
+                            tracks.len(),
+                            artist_uri,
+                            t0.elapsed()
                         );
-                        return tracks;
+                        return AlbumDetail {
+                            album: AlbumSummary {
+                                id: alb_id,
+                                spotify_uri: uri_str.to_string(),
+                                title: album_title,
+                                artist_name: default_artist,
+                                release_year,
+                                album_type,
+                                track_count: tracks.len(),
+                                cover_art_url: cover_url,
+                                artwork_theme: ArtworkTheme::SunriseMountainLake,
+                            },
+                            artist_uri,
+                            tracks,
+                        };
                     }
                 }
             }
@@ -766,9 +818,9 @@ impl SpotifyWebClient {
 
         // 2. Try Spotify Web API `GET /v1/albums/{id}`.
         if let (Some(token), Some(uri_str)) =
-            (self.available_web_token(), normalize_album_uri(trimmed))
+            (self.available_web_token(), resolved_uri.as_deref())
         {
-            let raw_id = uri_str.strip_prefix("spotify:album:").unwrap_or(&uri_str);
+            let raw_id = uri_str.strip_prefix("spotify:album:").unwrap_or(uri_str);
             let url = format!("{SPOTIFY_API_BASE}/albums/{raw_id}");
             if let Ok(resp) = self.http.get(url).bearer_auth(token).send().await {
                 if resp.status().as_u16() == 429 {
@@ -803,7 +855,32 @@ impl SpotifyWebClient {
                                 })
                                 .collect();
                             if !mapped.is_empty() {
-                                return mapped;
+                                return AlbumDetail {
+                                    album: AlbumSummary {
+                                        id: raw_id.to_string(),
+                                        spotify_uri: uri_str.to_string(),
+                                        title: album_name,
+                                        artist_name: if fallback_artist.is_empty() {
+                                            "Artist".to_string()
+                                        } else {
+                                            fallback_artist
+                                        },
+                                        release_year: alb
+                                            .release_date
+                                            .unwrap_or_else(|| "2024".to_string())
+                                            .chars()
+                                            .take(4)
+                                            .collect(),
+                                        album_type: alb
+                                            .album_type
+                                            .unwrap_or_else(|| "Album".to_string()),
+                                        track_count: mapped.len(),
+                                        cover_art_url: cover,
+                                        artwork_theme: ArtworkTheme::SunriseMountainLake,
+                                    },
+                                    artist_uri: None,
+                                    tracks: mapped,
+                                };
                             }
                         }
                     }
@@ -812,7 +889,51 @@ impl SpotifyWebClient {
         }
 
         // 3. Fallback to curated album tracks.
-        curated_tracks_for_album(trimmed)
+        fallback_album_detail(trimmed, resolved_uri)
+    }
+
+    /// Fetches all playable tracks for an album (and attaches its cover artwork URL)
+    /// using `librespot_metadata::Album` or Spotify Web API `/v1/albums/{id}`.
+    pub async fn fetch_album_tracks(
+        &self,
+        session: Option<&Session>,
+        album_id_or_uri: &str,
+    ) -> Vec<Track> {
+        self.fetch_album_detail(session, album_id_or_uri)
+            .await
+            .tracks
+    }
+}
+
+pub fn fallback_album_detail(trimmed: &str, resolved_uri: Option<String>) -> AlbumDetail {
+    let tracks = curated_tracks_for_album(trimmed);
+    let first = tracks.first();
+    let title = first
+        .map(|t| t.album.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| trimmed.to_string());
+    let artist_name = first
+        .map(|t| t.artist.clone())
+        .unwrap_or_else(|| "Lume".to_string());
+    let cover_art_url = first.and_then(|t| t.cover_art_url.clone());
+    let artwork_theme = first
+        .map(|t| t.artwork_theme)
+        .unwrap_or(ArtworkTheme::SunriseMountainLake);
+
+    AlbumDetail {
+        album: AlbumSummary {
+            id: trimmed.to_string(),
+            spotify_uri: resolved_uri.unwrap_or_else(|| format!("spotify:album:{trimmed}")),
+            title,
+            artist_name: artist_name.clone(),
+            release_year: "2024".to_string(),
+            album_type: "Album".to_string(),
+            track_count: tracks.len(),
+            cover_art_url,
+            artwork_theme,
+        },
+        artist_uri: Some(artist_name),
+        tracks,
     }
 }
 

@@ -143,6 +143,14 @@ pub struct AlbumSummary {
     pub artwork_theme: ArtworkTheme,
 }
 
+/// Full album detail including metadata, parent artist reference, and tracklist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlbumDetail {
+    pub album: AlbumSummary,
+    pub artist_uri: Option<String>,
+    pub tracks: Vec<Track>,
+}
+
 /// Full artist profile including portrait, bio, top tracks, and discography albums.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtistDetail {
@@ -474,6 +482,7 @@ pub enum PlayerCommand {
     PlayTrack(Track),
     SelectPlaylist(String),
     SelectArtist(String),
+    SelectAlbum(String),
     PlayAlbum(String),
     SelectOutputDevice(AudioDevice),
     AuthenticateSpotify {
@@ -503,6 +512,7 @@ pub enum EngineEvent {
         tracks: Vec<Track>,
     },
     ArtistDetailLoaded(Box<ArtistDetail>),
+    AlbumDetailLoaded(Box<AlbumDetail>),
 }
 
 /// Formats seconds as `M:SS` (e.g., `2:17`, `4:28`).

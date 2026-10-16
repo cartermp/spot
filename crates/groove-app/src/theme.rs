@@ -274,3 +274,27 @@ pub fn artist_bio_card(_theme: &Theme) -> container::Style {
         ..Default::default()
     }
 }
+
+pub fn breadcrumb_bar_container(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.58))),
+        border: Border {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.055),
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+pub fn recent_search_chip_card(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.70))),
+        border: Border {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.055),
+            width: 1.0,
+            radius: 10.0.into(),
+        },
+        ..Default::default()
+    }
+}

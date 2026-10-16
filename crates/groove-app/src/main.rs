@@ -6,13 +6,14 @@ mod visualizer;
 use artwork::{download_and_decode_artwork, ArtworkCache};
 use groove_audio::SpectrumAnalyzer;
 use groove_core::{
-    format_compact_count, format_seconds, AlbumSummary, ArtistDetail, ArtistSummary, AudioDevice,
-    ConnectionStatus, EngineEvent, NavSection, PlaybackState, PlayerCommand, RepeatMode,
-    SpectrumFrame, Track,
+    format_compact_count, format_seconds, AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary,
+    AudioDevice, ConnectionStatus, EngineEvent, NavSection, PlaybackState, PlayerCommand,
+    RepeatMode, SpectrumFrame, Track,
 };
 use groove_spotify::{
+    spawn_engine,
     web_api::{all_curated_albums, all_curated_artists, curated_artist_detail},
-    spawn_engine, EngineHandle,
+    EngineHandle,
 };
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
@@ -21,6 +22,8 @@ use iced::widget::{
 };
 use iced::window;
 use iced::{Alignment, Element, Length, Padding, Size, Subscription, Task, Theme};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::time::Duration;
 use theme::{palette, INSTRUMENT_SERIF_BYTES, SERIF_FONT};
 use visualizer::RibbonVisualizer;
@@ -64,10 +67,120 @@ pub fn main() -> iced::Result {
         .run_with(GrooveApp::new)
 }
 
+/// Multi-level navigation route supporting deep back/forward history and breadcrumbs
+/// (e.g. `Search` -> `Artist: Mastodon` -> `Album: Marrow Deep` -> `Now Playing`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageRoute {
+    Section(NavSection),
+    Artist {
+        id_or_uri: String,
+        label: String,
+    },
+    Album {
+        id_or_uri: String,
+        label: String,
+        artist_name: Option<String>,
+        artist_uri: Option<String>,
+    },
+}
+
+impl StageRoute {
+    pub fn label(&self) -> &str {
+        match self {
+            StageRoute::Section(sec) => sec.label(),
+            StageRoute::Artist { label, .. } => label,
+            StageRoute::Album { label, .. } => label,
+        }
+    }
+
+    pub fn kind_badge(&self) -> Option<&'static str> {
+        match self {
+            StageRoute::Section(_) => None,
+            StageRoute::Artist { .. } => Some("Artist"),
+            StageRoute::Album { .. } => Some("Album"),
+        }
+    }
+
+    pub fn breadcrumb_label(&self) -> String {
+        let base = truncate_nav_label(self.label(), 22);
+        match self.kind_badge() {
+            Some(kind) => format!("{kind} · {base}"),
+            None => base,
+        }
+    }
+
+    pub fn matches_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (StageRoute::Section(a), StageRoute::Section(b)) => a == b,
+            (
+                StageRoute::Artist {
+                    id_or_uri: a,
+                    label: la,
+                },
+                StageRoute::Artist {
+                    id_or_uri: b,
+                    label: lb,
+                },
+            ) => {
+                a.eq_ignore_ascii_case(b)
+                    || (!la.is_empty() && !lb.is_empty() && la.eq_ignore_ascii_case(lb))
+            }
+            (
+                StageRoute::Album {
+                    id_or_uri: a,
+                    label: la,
+                    ..
+                },
+                StageRoute::Album {
+                    id_or_uri: b,
+                    label: lb,
+                    ..
+                },
+            ) => {
+                a.eq_ignore_ascii_case(b)
+                    || (!la.is_empty() && !lb.is_empty() && la.eq_ignore_ascii_case(lb))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Kind of item stored in the "Recently Searched" history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecentSearchKind {
+    Query,
+    Artist { uri: String },
+    Album { uri: String, artist_name: String },
+    Track { uri: String, artist_name: String },
+}
+
+impl RecentSearchKind {
+    pub fn badge_label(&self) -> &'static str {
+        match self {
+            RecentSearchKind::Query => "SEARCH",
+            RecentSearchKind::Artist { .. } => "ARTIST",
+            RecentSearchKind::Album { .. } => "ALBUM",
+            RecentSearchKind::Track { .. } => "TRACK",
+        }
+    }
+}
+
+/// Persisted entry in the "Recently Searched" bar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentSearchEntry {
+    pub label: String,
+    pub subtitle: String,
+    pub query: String,
+    pub kind: RecentSearchKind,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     AnimationTick,
     SelectNav(NavSection),
+    NavigateBack,
+    NavigateForward,
+    NavigateHistory(usize),
     TogglePlayPause,
     NextTrack,
     PreviousTrack,
@@ -83,13 +196,20 @@ pub enum Message {
     OpenArtist(String),
     CloseArtistView,
     ToggleArtistBio,
+    OpenAlbum(String),
     PlayAlbum(String),
+    PlayAlbumTrack(usize),
     PlayArtistTopTracks,
     CreateNewPlaylist,
     SelectOutputDevice(AudioDevice),
     ConnectSpotifyClicked { force_reauth: bool },
     LogoutSpotifyClicked,
     SearchQueryChanged(String),
+    SubmitSearch,
+    ClearSearchQuery,
+    SelectRecentSearch(usize),
+    RemoveRecentSearch(usize),
+    ClearRecentSearches,
     ToggleTrackMenu,
     ArtworkLoaded(Option<(String, image::Handle)>),
 }
@@ -97,17 +217,20 @@ pub enum Message {
 pub struct GrooveApp {
     state: PlaybackState,
     active_nav: NavSection,
+    nav_history: Vec<StageRoute>,
+    nav_index: usize,
     analyzer: SpectrumAnalyzer,
     spectrum: SpectrumFrame,
     engine: EngineHandle,
     artwork: ArtworkCache,
     scrubbing_position: Option<f32>,
     search_query: String,
+    recent_searches: Vec<RecentSearchEntry>,
     search_artists: Vec<ArtistSummary>,
     search_albums: Vec<AlbumSummary>,
     search_results: Vec<Track>,
     selected_artist: Option<ArtistDetail>,
-    viewing_artist: bool,
+    selected_album: Option<AlbumDetail>,
     artist_bio_expanded: bool,
     show_track_details_banner: bool,
 }
@@ -138,27 +261,235 @@ impl GrooveApp {
         let search_artists = all_curated_artists();
         let search_albums = all_curated_albums();
         let selected_artist = Some(curated_artist_detail("Lume"));
+        let recent_searches = load_recent_searches();
 
         (
             Self {
                 state,
                 active_nav: NavSection::NowPlaying,
+                nav_history: vec![StageRoute::Section(NavSection::NowPlaying)],
+                nav_index: 0,
                 analyzer,
                 spectrum: SpectrumFrame::calm_preview(0.0),
                 engine,
                 artwork: ArtworkCache::new(),
                 scrubbing_position: None,
                 search_query: String::new(),
+                recent_searches,
                 search_artists,
                 search_albums,
                 search_results,
                 selected_artist,
-                viewing_artist: false,
+                selected_album: None,
                 artist_bio_expanded: false,
                 show_track_details_banner: false,
             },
             Task::none(),
         )
+    }
+
+    fn current_route(&self) -> &StageRoute {
+        self.nav_history
+            .get(self.nav_index)
+            .unwrap_or(&StageRoute::Section(NavSection::NowPlaying))
+    }
+
+    fn can_go_back(&self) -> bool {
+        self.nav_index > 0
+    }
+
+    fn can_go_forward(&self) -> bool {
+        self.nav_index + 1 < self.nav_history.len()
+    }
+
+    fn push_route(&mut self, route: StageRoute) {
+        if let StageRoute::Section(sec) = &route {
+            self.active_nav = *sec;
+        }
+        if self.current_route().matches_target(&route) {
+            if let Some(slot) = self.nav_history.get_mut(self.nav_index) {
+                *slot = route;
+            }
+            return;
+        }
+        self.nav_history.truncate(self.nav_index + 1);
+        self.nav_history.push(route);
+        if self.nav_history.len() > 32 {
+            self.nav_history.remove(0);
+        }
+        self.nav_index = self.nav_history.len() - 1;
+        let trail: Vec<String> = self
+            .nav_history
+            .iter()
+            .take(self.nav_index + 1)
+            .map(|r| r.breadcrumb_label())
+            .collect();
+        tracing::info!(
+            "[Nav] Route pushed (index={}/{}) -> {}",
+            self.nav_index,
+            self.nav_history.len(),
+            trail.join(" › ")
+        );
+    }
+
+    fn activate_current_route(&mut self) {
+        let route = self.current_route().clone();
+        let trail: Vec<String> = self
+            .nav_history
+            .iter()
+            .take(self.nav_index + 1)
+            .map(|r| r.breadcrumb_label())
+            .collect();
+        tracing::info!(
+            "[Nav] Activated history route (index={}/{}) -> {}",
+            self.nav_index,
+            self.nav_history.len(),
+            trail.join(" › ")
+        );
+
+        match route {
+            StageRoute::Section(sec) => {
+                self.active_nav = sec;
+                if sec == NavSection::Search && self.search_artists.is_empty() {
+                    let _ = self
+                        .engine
+                        .command_tx
+                        .send(PlayerCommand::SearchCatalog(self.search_query.clone()));
+                }
+            }
+            StageRoute::Artist { id_or_uri, label } => {
+                self.artist_bio_expanded = false;
+                let already_loaded = self.selected_artist.as_ref().is_some_and(|d| {
+                    d.artist.spotify_uri.eq_ignore_ascii_case(&id_or_uri)
+                        || d.artist.id.eq_ignore_ascii_case(&id_or_uri)
+                        || d.artist.name.eq_ignore_ascii_case(&id_or_uri)
+                        || (!label.is_empty() && d.artist.name.eq_ignore_ascii_case(&label))
+                });
+                if !already_loaded {
+                    let _ = self
+                        .engine
+                        .command_tx
+                        .send(PlayerCommand::SelectArtist(id_or_uri));
+                }
+            }
+            StageRoute::Album {
+                id_or_uri, label, ..
+            } => {
+                let already_loaded = self.selected_album.as_ref().is_some_and(|d| {
+                    !d.tracks.is_empty()
+                        && (d.album.spotify_uri.eq_ignore_ascii_case(&id_or_uri)
+                            || d.album.id.eq_ignore_ascii_case(&id_or_uri)
+                            || d.album.title.eq_ignore_ascii_case(&id_or_uri)
+                            || (!label.is_empty() && d.album.title.eq_ignore_ascii_case(&label)))
+                });
+                if !already_loaded {
+                    let _ = self
+                        .engine
+                        .command_tx
+                        .send(PlayerCommand::SelectAlbum(id_or_uri));
+                }
+            }
+        }
+    }
+
+    fn resolve_artist_label(&self, artist_id_or_name: &str) -> String {
+        if let Some(found) = self.search_artists.iter().find(|a| {
+            a.spotify_uri.eq_ignore_ascii_case(artist_id_or_name)
+                || a.id.eq_ignore_ascii_case(artist_id_or_name)
+                || a.name.eq_ignore_ascii_case(artist_id_or_name)
+        }) {
+            return found.name.clone();
+        }
+        if let Some(detail) = &self.selected_artist {
+            if detail
+                .artist
+                .spotify_uri
+                .eq_ignore_ascii_case(artist_id_or_name)
+                || detail.artist.id.eq_ignore_ascii_case(artist_id_or_name)
+                || detail.artist.name.eq_ignore_ascii_case(artist_id_or_name)
+            {
+                return detail.artist.name.clone();
+            }
+        }
+        if let Some(alb) = &self.selected_album {
+            if alb
+                .artist_uri
+                .as_deref()
+                .is_some_and(|u| u.eq_ignore_ascii_case(artist_id_or_name))
+            {
+                return alb.album.artist_name.clone();
+            }
+        }
+        if artist_id_or_name.starts_with("spotify:artist:") {
+            "Artist".to_string()
+        } else {
+            artist_id_or_name.to_string()
+        }
+    }
+
+    fn resolve_album_meta(
+        &self,
+        album_id_or_uri: &str,
+    ) -> (String, Option<String>, Option<String>) {
+        if let Some(detail) = &self.selected_artist {
+            if let Some(alb) = detail.albums.iter().find(|a| {
+                a.spotify_uri.eq_ignore_ascii_case(album_id_or_uri)
+                    || a.id.eq_ignore_ascii_case(album_id_or_uri)
+                    || a.title.eq_ignore_ascii_case(album_id_or_uri)
+            }) {
+                return (
+                    alb.title.clone(),
+                    Some(detail.artist.name.clone()),
+                    Some(detail.artist.spotify_uri.clone()),
+                );
+            }
+        }
+        if let Some(alb) = self.search_albums.iter().find(|a| {
+            a.spotify_uri.eq_ignore_ascii_case(album_id_or_uri)
+                || a.id.eq_ignore_ascii_case(album_id_or_uri)
+                || a.title.eq_ignore_ascii_case(album_id_or_uri)
+        }) {
+            let artist_uri = self
+                .search_artists
+                .iter()
+                .find(|ar| ar.name.eq_ignore_ascii_case(&alb.artist_name))
+                .map(|ar| ar.spotify_uri.clone());
+            return (alb.title.clone(), Some(alb.artist_name.clone()), artist_uri);
+        }
+        if let Some(detail) = &self.selected_album {
+            if detail
+                .album
+                .spotify_uri
+                .eq_ignore_ascii_case(album_id_or_uri)
+                || detail.album.title.eq_ignore_ascii_case(album_id_or_uri)
+            {
+                return (
+                    detail.album.title.clone(),
+                    Some(detail.album.artist_name.clone()),
+                    detail.artist_uri.clone(),
+                );
+            }
+        }
+        if album_id_or_uri.starts_with("spotify:album:") {
+            ("Album".to_string(), None, None)
+        } else {
+            (
+                album_id_or_uri.to_string(),
+                Some(self.state.current_track.artist.clone()),
+                None,
+            )
+        }
+    }
+
+    fn record_recent_search_entry(&mut self, entry: RecentSearchEntry) {
+        record_recent_entry(&mut self.recent_searches, entry);
+        save_recent_searches(&self.recent_searches);
+    }
+
+    fn record_recent_query_from_search(&mut self, query: &str) {
+        if record_recent_query(&mut self.recent_searches, query) {
+            save_recent_searches(&self.recent_searches);
+        }
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -179,6 +510,7 @@ impl GrooveApp {
                             | EngineEvent::QueueUpdated(_)
                             | EngineEvent::SearchResults { .. }
                             | EngineEvent::ArtistDetailLoaded(_)
+                            | EngineEvent::AlbumDetailLoaded(_)
                     ) {
                         needs_art_scan = true;
                     }
@@ -194,8 +526,7 @@ impl GrooveApp {
             }
             Message::SelectNav(nav) => {
                 tracing::info!("[UI] SelectNav -> {:?}", nav);
-                self.viewing_artist = false;
-                self.active_nav = nav;
+                self.push_route(StageRoute::Section(nav));
                 if nav == NavSection::Search && self.search_artists.is_empty() {
                     let _ = self
                         .engine
@@ -203,9 +534,30 @@ impl GrooveApp {
                         .send(PlayerCommand::SearchCatalog(self.search_query.clone()));
                 }
             }
+            Message::NavigateBack => {
+                if self.can_go_back() {
+                    self.nav_index -= 1;
+                    self.activate_current_route();
+                }
+            }
+            Message::NavigateForward => {
+                if self.can_go_forward() {
+                    self.nav_index += 1;
+                    self.activate_current_route();
+                }
+            }
+            Message::NavigateHistory(idx) => {
+                if idx < self.nav_history.len() && idx != self.nav_index {
+                    self.nav_index = idx;
+                    self.activate_current_route();
+                }
+            }
             Message::TogglePlayPause => {
                 self.state.is_playing = !self.state.is_playing;
-                tracing::info!("[UI] TogglePlayPause clicked -> is_playing={}", self.state.is_playing);
+                tracing::info!(
+                    "[UI] TogglePlayPause clicked -> is_playing={}",
+                    self.state.is_playing
+                );
                 let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
             }
             Message::NextTrack => {
@@ -261,8 +613,7 @@ impl GrooveApp {
                     .engine
                     .command_tx
                     .send(PlayerCommand::SelectQueueTrack(track_id));
-                self.viewing_artist = false;
-                self.active_nav = NavSection::NowPlaying;
+                self.push_route(StageRoute::Section(NavSection::NowPlaying));
             }
             Message::PlaySpecificTrack(track) => {
                 tracing::info!(
@@ -271,12 +622,22 @@ impl GrooveApp {
                     track.artist,
                     track.spotify_uri
                 );
+                if matches!(self.current_route(), StageRoute::Section(NavSection::Search)) {
+                    self.record_recent_search_entry(RecentSearchEntry {
+                        label: track.title.clone(),
+                        subtitle: format!("Track · {}", track.artist),
+                        query: format!("{} {}", track.title, track.artist),
+                        kind: RecentSearchKind::Track {
+                            uri: track.spotify_uri.clone(),
+                            artist_name: track.artist.clone(),
+                        },
+                    });
+                }
                 let _ = self
                     .engine
                     .command_tx
                     .send(PlayerCommand::PlayTrack(track));
-                self.viewing_artist = false;
-                self.active_nav = NavSection::NowPlaying;
+                self.push_route(StageRoute::Section(NavSection::NowPlaying));
             }
             Message::SelectPlaylist(playlist_id) => {
                 tracing::info!("[UI] SelectPlaylist('{playlist_id}')");
@@ -284,22 +645,45 @@ impl GrooveApp {
                     .engine
                     .command_tx
                     .send(PlayerCommand::SelectPlaylist(playlist_id));
-                self.viewing_artist = false;
-                self.active_nav = NavSection::NowPlaying;
+                self.push_route(StageRoute::Section(NavSection::NowPlaying));
             }
             Message::OpenArtist(artist_id_or_name) => {
-                tracing::info!("[UI] OpenArtist('{artist_id_or_name}')");
-                self.viewing_artist = true;
+                let label = self.resolve_artist_label(&artist_id_or_name);
+                tracing::info!(
+                    "[UI] OpenArtist('{artist_id_or_name}') -> label='{}'",
+                    label
+                );
+                if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
+                    && label != "Artist"
+                {
+                    self.record_recent_search_entry(RecentSearchEntry {
+                        label: label.clone(),
+                        subtitle: "Artist".to_string(),
+                        query: label.clone(),
+                        kind: RecentSearchKind::Artist {
+                            uri: artist_id_or_name.clone(),
+                        },
+                    });
+                }
                 self.artist_bio_expanded = false;
+                self.push_route(StageRoute::Artist {
+                    id_or_uri: artist_id_or_name.clone(),
+                    label,
+                });
                 let _ = self
                     .engine
                     .command_tx
                     .send(PlayerCommand::SelectArtist(artist_id_or_name));
             }
             Message::CloseArtistView => {
-                tracing::info!("[UI] CloseArtistView");
-                self.viewing_artist = false;
+                tracing::info!("[UI] CloseArtistView -> NavigateBack");
                 self.artist_bio_expanded = false;
+                if self.can_go_back() {
+                    self.nav_index -= 1;
+                    self.activate_current_route();
+                } else {
+                    self.push_route(StageRoute::Section(NavSection::Search));
+                }
             }
             Message::ToggleArtistBio => {
                 self.artist_bio_expanded = !self.artist_bio_expanded;
@@ -308,14 +692,118 @@ impl GrooveApp {
                     self.artist_bio_expanded
                 );
             }
+            Message::OpenAlbum(album_uri) => {
+                let (label, artist_name, artist_uri) = self.resolve_album_meta(&album_uri);
+                tracing::info!(
+                    "[UI] OpenAlbum('{album_uri}') -> label='{}', artist={:?}",
+                    label,
+                    artist_name
+                );
+                if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
+                    && label != "Album"
+                {
+                    let artist_str = artist_name
+                        .clone()
+                        .unwrap_or_else(|| "Album".to_string());
+                    self.record_recent_search_entry(RecentSearchEntry {
+                        label: label.clone(),
+                        subtitle: format!("Album · {artist_str}"),
+                        query: label.clone(),
+                        kind: RecentSearchKind::Album {
+                            uri: album_uri.clone(),
+                            artist_name: artist_str,
+                        },
+                    });
+                }
+                let already_same = self.selected_album.as_ref().is_some_and(|d| {
+                    d.album.spotify_uri.eq_ignore_ascii_case(&album_uri)
+                        || d.album.id.eq_ignore_ascii_case(&album_uri)
+                        || d.album.title.eq_ignore_ascii_case(&album_uri)
+                });
+                if !already_same {
+                    self.selected_album = None;
+                    if let Some(artist_detail) = &self.selected_artist {
+                        if let Some(alb) = artist_detail.albums.iter().find(|a| {
+                            a.spotify_uri.eq_ignore_ascii_case(&album_uri)
+                                || a.id.eq_ignore_ascii_case(&album_uri)
+                                || a.title.eq_ignore_ascii_case(&album_uri)
+                        }) {
+                            self.selected_album = Some(AlbumDetail {
+                                album: alb.clone(),
+                                artist_uri: Some(artist_detail.artist.spotify_uri.clone()),
+                                tracks: Vec::new(),
+                            });
+                        }
+                    }
+                    if self.selected_album.is_none() {
+                        if let Some(alb) = self.search_albums.iter().find(|a| {
+                            a.spotify_uri.eq_ignore_ascii_case(&album_uri)
+                                || a.id.eq_ignore_ascii_case(&album_uri)
+                                || a.title.eq_ignore_ascii_case(&album_uri)
+                        }) {
+                            self.selected_album = Some(AlbumDetail {
+                                album: alb.clone(),
+                                artist_uri: artist_uri.clone(),
+                                tracks: Vec::new(),
+                            });
+                        }
+                    }
+                    if self.selected_album.is_none() {
+                        self.selected_album = Some(groove_spotify::web_api::fallback_album_detail(
+                            &album_uri, None,
+                        ));
+                    }
+                }
+                self.push_route(StageRoute::Album {
+                    id_or_uri: album_uri.clone(),
+                    label,
+                    artist_name,
+                    artist_uri,
+                });
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::SelectAlbum(album_uri));
+            }
             Message::PlayAlbum(album_uri) => {
-                tracing::info!("[UI] PlayAlbum('{album_uri}')");
+                let (label, artist_name, _) = self.resolve_album_meta(&album_uri);
+                tracing::info!("[UI] PlayAlbum('{album_uri}') -> label='{label}'");
+                if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
+                    && label != "Album"
+                {
+                    let artist_str = artist_name.unwrap_or_else(|| "Album".to_string());
+                    self.record_recent_search_entry(RecentSearchEntry {
+                        label: label.clone(),
+                        subtitle: format!("Album · {artist_str}"),
+                        query: label,
+                        kind: RecentSearchKind::Album {
+                            uri: album_uri.clone(),
+                            artist_name: artist_str,
+                        },
+                    });
+                }
                 let _ = self
                     .engine
                     .command_tx
                     .send(PlayerCommand::PlayAlbum(album_uri));
-                self.viewing_artist = false;
-                self.active_nav = NavSection::NowPlaying;
+                self.push_route(StageRoute::Section(NavSection::NowPlaying));
+            }
+            Message::PlayAlbumTrack(track_idx) => {
+                if let Some(detail) = &self.selected_album {
+                    if let Some(chosen) = detail.tracks.get(track_idx).cloned() {
+                        tracing::info!(
+                            "[UI] PlayAlbumTrack({track_idx}) -> '{}' from album '{}'",
+                            chosen.title,
+                            detail.album.title
+                        );
+                        self.state.queue = detail.tracks.clone();
+                        let _ = self
+                            .engine
+                            .command_tx
+                            .send(PlayerCommand::PlayTrack(chosen));
+                        self.push_route(StageRoute::Section(NavSection::NowPlaying));
+                    }
+                }
             }
             Message::PlayArtistTopTracks => {
                 if let Some(detail) = &self.selected_artist {
@@ -329,8 +817,7 @@ impl GrooveApp {
                             .engine
                             .command_tx
                             .send(PlayerCommand::PlayTrack(first));
-                        self.viewing_artist = false;
-                        self.active_nav = NavSection::NowPlaying;
+                        self.push_route(StageRoute::Section(NavSection::NowPlaying));
                     }
                 }
             }
@@ -349,7 +836,11 @@ impl GrooveApp {
                 });
             }
             Message::SelectOutputDevice(device) => {
-                tracing::info!("[UI] SelectOutputDevice -> '{}' (id={})", device.name, device.id);
+                tracing::info!(
+                    "[UI] SelectOutputDevice -> '{}' (id={})",
+                    device.name,
+                    device.id
+                );
                 self.state.selected_device = device.clone();
                 let _ = self
                     .engine
@@ -378,6 +869,72 @@ impl GrooveApp {
                     .engine
                     .command_tx
                     .send(PlayerCommand::SearchCatalog(query));
+            }
+            Message::SubmitSearch => {
+                let trimmed = self.search_query.trim().to_string();
+                if !trimmed.is_empty() {
+                    tracing::info!("[UI] SubmitSearch -> '{trimmed}'");
+                    self.record_recent_search_entry(RecentSearchEntry {
+                        label: trimmed.clone(),
+                        subtitle: "Search".to_string(),
+                        query: trimmed.clone(),
+                        kind: RecentSearchKind::Query,
+                    });
+                    let _ = self
+                        .engine
+                        .command_tx
+                        .send(PlayerCommand::SearchCatalog(trimmed));
+                }
+            }
+            Message::ClearSearchQuery => {
+                tracing::info!("[UI] ClearSearchQuery");
+                self.search_query.clear();
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::SearchCatalog(String::new()));
+            }
+            Message::SelectRecentSearch(idx) => {
+                if let Some(entry) = self.recent_searches.get(idx).cloned() {
+                    tracing::info!(
+                        "[UI] SelectRecentSearch({idx}) -> '{}' ({:?})",
+                        entry.label,
+                        entry.kind
+                    );
+                    self.record_recent_search_entry(entry.clone());
+                    match entry.kind {
+                        RecentSearchKind::Query | RecentSearchKind::Track { .. } => {
+                            self.search_query = entry.query.clone();
+                            let _ = self
+                                .engine
+                                .command_tx
+                                .send(PlayerCommand::SearchCatalog(entry.query));
+                        }
+                        RecentSearchKind::Artist { uri } => {
+                            self.search_query = entry.query.clone();
+                            let _ = self
+                                .engine
+                                .command_tx
+                                .send(PlayerCommand::SearchCatalog(entry.query));
+                            return self.update(Message::OpenArtist(uri));
+                        }
+                        RecentSearchKind::Album { uri, .. } => {
+                            return self.update(Message::OpenAlbum(uri));
+                        }
+                    }
+                }
+            }
+            Message::RemoveRecentSearch(idx) => {
+                if idx < self.recent_searches.len() {
+                    let removed = self.recent_searches.remove(idx);
+                    tracing::info!("[UI] RemoveRecentSearch({idx}) -> '{}'", removed.label);
+                    save_recent_searches(&self.recent_searches);
+                }
+            }
+            Message::ClearRecentSearches => {
+                tracing::info!("[UI] ClearRecentSearches");
+                self.recent_searches.clear();
+                save_recent_searches(&self.recent_searches);
             }
             Message::ToggleTrackMenu => {
                 self.show_track_details_banner = !self.show_track_details_banner;
@@ -426,6 +983,16 @@ impl GrooveApp {
                 }
             }
             for t in &detail.top_tracks {
+                if let Some(u) = &t.cover_art_url {
+                    urls.push(u.clone());
+                }
+            }
+        }
+        if let Some(detail) = &self.selected_album {
+            if let Some(u) = &detail.album.cover_art_url {
+                urls.push(u.clone());
+            }
+            for t in &detail.tracks {
                 if let Some(u) = &t.cover_art_url {
                     urls.push(u.clone());
                 }
@@ -518,6 +1085,11 @@ impl GrooveApp {
                     albums.len(),
                     tracks.len()
                 );
+                if query.trim().len() >= 2
+                    && (!artists.is_empty() || !albums.is_empty() || !tracks.is_empty())
+                {
+                    self.record_recent_query_from_search(&query);
+                }
                 self.search_artists = artists;
                 self.search_albums = albums;
                 self.search_results = tracks;
@@ -529,22 +1101,56 @@ impl GrooveApp {
                     detail.albums.len(),
                     detail.top_tracks.len()
                 );
+                let loaded_name = detail.artist.name.clone();
+                let loaded_uri = detail.artist.spotify_uri.clone();
                 self.selected_artist = Some(*detail);
-                self.viewing_artist = true;
                 self.artist_bio_expanded = false;
+                if let Some(StageRoute::Artist { id_or_uri, label }) =
+                    self.nav_history.get_mut(self.nav_index)
+                {
+                    *id_or_uri = loaded_uri;
+                    *label = loaded_name;
+                }
+            }
+            EngineEvent::AlbumDetailLoaded(detail) => {
+                tracing::info!(
+                    "[UI] EngineEvent::AlbumDetailLoaded('{}' by '{}') -> {} tracks",
+                    detail.album.title,
+                    detail.album.artist_name,
+                    detail.tracks.len()
+                );
+                let loaded_title = detail.album.title.clone();
+                let loaded_uri = detail.album.spotify_uri.clone();
+                let loaded_artist_name = detail.album.artist_name.clone();
+                let loaded_artist_uri = detail.artist_uri.clone();
+                self.selected_album = Some(*detail);
+                if let Some(StageRoute::Album {
+                    id_or_uri,
+                    label,
+                    artist_name,
+                    artist_uri,
+                }) = self.nav_history.get_mut(self.nav_index)
+                {
+                    *id_or_uri = loaded_uri;
+                    *label = loaded_title;
+                    *artist_name = Some(loaded_artist_name);
+                    if loaded_artist_uri.is_some() {
+                        *artist_uri = loaded_artist_uri;
+                    }
+                }
             }
         }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
         let sidebar = self.view_sidebar();
-        let center_stage = if self.viewing_artist {
-            self.view_artist_stage()
-        } else {
-            match self.active_nav {
-                NavSection::NowPlaying => self.view_now_playing_stage(),
-                NavSection::Search => self.view_search_stage(),
-                NavSection::Home | NavSection::YourLibrary => self.view_library_stage(),
+        let center_stage = match self.current_route() {
+            StageRoute::Artist { .. } => self.view_artist_stage(),
+            StageRoute::Album { .. } => self.view_album_stage(),
+            StageRoute::Section(NavSection::NowPlaying) => self.view_now_playing_stage(),
+            StageRoute::Section(NavSection::Search) => self.view_search_stage(),
+            StageRoute::Section(NavSection::Home | NavSection::YourLibrary) => {
+                self.view_library_stage()
             }
         };
         let queue_pane = self.view_queue_pane();
@@ -740,7 +1346,7 @@ impl GrooveApp {
         section: NavSection,
         icon_handle: svg::Handle,
     ) -> Element<'a, Message> {
-        let is_active = self.active_nav == section && !self.viewing_artist;
+        let is_active = matches!(self.current_route(), StageRoute::Section(sec) if *sec == section);
         let label_text = text(section.label())
             .size(14)
             .color(palette::INK_PRIMARY);
@@ -760,6 +1366,167 @@ impl GrooveApp {
             .padding(Padding::from([9, 12]))
             .style(theme::nav_pill_button(is_active))
             .into()
+    }
+
+    /// Persistent multi-level visual navigation bar with Back, Forward, interactive
+    /// breadcrumb trail (`Search › Artist · Mastodon › Album · Marrow Deep`), and contextual jumps.
+    fn view_navigation_bar(&self) -> Element<'_, Message> {
+        let back_btn: Element<'_, Message> = if self.can_go_back() {
+            let prev_label = self
+                .nav_history
+                .get(self.nav_index.saturating_sub(1))
+                .map(|r| truncate_nav_label(r.label(), 16))
+                .unwrap_or_else(|| "Back".to_string());
+            button(
+                row![
+                    text("‹").size(15).color(palette::EMERALD),
+                    text(prev_label).size(12.0).color(palette::INK_PRIMARY),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::NavigateBack)
+            .padding(Padding::from([5, 10]))
+            .style(theme::subtle_row_button(true))
+            .into()
+        } else {
+            container(text("‹ Back").size(12.0).color(palette::INK_MUTED))
+                .padding(Padding::from([5, 10]))
+                .into()
+        };
+
+        let forward_btn: Element<'_, Message> = if self.can_go_forward() {
+            button(text("›").size(15).color(palette::INK_PRIMARY))
+                .on_press(Message::NavigateForward)
+                .padding(Padding::from([4, 9]))
+                .style(theme::subtle_row_button(false))
+                .into()
+        } else {
+            container(text("›").size(15).color(palette::INK_MUTED))
+                .padding(Padding::from([4, 9]))
+                .into()
+        };
+
+        let mut crumbs_row = row![].spacing(4).align_y(Alignment::Center);
+        let max_visible_crumbs = 4usize;
+        let active_end = self.nav_index + 1;
+        let start_idx = active_end.saturating_sub(max_visible_crumbs);
+
+        if start_idx > 0 {
+            let jump_idx = start_idx - 1;
+            crumbs_row = crumbs_row.push(
+                button(text("…").size(12.0).color(palette::INK_MUTED))
+                    .on_press(Message::NavigateHistory(jump_idx))
+                    .padding(Padding::from([3, 6]))
+                    .style(theme::subtle_row_button(false)),
+            );
+            crumbs_row = crumbs_row.push(text("›").size(12.0).color(palette::INK_MUTED));
+        }
+
+        for idx in start_idx..active_end {
+            if let Some(route) = self.nav_history.get(idx) {
+                let is_current = idx == self.nav_index;
+                let crumb_text = route.breadcrumb_label();
+                if is_current {
+                    crumbs_row = crumbs_row.push(
+                        container(
+                            text(crumb_text)
+                                .size(12.0)
+                                .color(palette::INK_PRIMARY),
+                        )
+                        .padding(Padding::from([4, 9]))
+                        .style(|_| container::Style {
+                            background: Some(iced::Background::Color(palette::SIDEBAR_ACTIVE_PILL)),
+                            border: iced::Border {
+                                radius: 8.0.into(),
+                                color: palette::DIVIDER,
+                                width: 1.0,
+                            },
+                            ..Default::default()
+                        }),
+                    );
+                } else {
+                    crumbs_row = crumbs_row.push(
+                        button(
+                            text(crumb_text)
+                                .size(12.0)
+                                .color(palette::INK_SECONDARY),
+                        )
+                        .on_press(Message::NavigateHistory(idx))
+                        .padding(Padding::from([4, 8]))
+                        .style(theme::subtle_row_button(false)),
+                    );
+                    crumbs_row = crumbs_row.push(text("›").size(12.0).color(palette::INK_MUTED));
+                }
+            }
+        }
+
+        let mut right_actions = row![].spacing(6).align_y(Alignment::Center);
+
+        // When viewing an Album, always provide a direct 1-click pill to its Artist page in the nav bar.
+        if let StageRoute::Album {
+            artist_name: Some(artist_name),
+            artist_uri,
+            ..
+        } = self.current_route()
+        {
+            let target = artist_uri
+                .clone()
+                .unwrap_or_else(|| artist_name.clone());
+            let prev_is_same_artist = self.nav_index > 0
+                && matches!(
+                    self.nav_history.get(self.nav_index - 1),
+                    Some(StageRoute::Artist { label, .. }) if label.eq_ignore_ascii_case(artist_name)
+                );
+            let btn_msg = if prev_is_same_artist {
+                Message::NavigateBack
+            } else {
+                Message::OpenArtist(target)
+            };
+            right_actions = right_actions.push(
+                button(
+                    text(format!(
+                        "Artist: {} ›",
+                        truncate_nav_label(artist_name, 16)
+                    ))
+                    .size(11.5)
+                    .color(palette::EMERALD),
+                )
+                .on_press(btn_msg)
+                .padding(Padding::from([5, 10]))
+                .style(theme::subtle_row_button(false)),
+            );
+        }
+
+        if !matches!(
+            self.current_route(),
+            StageRoute::Section(NavSection::NowPlaying)
+        ) {
+            right_actions = right_actions.push(
+                button(text("Now Playing ♫").size(11.5))
+                    .on_press(Message::SelectNav(NavSection::NowPlaying))
+                    .padding(Padding::from([5, 11]))
+                    .style(theme::nav_pill_button(true)),
+            );
+        }
+
+        container(
+            row![
+                row![back_btn, forward_btn]
+                    .spacing(2)
+                    .align_y(Alignment::Center),
+                text("|").size(12.0).color(palette::DIVIDER),
+                crumbs_row,
+                horizontal_space(),
+                right_actions,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(Padding::from([6, 10]))
+        .style(theme::breadcrumb_bar_container)
+        .into()
     }
 
     /// Column 2: Main "Now Playing" center stage matching the Groove mockup.
@@ -791,13 +1558,33 @@ impl GrooveApp {
         .padding(Padding::from([1, 4]))
         .style(theme::icon_ghost_button);
 
+        let album_link_btn = button(
+            row![
+                text(&track.album).size(13.5).color(palette::INK_MUTED),
+                text("›").size(13).color(palette::INK_MUTED),
+            ]
+            .spacing(3)
+            .align_y(Alignment::Center),
+        )
+        .on_press(Message::OpenAlbum(track.album.clone()))
+        .padding(Padding::from([1, 4]))
+        .style(theme::icon_ghost_button);
+
+        let subtitle_links = row![
+            artist_link_btn,
+            text("•").size(12).color(palette::INK_MUTED),
+            album_link_btn,
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
+
         let title_and_actions = row![
             column![
                 text(&track.title)
                     .font(SERIF_FONT)
                     .size(31)
                     .color(palette::INK_PRIMARY),
-                artist_link_btn,
+                subtitle_links,
             ]
             .spacing(2)
             .width(Length::Fill),
@@ -980,7 +1767,21 @@ impl GrooveApp {
             .align_y(Alignment::Center)
             .width(Length::Fixed(450.0));
 
+        let nav_bar_opt: Element<'_, Message> =
+            if self.can_go_back() || self.can_go_forward() || self.nav_history.len() > 1 {
+                column![
+                    vertical_space().height(Length::Fixed(10.0)),
+                    self.view_navigation_bar(),
+                ]
+                .spacing(4)
+                .width(Length::Fill)
+                .into()
+            } else {
+                vertical_space().height(Length::Fixed(0.0)).into()
+            };
+
         let stage_column = column![
+            nav_bar_opt,
             vertical_space(),
             hero_art,
             vertical_space().height(Length::Fixed(18.0)),
@@ -998,7 +1799,7 @@ impl GrooveApp {
         .align_x(Alignment::Center)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(Padding::from([24, 32]));
+        .padding(Padding::from([20, 32]));
 
         container(stage_column)
             .width(Length::Fill)
@@ -1122,10 +1923,6 @@ impl GrooveApp {
                 .size(32)
                 .color(palette::INK_PRIMARY),
             horizontal_space(),
-            button(text("Now Playing").size(12.5))
-                .on_press(Message::SelectNav(NavSection::NowPlaying))
-                .padding(Padding::from([6, 12]))
-                .style(theme::nav_pill_button(true)),
         ]
         .align_y(Alignment::Center);
 
@@ -1134,10 +1931,89 @@ impl GrooveApp {
             &self.search_query,
         )
         .on_input(Message::SearchQueryChanged)
+        .on_submit(Message::SubmitSearch)
         .padding(12)
-        .size(14);
+        .size(14)
+        .width(Length::Fill);
+
+        let mut search_bar_row = row![input].spacing(8).align_y(Alignment::Center);
+        if !self.search_query.is_empty() {
+            search_bar_row = search_bar_row.push(
+                button(text("Clear").size(12.0).color(palette::INK_SECONDARY))
+                    .on_press(Message::ClearSearchQuery)
+                    .padding(Padding::from([10, 14]))
+                    .style(theme::subtle_row_button(false)),
+            );
+        }
 
         let mut content_col = column![].spacing(18);
+
+        // 0. Recently Searched section (persisted across sessions)
+        if !self.recent_searches.is_empty() {
+            let recent_header = row![
+                text("Recently Searched")
+                    .font(SERIF_FONT)
+                    .size(20)
+                    .color(palette::INK_PRIMARY),
+                horizontal_space(),
+                button(text("Clear All").size(11.5).color(palette::INK_MUTED))
+                    .on_press(Message::ClearRecentSearches)
+                    .padding(Padding::from([4, 9]))
+                    .style(theme::subtle_row_button(false)),
+            ]
+            .align_y(Alignment::Center);
+
+            let mut chips_grid = column![].spacing(7);
+            let indexed_recent: Vec<(usize, &RecentSearchEntry)> =
+                self.recent_searches.iter().enumerate().take(6).collect();
+            for chunk in indexed_recent.chunks(3) {
+                let mut r = row![].spacing(8);
+                for (idx, entry) in chunk {
+                    let badge_color = match entry.kind {
+                        RecentSearchKind::Artist { .. } | RecentSearchKind::Album { .. } => {
+                            palette::EMERALD
+                        }
+                        _ => palette::INK_MUTED,
+                    };
+                    let chip = container(
+                        row![
+                            button(
+                                column![
+                                    text(entry.kind.badge_label())
+                                        .size(9.5)
+                                        .color(badge_color),
+                                    text(truncate_nav_label(&entry.label, 22))
+                                        .size(13.0)
+                                        .color(palette::INK_PRIMARY),
+                                ]
+                                .spacing(1)
+                                .width(Length::Fill),
+                            )
+                            .on_press(Message::SelectRecentSearch(*idx))
+                            .width(Length::Fill)
+                            .padding(Padding::from([6, 9]))
+                            .style(theme::subtle_row_button(false)),
+                            button(text("×").size(13.5).color(palette::INK_MUTED))
+                                .on_press(Message::RemoveRecentSearch(*idx))
+                                .padding(Padding::from([5, 8]))
+                                .style(theme::subtle_row_button(false)),
+                        ]
+                        .spacing(2)
+                        .align_y(Alignment::Center),
+                    )
+                    .width(Length::FillPortion(1))
+                    .style(theme::recent_search_chip_card);
+
+                    r = r.push(chip);
+                }
+                for _ in chunk.len()..3 {
+                    r = r.push(horizontal_space().width(Length::FillPortion(1)));
+                }
+                chips_grid = chips_grid.push(r);
+            }
+
+            content_col = content_col.push(column![recent_header, chips_grid].spacing(7));
+        }
 
         // 1. Artists section
         if !self.search_artists.is_empty() {
@@ -1209,29 +2085,38 @@ impl GrooveApp {
                     .width(Length::Fixed(52.0))
                     .height(Length::Fixed(52.0));
 
-                    let alb_card = button(
-                        row![
-                            cover,
-                            column![
-                                text(&alb.title).size(14).color(palette::INK_PRIMARY),
-                                text(format!(
-                                    "{} · {} · {}",
-                                    alb.artist_name, alb.release_year, alb.album_type
-                                ))
-                                .size(11.5)
-                                .color(palette::INK_SECONDARY),
+                    let alb_card = row![
+                        button(
+                            row![
+                                cover,
+                                column![
+                                    text(&alb.title).size(14).color(palette::INK_PRIMARY),
+                                    text(format!(
+                                        "{} · {} · {}",
+                                        alb.artist_name, alb.release_year, alb.album_type
+                                    ))
+                                    .size(11.5)
+                                    .color(palette::INK_SECONDARY),
+                                ]
+                                .spacing(2)
+                                .width(Length::Fill),
+                                text("Tracks ›").size(11.5).color(palette::INK_MUTED),
                             ]
-                            .spacing(2)
-                            .width(Length::Fill),
-                            text("Play").size(11.5).color(palette::INK_MUTED),
-                        ]
-                        .spacing(12)
-                        .align_y(Alignment::Center),
-                    )
-                    .on_press(Message::PlayAlbum(alb.spotify_uri.clone()))
-                    .width(Length::FillPortion(1))
-                    .padding(Padding::from([8, 10]))
-                    .style(theme::subtle_row_button(false));
+                            .spacing(12)
+                            .align_y(Alignment::Center),
+                        )
+                        .on_press(Message::OpenAlbum(alb.spotify_uri.clone()))
+                        .width(Length::Fill)
+                        .padding(Padding::from([8, 10]))
+                        .style(theme::subtle_row_button(false)),
+                        button(text("▶").size(12).color(palette::EMERALD))
+                            .on_press(Message::PlayAlbum(alb.spotify_uri.clone()))
+                            .padding(Padding::from([10, 10]))
+                            .style(theme::subtle_row_button(false)),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center)
+                    .width(Length::FillPortion(1));
 
                     r = r.push(alb_card);
                 }
@@ -1317,14 +2202,15 @@ impl GrooveApp {
 
         container(
             column![
-                vertical_space().height(Length::Fixed(16.0)),
+                vertical_space().height(Length::Fixed(10.0)),
+                self.view_navigation_bar(),
                 header,
                 self.view_spotify_auth_banner(),
-                input,
+                search_bar_row,
                 scrollable(content_col).height(Length::Fill),
             ]
-            .spacing(14)
-            .padding(Padding::from([24, 34])),
+            .spacing(12)
+            .padding(Padding::from([20, 34])),
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -1337,19 +2223,6 @@ impl GrooveApp {
         let Some(detail) = &self.selected_artist else {
             return self.view_search_stage();
         };
-
-        let nav_bar = row![
-            button(text("← Back").size(12.5))
-                .on_press(Message::CloseArtistView)
-                .padding(Padding::from([6, 12]))
-                .style(theme::subtle_row_button(true)),
-            horizontal_space(),
-            button(text("Now Playing").size(12.5))
-                .on_press(Message::SelectNav(NavSection::NowPlaying))
-                .padding(Padding::from([6, 12]))
-                .style(theme::nav_pill_button(true)),
-        ]
-        .align_y(Alignment::Center);
 
         let portrait = container(
             image(self.artwork.hero_or_url(
@@ -1464,7 +2337,7 @@ impl GrooveApp {
                 None
             };
 
-        // Discography — Albums & Singles with artwork
+        // Discography — Albums & Singles with artwork (click card to open Album page, or ▶ to play)
         let mut albums_section = column![
             text("Albums & Releases")
                 .font(SERIF_FONT)
@@ -1486,25 +2359,42 @@ impl GrooveApp {
                 )
                 .style(theme::album_art_shadow_card);
 
-                let card = button(
-                    column![
-                        cover,
-                        vertical_space().height(Length::Fixed(4.0)),
-                        text(&alb.title).size(13.5).color(palette::INK_PRIMARY),
-                        text(format!(
-                            "{} • {} ({} tracks)",
-                            alb.release_year, alb.album_type, alb.track_count
-                        ))
-                        .size(11.5)
-                        .color(palette::INK_SECONDARY),
+                let card = column![
+                    button(
+                        column![
+                            cover,
+                            vertical_space().height(Length::Fixed(4.0)),
+                            text(&alb.title).size(13.5).color(palette::INK_PRIMARY),
+                            text(format!(
+                                "{} • {} ({} tracks)",
+                                alb.release_year, alb.album_type, alb.track_count
+                            ))
+                            .size(11.5)
+                            .color(palette::INK_SECONDARY),
+                        ]
+                        .spacing(3)
+                        .align_x(Alignment::Start),
+                    )
+                    .on_press(Message::OpenAlbum(alb.spotify_uri.clone()))
+                    .width(Length::Fill)
+                    .padding(Padding::from([10, 10]))
+                    .style(theme::subtle_row_button(false)),
+                    row![
+                        button(text("View Album ›").size(11.0).color(palette::INK_SECONDARY))
+                            .on_press(Message::OpenAlbum(alb.spotify_uri.clone()))
+                            .padding(Padding::from([3, 8]))
+                            .style(theme::subtle_row_button(false)),
+                        horizontal_space(),
+                        button(text("▶ Play").size(11.0).color(palette::EMERALD))
+                            .on_press(Message::PlayAlbum(alb.spotify_uri.clone()))
+                            .padding(Padding::from([3, 8]))
+                            .style(theme::subtle_row_button(true)),
                     ]
-                    .spacing(3)
-                    .align_x(Alignment::Start),
-                )
-                .on_press(Message::PlayAlbum(alb.spotify_uri.clone()))
-                .width(Length::FillPortion(1))
-                .padding(Padding::from([10, 10]))
-                .style(theme::subtle_row_button(false));
+                    .align_y(Alignment::Center)
+                    .padding(Padding::from([0, 6])),
+                ]
+                .spacing(2)
+                .width(Length::FillPortion(1));
 
                 album_row = album_row.push(card);
             }
@@ -1525,37 +2415,47 @@ impl GrooveApp {
 
         for (idx, track) in detail.top_tracks.iter().enumerate() {
             let is_current = track.id == self.state.current_track.id;
-            let track_btn = button(
-                row![
-                    text(format!("{:02}", idx + 1))
-                        .size(12)
-                        .color(palette::INK_MUTED)
-                        .width(Length::Fixed(22.0)),
-                    image(
-                        self.artwork
-                            .thumb_or_url(track.cover_art_url.as_deref(), track.artwork_theme)
-                    )
-                    .width(Length::Fixed(40.0))
-                    .height(Length::Fixed(40.0)),
-                    column![
-                        text(&track.title).size(14).color(palette::INK_PRIMARY),
-                        text(&track.album).size(12).color(palette::INK_SECONDARY),
+            let track_row = row![
+                button(
+                    row![
+                        text(format!("{:02}", idx + 1))
+                            .size(12)
+                            .color(palette::INK_MUTED)
+                            .width(Length::Fixed(22.0)),
+                        image(
+                            self.artwork.thumb_or_url(
+                                track.cover_art_url.as_deref(),
+                                track.artwork_theme
+                            )
+                        )
+                        .width(Length::Fixed(40.0))
+                        .height(Length::Fixed(40.0)),
+                        column![
+                            text(&track.title).size(14).color(palette::INK_PRIMARY),
+                            text(&track.album).size(12).color(palette::INK_SECONDARY),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        text(track.formatted_duration())
+                            .size(12)
+                            .color(palette::INK_MUTED),
                     ]
-                    .spacing(2)
-                    .width(Length::Fill),
-                    text(track.formatted_duration())
-                        .size(12)
-                        .color(palette::INK_MUTED),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center),
-            )
-            .on_press(Message::PlaySpecificTrack(track.clone()))
-            .width(Length::Fill)
-            .padding(Padding::from([6, 10]))
-            .style(theme::subtle_row_button(is_current));
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::PlaySpecificTrack(track.clone()))
+                .width(Length::Fill)
+                .padding(Padding::from([6, 10]))
+                .style(theme::subtle_row_button(is_current)),
+                button(text("Album ›").size(11.5).color(palette::INK_SECONDARY))
+                    .on_press(Message::OpenAlbum(track.album.clone()))
+                    .padding(Padding::from([7, 10]))
+                    .style(theme::subtle_row_button(false)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
 
-            top_tracks_col = top_tracks_col.push(track_btn);
+            top_tracks_col = top_tracks_col.push(track_row);
         }
 
         let mut stage_col = column![hero_header].spacing(18);
@@ -1572,12 +2472,189 @@ impl GrooveApp {
 
         container(
             column![
-                vertical_space().height(Length::Fixed(16.0)),
-                nav_bar,
+                vertical_space().height(Length::Fixed(10.0)),
+                self.view_navigation_bar(),
                 body_scroll,
             ]
             .spacing(14)
-            .padding(Padding::from([24, 34])),
+            .padding(Padding::from([20, 34])),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::center_stage_container)
+        .into()
+    }
+
+    /// Dedicated Album detail & tracklist stage with visual navigation back to Artist (or deeper).
+    fn view_album_stage(&self) -> Element<'_, Message> {
+        let Some(detail) = &self.selected_album else {
+            return container(
+                column![
+                    vertical_space().height(Length::Fixed(10.0)),
+                    self.view_navigation_bar(),
+                    vertical_space().height(Length::Fixed(40.0)),
+                    text("Loading album tracks & artwork...")
+                        .font(SERIF_FONT)
+                        .size(28)
+                        .color(palette::INK_SECONDARY),
+                ]
+                .spacing(14)
+                .padding(Padding::from([20, 34])),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::center_stage_container)
+            .into();
+        };
+
+        let cover = container(
+            image(self.artwork.hero_or_url(
+                detail.album.cover_art_url.as_deref(),
+                detail.album.artwork_theme,
+            ))
+            .width(Length::Fixed(208.0))
+            .height(Length::Fixed(208.0)),
+        )
+        .style(theme::album_art_shadow_card);
+
+        let artist_target = detail
+            .artist_uri
+            .clone()
+            .unwrap_or_else(|| detail.album.artist_name.clone());
+
+        let prev_is_same_artist = self.nav_index > 0
+            && matches!(
+                self.nav_history.get(self.nav_index - 1),
+                Some(StageRoute::Artist { label, .. })
+                    if label.eq_ignore_ascii_case(&detail.album.artist_name)
+            );
+
+        let to_artist_msg = if prev_is_same_artist {
+            Message::NavigateBack
+        } else {
+            Message::OpenArtist(artist_target.clone())
+        };
+
+        let total_secs: u32 = detail.tracks.iter().map(|t| t.duration_secs).sum();
+        let total_mins = (total_secs / 60).max(1);
+
+        let artist_link_btn = button(
+            row![
+                text(&detail.album.artist_name)
+                    .font(SERIF_FONT)
+                    .size(21)
+                    .color(palette::INK_PRIMARY),
+                text("Artist Page ›").size(12.0).color(palette::EMERALD),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .on_press(to_artist_msg.clone())
+        .padding(Padding::from([4, 8]))
+        .style(theme::subtle_row_button(false));
+
+        let action_row = row![
+            button(text("▶  Play Album").size(12.5))
+                .on_press(Message::PlayAlbum(detail.album.spotify_uri.clone()))
+                .padding(Padding::from([8, 16]))
+                .style(theme::subtle_row_button(true)),
+            button(
+                text(format!("← {} Page", detail.album.artist_name))
+                    .size(12.0)
+                    .color(palette::INK_PRIMARY)
+            )
+            .on_press(to_artist_msg)
+            .padding(Padding::from([7, 13]))
+            .style(theme::nav_pill_button(false)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        let eyebrow = format!(
+            "{}  •  {}",
+            detail.album.album_type.to_uppercase(),
+            detail.album.release_year
+        );
+        let stats_line = format!(
+            "{} tracks  •  {} min  •  320 kbps Ogg Vorbis",
+            detail.tracks.len(),
+            total_mins
+        );
+
+        let hero_header = row![
+            cover,
+            column![
+                text(eyebrow).size(10.5).color(palette::EMERALD),
+                text(&detail.album.title)
+                    .font(SERIF_FONT)
+                    .size(38)
+                    .color(palette::INK_PRIMARY),
+                artist_link_btn,
+                text(stats_line).size(12.5).color(palette::INK_SECONDARY),
+                vertical_space().height(Length::Fixed(6.0)),
+                action_row,
+            ]
+            .spacing(5)
+            .width(Length::Fill),
+        ]
+        .spacing(24)
+        .align_y(Alignment::Center);
+
+        let mut tracks_col = column![
+            text("Album Tracks")
+                .font(SERIF_FONT)
+                .size(23)
+                .color(palette::INK_PRIMARY)
+        ]
+        .spacing(6);
+
+        for (idx, track) in detail.tracks.iter().enumerate() {
+            let is_current = track.id == self.state.current_track.id;
+            let track_row = row![
+                button(
+                    row![
+                        text(format!("{:02}", idx + 1))
+                            .size(12)
+                            .color(palette::INK_MUTED)
+                            .width(Length::Fixed(24.0)),
+                        column![
+                            text(&track.title).size(14.5).color(palette::INK_PRIMARY),
+                            text(&track.artist).size(12.0).color(palette::INK_SECONDARY),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        text(track.formatted_duration())
+                            .size(12.5)
+                            .color(palette::INK_MUTED),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::PlayAlbumTrack(idx))
+                .width(Length::Fill)
+                .padding(Padding::from([7, 10]))
+                .style(theme::subtle_row_button(is_current)),
+                button(text("Artist ›").size(11.5).color(palette::INK_SECONDARY))
+                    .on_press(Message::OpenArtist(track.artist.clone()))
+                    .padding(Padding::from([7, 10]))
+                    .style(theme::subtle_row_button(false)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+
+            tracks_col = tracks_col.push(track_row);
+        }
+
+        let stage_col = column![hero_header, horizontal_rule(1), tracks_col].spacing(18);
+
+        container(
+            column![
+                vertical_space().height(Length::Fixed(10.0)),
+                self.view_navigation_bar(),
+                scrollable(stage_col).height(Length::Fill),
+            ]
+            .spacing(14)
+            .padding(Padding::from([20, 34])),
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -1598,10 +2675,6 @@ impl GrooveApp {
                 .size(32)
                 .color(palette::INK_PRIMARY),
             horizontal_space(),
-            button(text("Open Now Playing").size(12.5))
-                .on_press(Message::SelectNav(NavSection::NowPlaying))
-                .padding(Padding::from([6, 12]))
-                .style(theme::nav_pill_button(true)),
         ]
         .align_y(Alignment::Center);
 
@@ -1684,13 +2757,14 @@ impl GrooveApp {
 
         container(
             column![
-                vertical_space().height(Length::Fixed(16.0)),
+                vertical_space().height(Length::Fixed(10.0)),
+                self.view_navigation_bar(),
                 header,
                 self.view_spotify_auth_banner(),
                 scrollable(playlist_cards).height(Length::Fill),
             ]
-            .spacing(14)
-            .padding(Padding::from([24, 34])),
+            .spacing(12)
+            .padding(Padding::from([20, 34])),
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -1810,6 +2884,91 @@ fn summarize_artist_bio(raw: &str, max_chars: usize) -> (String, String, bool) {
     (format!("{word_trimmed}…"), clean, true)
 }
 
+fn truncate_nav_label(label: &str, max_chars: usize) -> String {
+    let trimmed = label.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn recent_searches_file_path() -> PathBuf {
+    groove_spotify::auth::AppCachePaths::resolve()
+        .root_dir
+        .join("recent_searches.json")
+}
+
+fn load_recent_searches() -> Vec<RecentSearchEntry> {
+    let path = recent_searches_file_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<RecentSearchEntry>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .take(10)
+        .collect()
+}
+
+fn save_recent_searches(entries: &[RecentSearchEntry]) {
+    let path = recent_searches_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(entries) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+fn record_recent_entry(list: &mut Vec<RecentSearchEntry>, entry: RecentSearchEntry) {
+    if entry.label.trim().is_empty() {
+        return;
+    }
+    list.retain(|existing| {
+        !(existing.kind.badge_label() == entry.kind.badge_label()
+            && existing.label.eq_ignore_ascii_case(&entry.label))
+    });
+    list.insert(0, entry);
+    list.truncate(10);
+}
+
+/// Records a debounced search query while coalescing live typing prefixes
+/// (e.g. "m" -> "ma" -> "mas" -> "mastodon" updates the top entry in-place).
+fn record_recent_query(list: &mut Vec<RecentSearchEntry>, raw_query: &str) -> bool {
+    let query = raw_query.trim();
+    if query.chars().count() < 2 {
+        return false;
+    }
+
+    if let Some(first) = list.first_mut() {
+        if first.kind == RecentSearchKind::Query {
+            let prev_lower = first.label.to_lowercase();
+            let next_lower = query.to_lowercase();
+            if next_lower.starts_with(&prev_lower) || prev_lower.starts_with(&next_lower) {
+                if next_lower.len() >= prev_lower.len() {
+                    first.label = query.to_string();
+                    first.query = query.to_string();
+                    return true;
+                }
+                return false;
+            }
+        }
+    }
+
+    record_recent_entry(
+        list,
+        RecentSearchEntry {
+            label: query.to_string(),
+            subtitle: "Search query".to_string(),
+            query: query.to_string(),
+            kind: RecentSearchKind::Query,
+        },
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1827,6 +2986,30 @@ mod tests {
     }
 
     #[test]
+    fn recent_query_coalesces_incremental_typing_and_deduplicates() {
+        let mut recent = Vec::new();
+        assert!(record_recent_query(&mut recent, "ma"));
+        assert!(record_recent_query(&mut recent, "mast"));
+        assert!(record_recent_query(&mut recent, "mastodon"));
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].label, "mastodon");
+
+        record_recent_entry(
+            &mut recent,
+            RecentSearchEntry {
+                label: "Mastodon".into(),
+                subtitle: "Progressive Metal".into(),
+                query: "mastodon".into(),
+                kind: RecentSearchKind::Artist {
+                    uri: "spotify:artist:1DvfQQ39HxvCJ3GvfeIFuT".into(),
+                },
+            },
+        );
+        assert_eq!(recent.len(), 2);
+        assert!(matches!(recent[0].kind, RecentSearchKind::Artist { .. }));
+    }
+
+    #[test]
     fn artwork_cache_generates_all_themes() {
         let cache = ArtworkCache::new();
         let _hero = cache.hero_handle(groove_core::ArtworkTheme::SunriseMountainLake);
@@ -1834,7 +3017,7 @@ mod tests {
     }
 
     #[test]
-    fn app_initializes_and_handles_navigation_and_playback_messages() {
+    fn app_initializes_and_handles_multi_level_navigation_and_playback_messages() {
         let (mut app, _) = GrooveApp::new();
         assert_eq!(app.state.current_track.title, "Higher Ground");
         assert_eq!(app.active_nav, NavSection::NowPlaying);
@@ -1846,6 +3029,18 @@ mod tests {
         assert!(app.artist_bio_expanded);
         let _ = app.update(Message::OpenArtist("Mastodon".into()));
         assert!(!app.artist_bio_expanded);
+        assert!(matches!(app.current_route(), StageRoute::Artist { .. }));
+
+        // Navigate deeper from Artist -> Album -> Back to Artist -> Forward to Album
+        let _ = app.update(Message::OpenAlbum("Marrow Deep".into()));
+        assert!(matches!(app.current_route(), StageRoute::Album { .. }));
+        assert!(app.selected_album.is_some());
+
+        let _ = app.update(Message::NavigateBack);
+        assert!(matches!(app.current_route(), StageRoute::Artist { .. }));
+
+        let _ = app.update(Message::NavigateForward);
+        assert!(matches!(app.current_route(), StageRoute::Album { .. }));
 
         let _ = app.update(Message::ToggleLike);
         assert!(app.state.current_track.liked);
