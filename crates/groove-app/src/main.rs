@@ -2250,20 +2250,6 @@ impl GrooveApp {
             );
         }
 
-        if !detail.top_tracks.is_empty() {
-            let top_tracks_label = if self.artist_top_tracks_expanded {
-                "Hide Top Tracks  ▴"
-            } else {
-                "Show Top Tracks  ▾"
-            };
-            action_row = action_row.push(
-                button(text(top_tracks_label).size(12.0))
-                    .on_press(Message::ToggleArtistTopTracks)
-                    .padding(Padding::from([7, 13]))
-                    .style(theme::nav_pill_button(self.artist_top_tracks_expanded)),
-            );
-        }
-
         let hero_header = row![
             portrait,
             column![
@@ -2380,63 +2366,104 @@ impl GrooveApp {
             albums_section = albums_section.push(album_row);
         }
 
-        // Top Tracks section (hidden by default; expandable on demand)
-        let mut stage_col = column![hero_header].spacing(18);
+        // Top Tracks collapsible section (collapsed by default; full-width header so text never wraps)
+        let mut stage_col = column![hero_header].spacing(18).padding(Padding {
+            top: 0.0,
+            right: 16.0,
+            bottom: 16.0,
+            left: 0.0,
+        });
         if let Some(bio_card) = expanded_bio_section {
             stage_col = stage_col.push(bio_card);
         }
-        if self.artist_top_tracks_expanded && !detail.top_tracks.is_empty() {
-            let mut top_tracks_col = column![
-                text("Top Tracks")
-                    .font(SERIF_FONT)
-                    .size(23)
-                    .color(palette::INK_PRIMARY)
-            ]
-            .spacing(6);
+        if !detail.top_tracks.is_empty() {
+            let toggle_label = if self.artist_top_tracks_expanded {
+                "Hide Top Tracks  ▴"
+            } else {
+                "Show Top Tracks  ▾"
+            };
 
-            for (idx, track) in detail.top_tracks.iter().enumerate() {
-                let is_current = track.id == self.state.current_track.id;
-                let track_row = row![
-                    button(
-                        row![
-                            text(format!("{:02}", idx + 1))
-                                .size(12)
-                                .color(palette::INK_MUTED)
-                                .width(Length::Fixed(22.0)),
-                            image(
-                                self.artwork.thumb_or_url(
-                                    track.cover_art_url.as_deref(),
-                                    track.artwork_theme
-                                )
-                            )
-                            .width(Length::Fixed(40.0))
-                            .height(Length::Fixed(40.0)),
-                            column![
-                                text(&track.title).size(14).color(palette::INK_PRIMARY),
-                                text(&track.album).size(12).color(palette::INK_SECONDARY),
-                            ]
-                            .spacing(2)
-                            .width(Length::Fill),
-                            text(track.formatted_duration())
-                                .size(12)
-                                .color(palette::INK_MUTED),
-                        ]
-                        .spacing(10)
-                        .align_y(Alignment::Center),
+            let top_tracks_header = button(
+                row![
+                    text("Top Tracks")
+                        .font(SERIF_FONT)
+                        .size(23)
+                        .color(palette::INK_PRIMARY),
+                    text(format!("{} tracks", detail.top_tracks.len()))
+                        .size(12.5)
+                        .color(palette::INK_MUTED),
+                    horizontal_space(),
+                    container(
+                        text(toggle_label)
+                            .size(12.0)
+                            .color(palette::INK_PRIMARY),
                     )
-                    .on_press(Message::PlaySpecificTrack(track.clone()))
-                    .width(Length::Fill)
-                    .padding(Padding::from([6, 10]))
-                    .style(theme::subtle_row_button(is_current)),
-                    button(text("Album ›").size(11.5).color(palette::INK_SECONDARY))
-                        .on_press(Message::OpenAlbum(track.album.clone()))
-                        .padding(Padding::from([7, 10]))
-                        .style(theme::subtle_row_button(false)),
+                    .padding(Padding::from([6, 12]))
+                    .style(|_| container::Style {
+                        background: Some(iced::Background::Color(palette::SIDEBAR_ACTIVE_PILL)),
+                        border: iced::Border {
+                            radius: 10.0.into(),
+                            color: palette::DIVIDER,
+                            width: 1.0,
+                        },
+                        ..Default::default()
+                    }),
                 ]
-                .spacing(6)
-                .align_y(Alignment::Center);
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::ToggleArtistTopTracks)
+            .width(Length::Fill)
+            .padding(Padding::from([6, 8]))
+            .style(theme::subtle_row_button(false));
 
-                top_tracks_col = top_tracks_col.push(track_row);
+            let mut top_tracks_col = column![top_tracks_header].spacing(6);
+
+            if self.artist_top_tracks_expanded {
+                for (idx, track) in detail.top_tracks.iter().enumerate() {
+                    let is_current = track.id == self.state.current_track.id;
+                    let track_row = row![
+                        button(
+                            row![
+                                text(format!("{:02}", idx + 1))
+                                    .size(12)
+                                    .color(palette::INK_MUTED)
+                                    .width(Length::Fixed(22.0)),
+                                image(
+                                    self.artwork.thumb_or_url(
+                                        track.cover_art_url.as_deref(),
+                                        track.artwork_theme
+                                    )
+                                )
+                                .width(Length::Fixed(40.0))
+                                .height(Length::Fixed(40.0)),
+                                column![
+                                    text(&track.title).size(14).color(palette::INK_PRIMARY),
+                                    text(&track.album).size(12).color(palette::INK_SECONDARY),
+                                ]
+                                .spacing(2)
+                                .width(Length::Fill),
+                                text(track.formatted_duration())
+                                    .size(12)
+                                    .color(palette::INK_MUTED),
+                            ]
+                            .spacing(10)
+                            .align_y(Alignment::Center),
+                        )
+                        .on_press(Message::PlaySpecificTrack(track.clone()))
+                        .width(Length::Fill)
+                        .padding(Padding::from([6, 10]))
+                        .style(theme::subtle_row_button(is_current)),
+                        button(text("Album ›").size(11.5).color(palette::INK_SECONDARY))
+                            .on_press(Message::OpenAlbum(track.album.clone()))
+                            .padding(Padding::from([7, 10]))
+                            .style(theme::subtle_row_button(false)),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+
+                    top_tracks_col = top_tracks_col.push(track_row);
+                }
             }
 
             stage_col = stage_col
@@ -2616,7 +2643,14 @@ impl GrooveApp {
             tracks_col = tracks_col.push(track_row);
         }
 
-        let stage_col = column![hero_header, horizontal_rule(1), tracks_col].spacing(18);
+        let stage_col = column![hero_header, horizontal_rule(1), tracks_col]
+            .spacing(18)
+            .padding(Padding {
+                top: 0.0,
+                right: 16.0,
+                bottom: 16.0,
+                left: 0.0,
+            });
 
         container(
             column![
