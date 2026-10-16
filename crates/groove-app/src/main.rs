@@ -28,8 +28,11 @@ use visualizer::RibbonVisualizer;
 pub fn main() -> iced::Result {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(
+                    "info,symphonia_bundle_mp3=error,symphonia_core=warn",
+                )
+            }),
         )
         .init();
 
@@ -79,6 +82,7 @@ pub enum Message {
     SelectPlaylist(String),
     OpenArtist(String),
     CloseArtistView,
+    ToggleArtistBio,
     PlayAlbum(String),
     PlayArtistTopTracks,
     CreateNewPlaylist,
@@ -104,6 +108,7 @@ pub struct GrooveApp {
     search_results: Vec<Track>,
     selected_artist: Option<ArtistDetail>,
     viewing_artist: bool,
+    artist_bio_expanded: bool,
     show_track_details_banner: bool,
 }
 
@@ -149,6 +154,7 @@ impl GrooveApp {
                 search_results,
                 selected_artist,
                 viewing_artist: false,
+                artist_bio_expanded: false,
                 show_track_details_banner: false,
             },
             Task::none(),
@@ -284,6 +290,7 @@ impl GrooveApp {
             Message::OpenArtist(artist_id_or_name) => {
                 tracing::info!("[UI] OpenArtist('{artist_id_or_name}')");
                 self.viewing_artist = true;
+                self.artist_bio_expanded = false;
                 let _ = self
                     .engine
                     .command_tx
@@ -292,6 +299,14 @@ impl GrooveApp {
             Message::CloseArtistView => {
                 tracing::info!("[UI] CloseArtistView");
                 self.viewing_artist = false;
+                self.artist_bio_expanded = false;
+            }
+            Message::ToggleArtistBio => {
+                self.artist_bio_expanded = !self.artist_bio_expanded;
+                tracing::info!(
+                    "[UI] ToggleArtistBio -> expanded={}",
+                    self.artist_bio_expanded
+                );
             }
             Message::PlayAlbum(album_uri) => {
                 tracing::info!("[UI] PlayAlbum('{album_uri}')");
@@ -516,6 +531,7 @@ impl GrooveApp {
                 );
                 self.selected_artist = Some(*detail);
                 self.viewing_artist = true;
+                self.artist_bio_expanded = false;
             }
         }
     }
@@ -1340,8 +1356,8 @@ impl GrooveApp {
                 detail.artist.portrait_url.as_deref(),
                 detail.artist.artwork_theme,
             ))
-            .width(Length::Fixed(116.0))
-            .height(Length::Fixed(116.0)),
+            .width(Length::Fixed(216.0))
+            .height(Length::Fixed(216.0)),
         )
         .style(theme::album_art_shadow_card);
 
@@ -1349,7 +1365,13 @@ impl GrooveApp {
             .artist
             .followers
             .map(|f| format!("{} followers", format_compact_count(f)))
-            .unwrap_or_else(|| "Verified Artist".to_string());
+            .unwrap_or_else(|| {
+                format!(
+                    "{} Releases  •  {} Popular Tracks",
+                    detail.albums.len(),
+                    detail.top_tracks.len()
+                )
+            });
 
         let genre_line = if detail.artist.genres.is_empty() {
             followers_text
@@ -1357,32 +1379,90 @@ impl GrooveApp {
             format!("{}  •  {}", detail.artist.subtitle(), followers_text)
         };
 
-        let bio_text = detail.biography.as_deref().unwrap_or(
+        let raw_bio = detail.biography.as_deref().unwrap_or(
             "Explore studio albums, singles, and high-resolution 320 kbps streams on Groove.",
         );
+        let (bio_preview, full_bio, has_more_bio) = summarize_artist_bio(raw_bio, 215);
+
+        let mut action_row = row![
+            button(text("▶  Play Top Tracks").size(12.5))
+                .on_press(Message::PlayArtistTopTracks)
+                .padding(Padding::from([8, 16]))
+                .style(theme::subtle_row_button(true)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        if has_more_bio {
+            let toggle_label = if self.artist_bio_expanded {
+                "Collapse Bio  ▴"
+            } else {
+                "Read Bio  ▾"
+            };
+            action_row = action_row.push(
+                button(text(toggle_label).size(12.0))
+                    .on_press(Message::ToggleArtistBio)
+                    .padding(Padding::from([7, 13]))
+                    .style(theme::nav_pill_button(self.artist_bio_expanded)),
+            );
+        }
 
         let hero_header = row![
             portrait,
             column![
+                text("VERIFIED ARTIST").size(10.5).color(palette::EMERALD),
                 text(&detail.artist.name)
                     .font(SERIF_FONT)
-                    .size(36)
+                    .size(40)
                     .color(palette::INK_PRIMARY),
-                text(genre_line).size(12.5).color(palette::INK_SECONDARY),
-                text(bio_text).size(12.5).color(palette::INK_MUTED),
-                row![
-                    button(text("▶  Play Top Tracks").size(12.5))
-                        .on_press(Message::PlayArtistTopTracks)
-                        .padding(Padding::from([7, 14]))
-                        .style(theme::subtle_row_button(true)),
-                ]
-                .spacing(8),
+                text(genre_line).size(13.0).color(palette::INK_SECONDARY),
+                vertical_space().height(Length::Fixed(2.0)),
+                text(bio_preview).size(13.0).color(palette::INK_MUTED),
+                vertical_space().height(Length::Fixed(4.0)),
+                action_row,
             ]
             .spacing(5)
             .width(Length::Fill),
         ]
-        .spacing(18)
+        .spacing(24)
         .align_y(Alignment::Center);
+
+        let expanded_bio_section: Option<Element<'_, Message>> =
+            if self.artist_bio_expanded && has_more_bio {
+                let mut bio_col = column![
+                    row![
+                        text(format!("About {}", detail.artist.name))
+                            .font(SERIF_FONT)
+                            .size(21)
+                            .color(palette::INK_PRIMARY),
+                        horizontal_space(),
+                        button(text("Show Less  ▴").size(11.5))
+                            .on_press(Message::ToggleArtistBio)
+                            .padding(Padding::from([5, 11]))
+                            .style(theme::nav_pill_button(false)),
+                    ]
+                    .align_y(Alignment::Center)
+                ]
+                .spacing(10);
+
+                for paragraph in full_bio.split("\n\n").filter(|p| !p.trim().is_empty()) {
+                    bio_col = bio_col.push(
+                        text(paragraph.trim().to_string())
+                            .size(13.0)
+                            .color(palette::INK_SECONDARY),
+                    );
+                }
+
+                Some(
+                    container(bio_col)
+                        .width(Length::Fill)
+                        .padding(Padding::from([16, 20]))
+                        .style(theme::artist_bio_card)
+                        .into(),
+                )
+            } else {
+                None
+            };
 
         // Discography — Albums & Singles with artwork
         let mut albums_section = column![
@@ -1478,17 +1558,17 @@ impl GrooveApp {
             top_tracks_col = top_tracks_col.push(track_btn);
         }
 
-        let body_scroll = scrollable(
-            column![
-                hero_header,
-                horizontal_rule(1),
-                albums_section,
-                horizontal_rule(1),
-                top_tracks_col,
-            ]
-            .spacing(18),
-        )
-        .height(Length::Fill);
+        let mut stage_col = column![hero_header].spacing(18);
+        if let Some(bio_card) = expanded_bio_section {
+            stage_col = stage_col.push(bio_card);
+        }
+        stage_col = stage_col
+            .push(horizontal_rule(1))
+            .push(albums_section)
+            .push(horizontal_rule(1))
+            .push(top_tracks_col);
+
+        let body_scroll = scrollable(stage_col).height(Length::Fill);
 
         container(
             column![
@@ -1695,9 +1775,56 @@ impl GrooveApp {
     }
 }
 
+/// Sanitizes an artist biography (stripping inline Spotify `<a href="...">` tags) and returns
+/// `(preview_excerpt, full_clean_bio, has_more_bio)`.
+fn summarize_artist_bio(raw: &str, max_chars: usize) -> (String, String, bool) {
+    let clean = groove_spotify::web_api::sanitize_spotify_biography(raw);
+    let single_line: String = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.chars().count() <= max_chars {
+        return (single_line, clean, false);
+    }
+
+    // Prefer truncating at a sentence boundary if one falls in a nice range [90..=max_chars],
+    // otherwise truncate cleanly at the last word boundary <= max_chars.
+    let mut byte_cutoff = single_line.len();
+    for (char_idx, (byte_idx, _)) in single_line.char_indices().enumerate() {
+        if char_idx == max_chars {
+            byte_cutoff = byte_idx;
+            break;
+        }
+    }
+    let slice = &single_line[..byte_cutoff];
+
+    if let Some(dot_pos) = slice.rfind(". ") {
+        if slice[..=dot_pos].chars().count() >= 90 {
+            return (slice[..=dot_pos].trim().to_string(), clean, true);
+        }
+    }
+
+    let word_trimmed = match slice.rfind(' ') {
+        Some(space_pos) if space_pos > 40 => &slice[..space_pos],
+        _ => slice,
+    }
+    .trim_end_matches(|c: char| matches!(c, ',' | ';' | ':' | '-' | '–' | '—'));
+
+    (format!("{word_trimmed}…"), clean, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summarize_artist_bio_strips_html_and_truncates_cleanly() {
+        let mastodon_raw = r#"One of the template bands of the New Wave of American Heavy Metal, Atlanta's Mastodon inject brainy, psychedelic prog into a volatile rhythmic alloy of sludge, stoner, and thrash metal. They broke into the mainstream with 2004's <a href="spotify:album:abc">Leviathan</a>, a critically acclaimed concept album based on <a href="spotify:artist:674k1zGzVqfmAcYyeOtMh7">Herman Melville</a>'s Moby Dick."#;
+        let (preview, full, has_more) = summarize_artist_bio(mastodon_raw, 215);
+        assert!(has_more);
+        assert!(!preview.contains("<a "));
+        assert!(!preview.contains("</a>"));
+        assert!(!full.contains("<a "));
+        assert!(full.contains("Herman Melville's Moby Dick."));
+        assert!(preview.chars().count() <= 220);
+    }
 
     #[test]
     fn artwork_cache_generates_all_themes() {
@@ -1714,6 +1841,11 @@ mod tests {
 
         let _ = app.update(Message::SelectNav(NavSection::Search));
         assert_eq!(app.active_nav, NavSection::Search);
+
+        let _ = app.update(Message::ToggleArtistBio);
+        assert!(app.artist_bio_expanded);
+        let _ = app.update(Message::OpenArtist("Mastodon".into()));
+        assert!(!app.artist_bio_expanded);
 
         let _ = app.update(Message::ToggleLike);
         assert!(app.state.current_track.liked);

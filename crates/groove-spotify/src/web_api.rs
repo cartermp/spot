@@ -1252,15 +1252,25 @@ fn pick_best_image_url(images: &[ApiImage]) -> Option<String> {
 }
 
 fn extract_librespot_image_url(images: &librespot_metadata::image::Images) -> Option<String> {
-    // Prefer LARGE or DEFAULT image if present, or fall back to first image
+    // Prefer XLARGE or LARGE high-res image first, then largest pixel area, then DEFAULT/first
     let chosen = images
         .iter()
-        .find(|img| {
-            matches!(
-                img.size,
-                librespot_metadata::image::ImageSize::LARGE
-                    | librespot_metadata::image::ImageSize::DEFAULT
-            )
+        .find(|img| matches!(img.size, librespot_metadata::image::ImageSize::XLARGE))
+        .or_else(|| {
+            images
+                .iter()
+                .find(|img| matches!(img.size, librespot_metadata::image::ImageSize::LARGE))
+        })
+        .or_else(|| {
+            images
+                .iter()
+                .filter(|img| img.width > 0 && img.height > 0)
+                .max_by_key(|img| img.width.saturating_mul(img.height))
+        })
+        .or_else(|| {
+            images
+                .iter()
+                .find(|img| matches!(img.size, librespot_metadata::image::ImageSize::DEFAULT))
         })
         .or_else(|| images.first())?;
     let hex = chosen.id.to_base16().ok()?;
@@ -1269,6 +1279,62 @@ fn extract_librespot_image_url(images: &librespot_metadata::image::Images) -> Op
     } else {
         Some(format!("https://i.scdn.co/image/{hex}"))
     }
+}
+
+/// Strips inline HTML tags (such as `<a href="spotify:artist:...">...</a>`) and decodes HTML
+/// entities from Spotify artist biographies while preserving clean paragraph breaks.
+pub fn sanitize_spotify_biography(raw: &str) -> String {
+    let mut stripped = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            let mut tag = String::new();
+            for tc in chars.by_ref() {
+                if tc == '>' {
+                    break;
+                }
+                tag.push(tc);
+            }
+            let tag_lower = tag.trim().to_ascii_lowercase();
+            if tag_lower.starts_with("br")
+                || tag_lower == "/p"
+                || tag_lower.starts_with("p ")
+                || tag_lower == "p"
+            {
+                stripped.push('\n');
+            }
+        } else {
+            stripped.push(ch);
+        }
+    }
+
+    let decoded = stripped
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&ndash;", "–")
+        .replace("&mdash;", "—")
+        .replace("&hellip;", "…")
+        .replace("&#8211;", "–")
+        .replace("&#8212;", "—")
+        .replace("&#8217;", "’")
+        .replace("&#8220;", "“")
+        .replace("&#8221;", "”");
+
+    let mut paragraphs = Vec::new();
+    for line in decoded.lines() {
+        let collapsed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !collapsed.is_empty() {
+            paragraphs.push(collapsed);
+        }
+    }
+    paragraphs.join("\n\n")
 }
 
 fn normalize_artist_uri(input: &str) -> Option<String> {
@@ -1668,12 +1734,18 @@ async fn fetch_artist_via_spclient(
         .to_string();
 
     let portrait_url = extract_librespot_image_url(&meta_artist.portrait_group)
-        .or_else(|| extract_librespot_image_url(&meta_artist.portraits));
+        .or_else(|| extract_librespot_image_url(&meta_artist.portraits))
+        .or_else(|| {
+            meta_artist.biographies.iter().find_map(|b| {
+                extract_librespot_image_url(&b.portraits)
+                    .or_else(|| b.portrait_group.iter().find_map(extract_librespot_image_url))
+            })
+        });
 
     let biography = meta_artist
         .biographies
         .first()
-        .map(|b| b.text.trim().to_string())
+        .map(|b| sanitize_spotify_biography(&b.text))
         .filter(|s| !s.is_empty());
 
     let artist_name = meta_artist.name.clone();
@@ -1801,8 +1873,12 @@ fn map_librespot_track(
     artist_override: Option<&str>,
     cover_art_url: Option<String>,
 ) -> Track {
-    let spotify_uri = t
-        .id
+    let playable_uri = if t.files.is_empty() {
+        t.alternatives.first().unwrap_or(&t.id)
+    } else {
+        &t.id
+    };
+    let spotify_uri = playable_uri
         .to_uri()
         .unwrap_or_else(|_| format!("spotify:track:spclient-{idx}"));
     let id = spotify_uri

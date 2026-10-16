@@ -160,6 +160,7 @@ async fn run_engine_loop(
                     &mut state,
                     &event_tx,
                     &player,
+                    &live_session,
                     &mut player_has_loaded_track,
                 );
             }
@@ -173,6 +174,7 @@ async fn run_engine_loop(
                         if let Some(active_player) = player.as_ref() {
                             load_track_on_player(
                                 active_player,
+                                live_session.as_ref(),
                                 &state.current_track,
                                 state.is_playing,
                                 0.0,
@@ -202,6 +204,7 @@ fn handle_librespot_event(
     state: &mut PlaybackState,
     event_tx: &Sender<EngineEvent>,
     player: &Option<Arc<Player>>,
+    live_session: &Option<Session>,
     player_has_loaded_track: &mut bool,
 ) {
     match event {
@@ -241,6 +244,7 @@ fn handle_librespot_event(
             if let Some(active_player) = player.as_ref() {
                 load_track_on_player(
                     active_player,
+                    live_session.as_ref(),
                     &state.current_track,
                     state.is_playing,
                     0.0,
@@ -322,6 +326,7 @@ async fn apply_auth_result(
             if state.current_track.id != "higher-ground" {
                 load_track_on_player(
                     &new_player,
+                    Some(&auth_session.session),
                     &state.current_track,
                     state.is_playing,
                     state.position_secs,
@@ -410,6 +415,7 @@ async fn handle_command(
                     if !*player_has_loaded_track {
                         load_track_on_player(
                             active_player,
+                            live_session.as_ref(),
                             &state.current_track,
                             true,
                             state.position_secs,
@@ -435,6 +441,7 @@ async fn handle_command(
                 if !*player_has_loaded_track {
                     load_track_on_player(
                         active_player,
+                        live_session.as_ref(),
                         &state.current_track,
                         true,
                         state.position_secs,
@@ -465,6 +472,7 @@ async fn handle_command(
             if let Some(active_player) = player.as_ref() {
                 load_track_on_player(
                     active_player,
+                    live_session.as_ref(),
                     &state.current_track,
                     state.is_playing,
                     0.0,
@@ -483,6 +491,7 @@ async fn handle_command(
             if let Some(active_player) = player.as_ref() {
                 load_track_on_player(
                     active_player,
+                    live_session.as_ref(),
                     &state.current_track,
                     state.is_playing,
                     0.0,
@@ -562,7 +571,13 @@ async fn handle_command(
                 state.position_secs = 0.0;
                 state.is_playing = true;
                 if let Some(active_player) = player.as_ref() {
-                    load_track_on_player(active_player, &state.current_track, true, 0.0);
+                    load_track_on_player(
+                        active_player,
+                        live_session.as_ref(),
+                        &state.current_track,
+                        true,
+                        0.0,
+                    );
                     *player_has_loaded_track = true;
                 }
             }
@@ -585,7 +600,13 @@ async fn handle_command(
             state.position_secs = 0.0;
             state.is_playing = true;
             if let Some(active_player) = player.as_ref() {
-                load_track_on_player(active_player, &state.current_track, true, 0.0);
+                load_track_on_player(
+                    active_player,
+                    live_session.as_ref(),
+                    &state.current_track,
+                    true,
+                    0.0,
+                );
                 *player_has_loaded_track = true;
             }
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
@@ -615,7 +636,13 @@ async fn handle_command(
                 state.position_secs = 0.0;
                 state.is_playing = true;
                 if let Some(active_player) = player.as_ref() {
-                    load_track_on_player(active_player, &state.current_track, true, 0.0);
+                    load_track_on_player(
+                        active_player,
+                        live_session.as_ref(),
+                        &state.current_track,
+                        true,
+                        0.0,
+                    );
                     *player_has_loaded_track = true;
                 }
             }
@@ -662,7 +689,13 @@ async fn handle_command(
                 state.position_secs = 0.0;
                 state.is_playing = true;
                 if let Some(active_player) = player.as_ref() {
-                    load_track_on_player(active_player, &state.current_track, true, 0.0);
+                    load_track_on_player(
+                        active_player,
+                        live_session.as_ref(),
+                        &state.current_track,
+                        true,
+                        0.0,
+                    );
                     *player_has_loaded_track = true;
                 }
                 let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
@@ -697,6 +730,7 @@ async fn handle_command(
                 if *player_has_loaded_track || state.current_track.id != "higher-ground" {
                     load_track_on_player(
                         &new_player,
+                        Some(session),
                         &state.current_track,
                         state.is_playing,
                         state.position_secs,
@@ -820,18 +854,64 @@ fn create_librespot_player(
     (player, events)
 }
 
-fn load_track_on_player(player: &Player, track: &Track, start_playing: bool, position_secs: f32) {
+fn load_track_on_player(
+    player: &Arc<Player>,
+    session: Option<&Session>,
+    track: &Track,
+    start_playing: bool,
+    position_secs: f32,
+) {
     match SpotifyUri::from_uri(&track.spotify_uri) {
         Ok(uri) if uri.is_playable() => {
             let position_ms = (position_secs.max(0.0) * 1000.0) as u32;
-            info!(
-                "[LibrespotPlayer] Loading track '{}' ({}) start_playing={} position_ms={}",
-                track.title, track.spotify_uri, start_playing, position_ms
-            );
-            player.load(uri, start_playing, position_ms);
+            let player_clone = Arc::clone(player);
+            let sess_clone = session.cloned();
+            let title = track.title.clone();
+            let raw_uri_str = track.spotify_uri.clone();
+
+            tokio::spawn(async move {
+                let mut resolved_uri = uri;
+                if let Some(sess) = sess_clone {
+                    use librespot_metadata::{Metadata, Track as LibrespotTrack};
+                    if let Ok(meta) = LibrespotTrack::get(&sess, &resolved_uri).await {
+                        if meta.files.is_empty() {
+                            for alt_uri in meta.alternatives.iter() {
+                                if let Ok(alt_meta) = LibrespotTrack::get(&sess, alt_uri).await {
+                                    if !alt_meta.files.is_empty() {
+                                        info!(
+                                            "[LibrespotPlayer] Track '{}' ({}) had 0 direct files; resolved to playable alternative {:?} ({} files)",
+                                            title,
+                                            raw_uri_str,
+                                            alt_uri,
+                                            alt_meta.files.len()
+                                        );
+                                        resolved_uri = alt_uri.clone();
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            info!(
+                                "[LibrespotPlayer] Track '{}' ({}) verified with {} direct audio files",
+                                title,
+                                raw_uri_str,
+                                meta.files.len()
+                            );
+                        }
+                    }
+                }
+                info!(
+                    "[LibrespotPlayer] Loading track '{}' ({:?}) start_playing={} position_ms={}",
+                    title, resolved_uri, start_playing, position_ms
+                );
+                player_clone.load(resolved_uri, start_playing, position_ms);
+            });
         }
         Ok(_) => {
-            warn!("Spotify URI '{}' is not a playable track/episode", track.spotify_uri);
+            warn!(
+                "Spotify URI '{}' is not a playable track/episode",
+                track.spotify_uri
+            );
         }
         Err(err) => {
             warn!(

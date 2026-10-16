@@ -257,3 +257,20 @@ pub fn device_pick_list_style(_theme: &Theme, status: pick_list::Status) -> pick
         },
     }
 }
+
+pub fn artist_bio_card(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.72))),
+        border: Border {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.055),
+            width: 1.0,
+            radius: 14.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.04, 0.07, 0.09, 0.05),
+            offset: Vector::new(0.0, 4.0),
+            blur_radius: 14.0,
+        },
+        ..Default::default()
+    }
+}

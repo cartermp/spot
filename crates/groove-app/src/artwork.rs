@@ -157,11 +157,14 @@ pub async fn download_and_decode_artwork(url: String) -> Option<(String, image::
     };
 
     let url_clone = trimmed.clone();
-    let handle = tokio::task::spawn_blocking(move || decode_rounded_rgba(&raw_bytes, 300, 16.0))
+    let handle = tokio::task::spawn_blocking(move || decode_rounded_rgba(&raw_bytes, 380, 20.0))
         .await
         .ok()??;
 
-    tracing::info!("[Artwork] Decoded GPU texture (300x300 rounded RGBA) for {}", url_clone);
+    tracing::info!(
+        "[Artwork] Decoded GPU texture (380x380 rounded RGBA) for {}",
+        url_clone
+    );
     Some((url_clone, handle))
 }
 
@@ -170,7 +173,7 @@ fn disk_cache_path_for_url(url: &str) -> Option<PathBuf> {
     url.hash(&mut hasher);
     let hash = hasher.finish();
     let base = dirs::data_dir()?.join("Groove").join("image_cache");
-    Some(base.join(format!("art_{hash:016x}.img")))
+    Some(base.join(format!("art_v2_{hash:016x}.img")))
 }
 
 fn decode_rounded_rgba(bytes: &[u8], target_size: u32, corner_radius: f32) -> Option<image::Handle> {
