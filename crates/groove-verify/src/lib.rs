@@ -1476,6 +1476,7 @@ pub fn prove_stateful_command_sequences_proptest() -> ProofCertificate {
                 prop_assert!(playback.check_invariants().is_ok());
                 let tray_snapshot = TrayMenuSnapshot::from_playback_state(&playback);
                 prop_assert!(tray_snapshot.check_invariants().is_ok());
+                prop_assert!(tray_snapshot.check_sync_with_playback(&playback).is_ok());
                 prop_assert!(nav.check_invariants().is_ok());
                 prop_assert!(recent.check_invariants().is_ok());
                 total_steps.fetch_add(1, Ordering::Relaxed);
@@ -1589,7 +1590,7 @@ pub fn prove_word_deletion_account_and_tray_snapshot_proptest() -> ProofCertific
                 prop_assert!(acct_label.chars().count() <= 26);
                 prop_assert!(!acct_label.contains('\n') && !acct_label.contains('\r'));
 
-                // Verify INV-T1..T3: TrayMenuSnapshot
+                // Verify INV-T1..T7: TrayMenuSnapshot & exact progress synchronization
                 let mut state = PlaybackState::mockup_default();
                 state.is_playing = is_playing;
                 state.current_track.id = "trk-1".into();
@@ -1600,6 +1601,7 @@ pub fn prove_word_deletion_account_and_tray_snapshot_proptest() -> ProofCertific
 
                 let snapshot = TrayMenuSnapshot::from_playback_state(&state);
                 prop_assert!(snapshot.check_invariants().is_ok());
+                prop_assert!(snapshot.check_sync_with_playback(&state).is_ok());
 
                 total_cases.fetch_add(1, Ordering::Relaxed);
                 Ok(())
@@ -1765,8 +1767,11 @@ pub fn prove_recently_listened_store_invariants_proptest() -> ProofCertificate {
     use proptest::test_runner::{Config, TestRunner};
 
     let t0 = Instant::now();
-    let cases = 350u32;
-    let mut runner = TestRunner::new(Config::with_cases(cases));
+    let mut runner = TestRunner::new(Config {
+        cases: 350,
+        failure_persistence: None,
+        ..Config::default()
+    });
 
     let item_strategy = (
         any::<bool>(),
@@ -2341,6 +2346,311 @@ pub fn prove_album_discography_and_playlist_isolation_stateright() -> ProofCerti
     }
 }
 
+// ============================================================================
+// 5. TRAY & PLAYER PROGRESS SYNCHRONIZATION MODEL (INV-T4..T7)
+// ============================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TrayProgressSyncState {
+    pub track_idx: u8,
+    pub duration_secs: u32,
+    pub player_elapsed_secs: u32,
+    pub tray_elapsed_secs: u32,
+    pub tray_remaining_secs: u32,
+    pub tray_permille: u16,
+    pub tray_rate_milli: u16,
+    pub is_playing: bool,
+    pub invariants_ok: bool,
+    pub sync_ok: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TrayProgressSyncAction {
+    Play,
+    Pause,
+    RemotePlayFromTray,
+    RemotePauseFromTray,
+    TickPositionSecs(u32),
+    PlayerScrubSeekSecs(u32),
+    TrayRemoteSeekSecs(u32),
+    NextTrack,
+    PreviousTrack,
+    EndOfTrack,
+}
+
+pub struct TrayProgressSyncModel;
+
+impl TrayProgressSyncModel {
+    fn sample_tracks() -> Vec<Track> {
+        vec![
+            Track {
+                id: "ep-daily".into(),
+                spotify_uri: "spotify:episode:2MAi0BvDc6GTFvKFPXnkCL".into(),
+                title: "MAGA's Midterm Defectors".into(),
+                artist: "The Daily".into(),
+                album: "The Daily".into(),
+                duration_secs: 1662, // 27:42
+                liked: false,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::SunriseMountainLake,
+            },
+            Track {
+                id: "trk-rtj".into(),
+                spotify_uri: "spotify:track:rtj1".into(),
+                title: "Run the Jewels".into(),
+                artist: "Run The Jewels".into(),
+                album: "Run The Jewels".into(),
+                duration_secs: 210, // 03:30
+                liked: true,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::GoldenCanyon,
+            },
+        ]
+    }
+
+    fn materialize(s: &TrayProgressSyncState) -> PlaybackState {
+        let mut state = PlaybackState::mockup_default();
+        let tracks = Self::sample_tracks();
+        let idx = (s.track_idx as usize).min(tracks.len() - 1);
+        state.current_track = tracks[idx].clone();
+        state.queue = tracks;
+        state.is_playing = s.is_playing;
+        state.position_secs =
+            sanitize_position_secs(s.player_elapsed_secs as f32, state.current_track.duration_secs);
+        state
+    }
+
+    fn project(state: &PlaybackState) -> TrayProgressSyncState {
+        let tray = TrayMenuSnapshot::from_playback_state(state);
+        let invariants_ok = state.check_invariants().is_ok() && tray.check_invariants().is_ok();
+        let sync_ok = tray.check_sync_with_playback(state).is_ok();
+        let track_idx = state
+            .queue
+            .iter()
+            .position(|t| t.id == state.current_track.id)
+            .unwrap_or(0) as u8;
+
+        TrayProgressSyncState {
+            track_idx,
+            duration_secs: state.current_track.duration_secs,
+            player_elapsed_secs: state.synced_elapsed_secs(),
+            tray_elapsed_secs: tray.elapsed_secs,
+            tray_remaining_secs: tray.remaining_secs,
+            tray_permille: tray.progress_permille,
+            tray_rate_milli: tray.playback_rate_milli,
+            is_playing: state.is_playing,
+            invariants_ok,
+            sync_ok,
+        }
+    }
+}
+
+impl Model for TrayProgressSyncModel {
+    type State = TrayProgressSyncState;
+    type Action = TrayProgressSyncAction;
+
+    fn init_states(&self) -> Vec<Self::State> {
+        let mut init = PlaybackState::mockup_default();
+        let tracks = Self::sample_tracks();
+        init.current_track = tracks[0].clone();
+        init.queue = tracks;
+        init.is_playing = false;
+        init.position_secs = 0.0;
+        vec![Self::project(&init)]
+    }
+
+    fn actions(&self, _state: &Self::State, actions: &mut Vec<Self::Action>) {
+        actions.extend([
+            TrayProgressSyncAction::Play,
+            TrayProgressSyncAction::Pause,
+            TrayProgressSyncAction::RemotePlayFromTray,
+            TrayProgressSyncAction::RemotePauseFromTray,
+            TrayProgressSyncAction::TickPositionSecs(15),
+            TrayProgressSyncAction::TickPositionSecs(120),
+            TrayProgressSyncAction::PlayerScrubSeekSecs(0),
+            TrayProgressSyncAction::PlayerScrubSeekSecs(523), // 08:43
+            TrayProgressSyncAction::PlayerScrubSeekSecs(972), // 16:12
+            TrayProgressSyncAction::TrayRemoteSeekSecs(523),
+            TrayProgressSyncAction::TrayRemoteSeekSecs(972),
+            TrayProgressSyncAction::TrayRemoteSeekSecs(1662),
+            TrayProgressSyncAction::NextTrack,
+            TrayProgressSyncAction::PreviousTrack,
+            TrayProgressSyncAction::EndOfTrack,
+        ]);
+    }
+
+    fn next_state(&self, last: &Self::State, action: Self::Action) -> Option<Self::State> {
+        let mut state = Self::materialize(last);
+        match action {
+            TrayProgressSyncAction::Play | TrayProgressSyncAction::RemotePlayFromTray => {
+                state.apply_verified_action(VerifiedTransportAction::Play);
+            }
+            TrayProgressSyncAction::Pause | TrayProgressSyncAction::RemotePauseFromTray => {
+                state.apply_verified_action(VerifiedTransportAction::Pause);
+            }
+            TrayProgressSyncAction::TickPositionSecs(delta) => {
+                if state.is_playing {
+                    let next = state.position_secs + delta as f32;
+                    let dur = state.current_track.duration_secs as f32;
+                    if dur > 0.0 && next >= dur {
+                        state.apply_verified_action(VerifiedTransportAction::EndOfTrack);
+                    } else {
+                        state.position_secs =
+                            sanitize_position_secs(next, state.current_track.duration_secs);
+                    }
+                }
+            }
+            TrayProgressSyncAction::PlayerScrubSeekSecs(target)
+            | TrayProgressSyncAction::TrayRemoteSeekSecs(target) => {
+                state.apply_verified_action(VerifiedTransportAction::SeekSeconds(target as f32));
+            }
+            TrayProgressSyncAction::NextTrack => {
+                state.apply_verified_action(VerifiedTransportAction::NextTrack);
+            }
+            TrayProgressSyncAction::PreviousTrack => {
+                state.apply_verified_action(VerifiedTransportAction::PreviousTrack);
+            }
+            TrayProgressSyncAction::EndOfTrack => {
+                state.apply_verified_action(VerifiedTransportAction::EndOfTrack);
+            }
+        }
+        Some(Self::project(&state))
+    }
+
+    fn properties(&self) -> Vec<Property<Self>> {
+        vec![
+            Property::<Self>::always(
+                "INV-T4..T7: Tray progress indicator and true player progress indicator are always in sync",
+                |_, s| {
+                    s.invariants_ok
+                        && s.sync_ok
+                        && s.tray_elapsed_secs == s.player_elapsed_secs
+                        && s.tray_elapsed_secs + s.tray_remaining_secs == s.duration_secs
+                        && s.tray_permille <= 1000
+                        && ((s.is_playing && s.tray_rate_milli == 1000)
+                            || (!s.is_playing && s.tray_rate_milli == 0))
+                },
+            ),
+            Property::<Self>::sometimes(
+                "Liveness: Podcast episode at 16:12 / 27:42 (-11:30) is reachable and strictly synchronized",
+                |_, s| {
+                    s.track_idx == 0
+                        && s.player_elapsed_secs == 972
+                        && s.tray_elapsed_secs == 972
+                        && s.tray_remaining_secs == 690
+                },
+            ),
+        ]
+    }
+}
+
+/// Proof 17 (`MC-TRAY-PROGRESS-SYNC-17`): TLA+-style `stateright` explicit-state model checking
+/// and exhaustive duration/position boundary proof verifying `INV-T4..T7`:
+/// - **INV-T4 (Time Conservation & Permille Exactness)**: `elapsed_secs + remaining_secs == duration_secs`
+///   and `progress_permille == round(elapsed_secs * 1000 / duration_secs) in 0..=1000`.
+/// - **INV-T5 (Playback Rate Coherence)**: `playback_rate_milli == 1000` when playing an active track,
+///   and `0` when paused or stopped (preventing macOS `MPNowPlayingInfoCenter` clock drift).
+/// - **INV-T6 (Progress Label Coherence)**: `progress_label` embeds the exact formatted `elapsed_secs`,
+///   `duration_secs`, and `-remaining_secs`.
+/// - **INV-T7 (`check_sync_with_playback`)**: The tray's progress indicator and the player's true
+///   progress indicator are ALWAYS in 1:1 sync across all play/pause/seek/tick/track transitions.
+pub fn prove_tray_and_player_progress_sync_invariant() -> ProofCertificate {
+    let t0 = Instant::now();
+
+    // 1. Stateright explicit-state BFS model check
+    let checker = TrayProgressSyncModel.checker().spawn_bfs().join();
+    checker.assert_properties();
+    let mut explored = checker.unique_state_count();
+
+    // 2. Explicit regression proof for the user-reported "The Daily - MAGA's Midterm Defectors"
+    //    at 16:12 / 27:42 (972s / 1662s, -11:30 remaining):
+    let mut daily_state = PlaybackState::mockup_default();
+    daily_state.current_track = Track {
+        id: "ep-daily".into(),
+        spotify_uri: "spotify:episode:2MAi0BvDc6GTFvKFPXnkCL".into(),
+        title: "MAGA's Midterm Defectors".into(),
+        artist: "The Daily".into(),
+        album: "The Daily".into(),
+        duration_secs: 1662,
+        liked: false,
+        cover_art_url: None,
+        artwork_theme: ArtworkTheme::SunriseMountainLake,
+    };
+    daily_state.is_playing = true;
+    daily_state.position_secs = 972.0; // 16:12
+    let daily_snap = TrayMenuSnapshot::from_playback_state(&daily_state);
+    daily_snap.assert_invariants();
+    assert!(daily_snap.check_sync_with_playback(&daily_state).is_ok());
+    assert_eq!(daily_state.synced_elapsed_secs(), 972);
+    assert_eq!(daily_snap.elapsed_secs, 972);
+    assert_eq!(daily_snap.duration_secs, 1662);
+    assert_eq!(daily_snap.remaining_secs, 690); // 11:30
+    assert!(daily_snap.progress_label.contains("16:12 / 27:42"));
+    assert!(daily_snap.progress_label.contains("(-11:30)"));
+    explored += 1;
+
+    // 3. Exhaustive boundary & fractional-second sweep across durations and positions
+    let durations = [0u32, 1, 2, 59, 60, 61, 180, 523, 972, 1662, 3600, 86_400];
+    let frac_offsets = [-10.0f32, -0.5, 0.0, 0.1, 0.49, 0.5, 0.51, 0.99, 1.0, 10.0];
+
+    for &dur in &durations {
+        let anchor_points = [
+            0u32,
+            1,
+            dur / 4,
+            dur / 2,
+            (dur.saturating_mul(3)) / 4,
+            dur.saturating_sub(1),
+            dur,
+            dur.saturating_add(10),
+        ];
+        for &base in &anchor_points {
+            for &frac in &frac_offsets {
+                for is_playing in [false, true] {
+                    let mut st = PlaybackState::mockup_default();
+                    st.current_track.id = if dur == 0 {
+                        String::new()
+                    } else {
+                        "trk-sync".into()
+                    };
+                    st.current_track.title = if dur == 0 {
+                        "Ready to Play".into()
+                    } else {
+                        "Sync Track".into()
+                    };
+                    st.current_track.duration_secs = dur;
+                    st.is_playing = is_playing && dur > 0;
+                    st.position_secs = sanitize_position_secs(base as f32 + frac, dur);
+
+                    st.assert_invariants();
+                    let snap = TrayMenuSnapshot::from_playback_state(&st);
+                    snap.assert_invariants();
+                    assert!(
+                        snap.check_sync_with_playback(&st).is_ok(),
+                        "Tray and player progress out of sync for dur={dur}, pos={}",
+                        st.position_secs
+                    );
+                    assert_eq!(snap.elapsed_secs, st.synced_elapsed_secs());
+                    assert_eq!(snap.remaining_secs, st.synced_remaining_secs());
+                    assert_eq!(snap.progress_permille, st.synced_progress_permille());
+                    assert_eq!(snap.playback_rate_milli, st.synced_playback_rate_milli());
+                    explored += 1;
+                }
+            }
+        }
+    }
+
+    ProofCertificate {
+        id: "MC-TRAY-PROGRESS-SYNC-17",
+        subsystem: "groove-core / groove-app (Tray & Player Progress Sync)",
+        method: "Stateright BFS + Exhaustive Fractional/Boundary Sync Proof",
+        theorem: "INV-T4..T7: Tray elapsed, remaining, permille & rate strictly match Player",
+        states_or_cases_explored: explored,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        verified: true,
+    }
+}
+
 /// Runs the complete Groove formal verification suite and returns a structured [`VerificationSuiteReport`].
 pub fn run_all_formal_proofs() -> VerificationSuiteReport {
     let suite_start = Instant::now();
@@ -2361,6 +2671,7 @@ pub fn run_all_formal_proofs() -> VerificationSuiteReport {
         prove_podcast_uri_and_episode_track_invariants_proptest(),
         prove_recently_listened_store_invariants_proptest(),
         prove_album_discography_and_playlist_isolation_stateright(),
+        prove_tray_and_player_progress_sync_invariant(),
     ];
 
     let total_states_or_cases = certificates
@@ -2384,6 +2695,6 @@ mod tests {
     fn formal_verification_suite_proves_all_theorems() {
         let report = run_all_formal_proofs();
         assert!(report.all_verified());
-        assert_eq!(report.certificates.len(), 16);
+        assert_eq!(report.certificates.len(), 17);
     }
 }

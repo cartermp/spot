@@ -84,6 +84,8 @@ async fn run_engine_loop(
     let mut player: Option<Arc<Player>> = None;
     let mut player_events: Option<PlayerEventChannel> = None;
     let mut player_has_loaded_track = false;
+    let mut playback_anchor: Option<(std::time::Instant, f32)> = None;
+    let mut player_is_buffering = false;
     let mut search_abort_handle: Option<tokio::task::AbortHandle> = None;
     let mut artist_abort_handle: Option<tokio::task::AbortHandle> = None;
     let (auth_result_tx, auth_result_rx) =
@@ -141,6 +143,10 @@ async fn run_engine_loop(
                     break;
                 };
 
+                let prev_track_id = state.current_track.id.clone();
+                let prev_playing = state.is_playing;
+                let prev_pos = state.position_secs;
+
                 handle_command(
                     cmd,
                     &mut state,
@@ -157,6 +163,19 @@ async fn run_engine_loop(
                     &auth_result_tx,
                 )
                 .await;
+
+                if !state.is_playing {
+                    playback_anchor = None;
+                    player_is_buffering = false;
+                } else if state.current_track.id != prev_track_id
+                    || !prev_playing
+                    || (state.position_secs - prev_pos).abs() > 0.01
+                {
+                    playback_anchor = Some((std::time::Instant::now(), state.position_secs));
+                    if state.current_track.id != prev_track_id && live_session.is_some() {
+                        player_is_buffering = true;
+                    }
+                }
             }
 
             Some(player_evt) = recv_player_event(&mut player_events) => {
@@ -167,14 +186,28 @@ async fn run_engine_loop(
                     &player,
                     &live_session,
                     &mut player_has_loaded_track,
+                    &mut playback_anchor,
+                    &mut player_is_buffering,
                 );
             }
 
             _ = tick_interval.tick() => {
-                if state.is_playing {
-                    state.position_secs += 0.1;
+                if state.is_playing && !player_is_buffering {
+                    let next_pos = match playback_anchor {
+                        Some((inst, base_pos)) => base_pos + inst.elapsed().as_secs_f32(),
+                        None => {
+                            let p = state.position_secs + 0.1;
+                            playback_anchor = Some((std::time::Instant::now(), p));
+                            p
+                        }
+                    };
                     let duration = state.current_track.duration_secs as f32;
-                    if duration > 0.0 && state.position_secs >= duration {
+                    let should_advance = if live_session.is_some() && player.is_some() {
+                        duration > 0.0 && next_pos >= duration + 2.0
+                    } else {
+                        duration > 0.0 && next_pos >= duration
+                    };
+                    if should_advance {
                         advance_queue_track(&mut state, true, true);
                         sync_player_after_advance(
                             &state,
@@ -182,9 +215,17 @@ async fn run_engine_loop(
                             &live_session,
                             &mut player_has_loaded_track,
                         );
+                        playback_anchor = if state.is_playing {
+                            Some((std::time::Instant::now(), state.position_secs))
+                        } else {
+                            None
+                        };
+                        player_is_buffering = live_session.is_some() && state.is_playing;
                         let _ = event_tx.send(EngineEvent::TrackChanged(state.current_track.clone()));
                         let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
                     } else {
+                        state.position_secs =
+                            sanitize_position_secs(next_pos, state.current_track.duration_secs);
                         let _ = event_tx.send(EngineEvent::PositionTick(state.position_secs));
                     }
                 }
@@ -200,6 +241,7 @@ async fn recv_player_event(channel: &mut Option<PlayerEventChannel>) -> Option<P
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_librespot_event(
     event: PlayerEvent,
     state: &mut PlaybackState,
@@ -207,6 +249,8 @@ fn handle_librespot_event(
     player: &Option<Arc<Player>>,
     live_session: &Option<Session>,
     player_has_loaded_track: &mut bool,
+    playback_anchor: &mut Option<(std::time::Instant, f32)>,
+    player_is_buffering: &mut bool,
 ) {
     match event {
         PlayerEvent::Playing {
@@ -217,10 +261,13 @@ fn handle_librespot_event(
             info!(
                 "[LibrespotPlayer] Event: Playing track={track_id:?} at position_ms={position_ms}"
             );
+            *player_is_buffering = false;
             state.is_playing = true;
             state.position_secs =
                 sanitize_position_secs(position_ms as f32 / 1000.0, state.current_track.duration_secs);
+            *playback_anchor = Some((std::time::Instant::now(), state.position_secs));
             let _ = event_tx.send(EngineEvent::PlayStateChanged(true));
+            let _ = event_tx.send(EngineEvent::PositionTick(state.position_secs));
         }
         PlayerEvent::Paused {
             track_id,
@@ -230,22 +277,44 @@ fn handle_librespot_event(
             info!(
                 "[LibrespotPlayer] Event: Paused track={track_id:?} at position_ms={position_ms}"
             );
+            *player_is_buffering = false;
             state.is_playing = false;
             state.position_secs =
                 sanitize_position_secs(position_ms as f32 / 1000.0, state.current_track.duration_secs);
+            *playback_anchor = None;
             let _ = event_tx.send(EngineEvent::PlayStateChanged(false));
+            let _ = event_tx.send(EngineEvent::PositionTick(state.position_secs));
+        }
+        PlayerEvent::Stopped { track_id, .. } => {
+            info!("[LibrespotPlayer] Event: Stopped track={track_id:?}");
+            *player_is_buffering = false;
+            state.is_playing = false;
+            *playback_anchor = None;
+            let _ = event_tx.send(EngineEvent::PlayStateChanged(false));
+            let _ = event_tx.send(EngineEvent::PositionTick(state.position_secs));
         }
         PlayerEvent::PositionChanged { position_ms, .. }
         | PlayerEvent::PositionCorrection { position_ms, .. }
         | PlayerEvent::Seeked { position_ms, .. } => {
+            info!(
+                "[LibrespotPlayer] Event: Position/Seek synced to position_ms={position_ms}"
+            );
+            *player_is_buffering = false;
             state.position_secs =
                 sanitize_position_secs(position_ms as f32 / 1000.0, state.current_track.duration_secs);
+            *playback_anchor = Some((std::time::Instant::now(), state.position_secs));
             let _ = event_tx.send(EngineEvent::PositionTick(state.position_secs));
         }
         PlayerEvent::EndOfTrack { track_id, .. } => {
             info!("[LibrespotPlayer] Event: EndOfTrack ({track_id:?}) -> advancing queue");
             advance_queue_track(state, true, true);
             sync_player_after_advance(state, player, live_session, player_has_loaded_track);
+            *playback_anchor = if state.is_playing {
+                Some((std::time::Instant::now(), state.position_secs))
+            } else {
+                None
+            };
+            *player_is_buffering = live_session.is_some() && state.is_playing;
             let _ = event_tx.send(EngineEvent::TrackChanged(state.current_track.clone()));
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
@@ -257,9 +326,15 @@ fn handle_librespot_event(
             info!(
                 "[LibrespotPlayer] Event: Loading track={track_id:?} at position_ms={position_ms}"
             );
+            *player_is_buffering = true;
+            state.position_secs =
+                sanitize_position_secs(position_ms as f32 / 1000.0, state.current_track.duration_secs);
+            *playback_anchor = Some((std::time::Instant::now(), state.position_secs));
+            let _ = event_tx.send(EngineEvent::PositionTick(state.position_secs));
         }
         PlayerEvent::Unavailable { track_id, .. } => {
             warn!("[LibrespotPlayer] Event: Track unavailable ({track_id:?})");
+            *player_is_buffering = false;
         }
         other => {
             debug!("[LibrespotPlayer] Event: {other:?}");

@@ -1844,7 +1844,7 @@ pub fn format_connected_account_label(username: &str, is_premium: bool) -> Strin
     format!("Connected as {display_name}")
 }
 
-/// Formally verified snapshot of the macOS Menu Bar Tray state derived from `PlaybackState`.
+/// Formally verified snapshot of the macOS Menu Bar Tray & Now Playing state derived from `PlaybackState`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrayMenuSnapshot {
     /// Compact single-line title shown next to the icon in the macOS menu bar (`<= 30` chars).
@@ -1855,6 +1855,18 @@ pub struct TrayMenuSnapshot {
     pub now_playing_headline: String,
     /// Secondary album/stream line inside the tray dropdown menu.
     pub album_subtitle: String,
+    /// Synchronized single-line progress indicator (`elapsed ━━●━━ -remaining (duration)`).
+    pub progress_label: String,
+    /// Synchronized integer elapsed playback time in seconds (`<= duration_secs`).
+    pub elapsed_secs: u32,
+    /// Synchronized total track/episode duration in seconds.
+    pub duration_secs: u32,
+    /// Synchronized integer remaining playback time in seconds (`duration_secs - elapsed_secs`).
+    pub remaining_secs: u32,
+    /// Synchronized progress bar ratio in parts-per-thousand (`0..=1000`).
+    pub progress_permille: u16,
+    /// Synchronized OS Now Playing playback rate in milli-units (`1000` = `1.0x`, `0` = `0.0x`).
+    pub playback_rate_milli: u16,
     /// Action label for Play/Pause menu item (`"Pause Playback"` vs `"Play Track"`).
     pub play_pause_label: String,
     /// Action label for Like menu item (`"♥ Liked"` vs `"♡ Like Track"`).
@@ -1867,9 +1879,7 @@ pub struct TrayMenuSnapshot {
 
 impl TrayMenuSnapshot {
     pub fn from_playback_state(state: &PlaybackState) -> Self {
-        let has_track = !state.current_track.id.is_empty()
-            && !state.current_track.title.trim().is_empty()
-            && state.current_track.id != "no-track";
+        let has_track = state.has_active_track();
 
         let clean_title: String = state
             .current_track
@@ -1926,8 +1936,21 @@ impl TrayMenuSnapshot {
             "Spotify Premium • 320 kbps Ogg Vorbis".to_string()
         };
 
+        let elapsed_secs = state.synced_elapsed_secs();
+        let duration_secs = state.current_track.duration_secs;
+        let remaining_secs = state.synced_remaining_secs();
+        let progress_permille = state.synced_progress_permille();
+        let playback_rate_milli = state.synced_playback_rate_milli();
+
+        let elapsed_str = crate::format_seconds(elapsed_secs);
+        let remaining_str = format!("-{}", crate::format_seconds(remaining_secs));
+        let duration_str = crate::format_seconds(duration_secs);
+        let bar_glyphs = Self::render_progress_bar(progress_permille, 10);
+        let progress_label =
+            format!("{bar_glyphs}  {elapsed_str} / {duration_str}  ({remaining_str})");
+
         let tooltip = if has_track {
-            format!("Groove: {now_playing_headline} ({album_subtitle})")
+            format!("Groove: {now_playing_headline} [{elapsed_str} / {duration_str}]")
         } else {
             "Groove — Spotify Premium Player".to_string()
         };
@@ -1951,11 +1974,82 @@ impl TrayMenuSnapshot {
             tooltip,
             now_playing_headline,
             album_subtitle,
+            progress_label,
+            elapsed_secs,
+            duration_secs,
+            remaining_secs,
+            progress_permille,
+            playback_rate_milli,
             play_pause_label,
             like_label,
             is_playing: state.is_playing,
             can_skip_tracks,
         }
+    }
+
+    /// Renders a compact single-line Unicode progress bar of `slots` segments for `progress_permille` (`0..=1000`).
+    pub fn render_progress_bar(progress_permille: u16, slots: usize) -> String {
+        let total = slots.max(4);
+        let clamped = progress_permille.min(1000) as usize;
+        let knob_idx = ((clamped * (total - 1)) + 500) / 1000;
+        let mut bar = String::with_capacity(total * 3);
+        for i in 0..total {
+            if i < knob_idx {
+                bar.push('━');
+            } else if i == knob_idx {
+                bar.push('●');
+            } else {
+                bar.push('─');
+            }
+        }
+        bar
+    }
+
+    /// Returns the playback rate as an IEEE-754 `f64` (`1.0` or `0.0`) for macOS `MPNowPlayingInfoCenter`.
+    pub fn playback_rate_f64(&self) -> f64 {
+        (self.playback_rate_milli as f64) / 1000.0
+    }
+
+    /// Formal relational invariant (`INV-T7`) proving that this `TrayMenuSnapshot`'s progress
+    /// indicator and transport state are strictly in sync with the true `PlaybackState`.
+    pub fn check_sync_with_playback(&self, state: &PlaybackState) -> Result<(), InvariantViolation> {
+        self.check_invariants()?;
+
+        let true_elapsed = state.synced_elapsed_secs();
+        let true_duration = state.current_track.duration_secs;
+        let true_remaining = state.synced_remaining_secs();
+        let true_permille = state.synced_progress_permille();
+        let true_rate = state.synced_playback_rate_milli();
+
+        if self.elapsed_secs != true_elapsed
+            || self.duration_secs != true_duration
+            || self.remaining_secs != true_remaining
+            || self.progress_permille != true_permille
+            || self.is_playing != state.is_playing
+            || self.playback_rate_milli != true_rate
+        {
+            return Err(InvariantViolation {
+                code: "INV-T7",
+                subsystem: "TrayMenuSnapshot",
+                details: format!(
+                    "tray progress out of sync with player: tray=(elapsed={}s, rem=-{}s, dur={}s, permille={}, playing={}, rate={}) vs player=(elapsed={}s, rem=-{}s, dur={}s, permille={}, playing={}, rate={})",
+                    self.elapsed_secs,
+                    self.remaining_secs,
+                    self.duration_secs,
+                    self.progress_permille,
+                    self.is_playing,
+                    self.playback_rate_milli,
+                    true_elapsed,
+                    true_remaining,
+                    true_duration,
+                    true_permille,
+                    state.is_playing,
+                    true_rate,
+                ),
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -2002,6 +2096,69 @@ impl FormalInvariant for TrayMenuSnapshot {
                 details: format!(
                     "play_pause_label '{}' disagrees with is_playing={}",
                     self.play_pause_label, self.is_playing
+                ),
+            });
+        }
+
+        // INV-T4: Progress time conservation (`elapsed_secs + remaining_secs == duration_secs`)
+        // and exact progress_permille ratio in `0..=1000`.
+        if self.elapsed_secs > self.duration_secs
+            || self.elapsed_secs.saturating_add(self.remaining_secs) != self.duration_secs
+        {
+            return Err(InvariantViolation {
+                code: "INV-T4",
+                subsystem: "TrayMenuSnapshot",
+                details: format!(
+                    "progress time conservation violated: elapsed={}s + remaining={}s != duration={}s",
+                    self.elapsed_secs, self.remaining_secs, self.duration_secs
+                ),
+            });
+        }
+        let expected_permille = if self.duration_secs == 0 {
+            0
+        } else {
+            (((self.elapsed_secs as u64) * 1000) / (self.duration_secs as u64)).min(1000) as u16
+        };
+        if self.progress_permille > 1000 || self.progress_permille != expected_permille {
+            return Err(InvariantViolation {
+                code: "INV-T4",
+                subsystem: "TrayMenuSnapshot",
+                details: format!(
+                    "progress_permille={} disagrees with expected={} (elapsed={}, duration={})",
+                    self.progress_permille, expected_permille, self.elapsed_secs, self.duration_secs
+                ),
+            });
+        }
+
+        // INV-T5: Playback rate coherence (`playback_rate_milli` in `{0, 1000}` and `!is_playing ==> 0`).
+        if (self.playback_rate_milli != 0 && self.playback_rate_milli != 1000)
+            || (!self.is_playing && self.playback_rate_milli != 0)
+        {
+            return Err(InvariantViolation {
+                code: "INV-T5",
+                subsystem: "TrayMenuSnapshot",
+                details: format!(
+                    "playback_rate_milli={} invalid for is_playing={}",
+                    self.playback_rate_milli, self.is_playing
+                ),
+            });
+        }
+
+        // INV-T6: Progress indicator label is single-line and contains exact elapsed and remaining timestamps.
+        let expected_elapsed_str = crate::format_seconds(self.elapsed_secs);
+        let expected_rem_str = format!("-{}", crate::format_seconds(self.remaining_secs));
+        if self.progress_label.trim().is_empty()
+            || self.progress_label.contains('\n')
+            || self.progress_label.contains('\r')
+            || !self.progress_label.contains(&expected_elapsed_str)
+            || !self.progress_label.contains(&expected_rem_str)
+        {
+            return Err(InvariantViolation {
+                code: "INV-T6",
+                subsystem: "TrayMenuSnapshot",
+                details: format!(
+                    "progress_label '{}' missing elapsed '{}' or remaining '{}'",
+                    self.progress_label, expected_elapsed_str, expected_rem_str
                 ),
             });
         }

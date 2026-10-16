@@ -2197,6 +2197,7 @@ name = "groove-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block2 0.6.2",
  "dirs 5.0.1",
  "flume",
  "groove-audio",
@@ -2204,6 +2205,7 @@ dependencies = [
  "groove-spotify",
  "iced",
  "image 0.25.10",
+ "libc",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",

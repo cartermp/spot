@@ -510,6 +510,49 @@ impl PlaybackState {
             _ => None,
         }
     }
+
+    /// Returns `true` if `current_track` represents an active playable track or episode.
+    pub fn has_active_track(&self) -> bool {
+        !self.current_track.id.is_empty()
+            && !self.current_track.title.trim().is_empty()
+            && self.current_track.id != "no-track"
+    }
+
+    /// Canonical sanitized playback position in `[0.0, current_track.duration_secs]`.
+    pub fn synced_position_secs(&self) -> f32 {
+        sanitize_position_secs(self.position_secs, self.current_track.duration_secs)
+    }
+
+    /// Canonical integer elapsed seconds shown in both the main player scrubber and the macOS tray.
+    pub fn synced_elapsed_secs(&self) -> u32 {
+        (self.synced_position_secs().floor() as u32).min(self.current_track.duration_secs)
+    }
+
+    /// Canonical integer remaining seconds (`duration_secs - elapsed_secs`).
+    pub fn synced_remaining_secs(&self) -> u32 {
+        self.current_track
+            .duration_secs
+            .saturating_sub(self.synced_elapsed_secs())
+    }
+
+    /// Canonical progress ratio in parts-per-thousand (`0..=1000`).
+    pub fn synced_progress_permille(&self) -> u16 {
+        let dur = self.current_track.duration_secs;
+        if dur == 0 {
+            0
+        } else {
+            (((self.synced_elapsed_secs() as u64) * 1000) / (dur as u64)).min(1000) as u16
+        }
+    }
+
+    /// Canonical playback rate in milli-units (`1000` = `1.0x` when actively playing a track, `0` = `0.0x` when paused/idle).
+    pub fn synced_playback_rate_milli(&self) -> u16 {
+        if self.is_playing && self.has_active_track() {
+            1000
+        } else {
+            0
+        }
+    }
 }
 
 /// Commands dispatched from the UI thread to the async Spotify + Audio engine.

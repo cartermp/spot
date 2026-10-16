@@ -270,6 +270,15 @@ pub struct GrooveApp {
 impl FormalInvariant for GrooveApp {
     fn check_invariants(&self) -> Result<(), InvariantViolation> {
         self.state.check_invariants()?;
+        let tray_snapshot = groove_core::TrayMenuSnapshot::from_playback_state(&self.state);
+        tray_snapshot.check_invariants()?;
+        tray_snapshot.check_sync_with_playback(&self.state)?;
+        if let Some(tray) = &self.tray {
+            if let Some(live_snap) = tray.snapshot() {
+                live_snap.check_invariants()?;
+                live_snap.check_sync_with_playback(&self.state)?;
+            }
+        }
         self.nav_history.check_invariants()?;
         self.recent_searches.check_invariants()?;
         self.recently_listened.check_invariants()?;
@@ -723,11 +732,23 @@ impl GrooveApp {
                     self.tray = GrooveTray::try_new(&self.state, &self.artwork);
                 }
 
-                // Poll native macOS menu bar tray actions
+                // Poll native macOS menu bar tray & Now Playing actions
                 for action in GrooveTray::poll_actions() {
                     match action {
                         TrayAction::OpenNowPlaying => {
                             self.push_route(StageRoute::Section(NavSection::NowPlaying));
+                        }
+                        TrayAction::Play => {
+                            if !self.state.is_playing {
+                                self.state.is_playing = true;
+                                let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
+                            }
+                        }
+                        TrayAction::Pause => {
+                            if self.state.is_playing {
+                                self.state.is_playing = false;
+                                let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
+                            }
                         }
                         TrayAction::TogglePlayPause => {
                             self.state.is_playing = !self.state.is_playing;
@@ -757,6 +778,18 @@ impl GrooveApp {
                                 .command_tx
                                 .send(PlayerCommand::ToggleLikeCurrent);
                         }
+                        TrayAction::SeekSeconds(secs) => {
+                            let sanitized = sanitize_position_secs(
+                                secs as f32,
+                                self.state.current_track.duration_secs,
+                            );
+                            self.scrubbing_position = None;
+                            self.state.position_secs = sanitized;
+                            let _ = self
+                                .engine
+                                .command_tx
+                                .send(PlayerCommand::SeekSeconds(sanitized));
+                        }
                     }
                 }
 
@@ -777,9 +810,7 @@ impl GrooveApp {
                     self.apply_engine_event(event);
                 }
 
-                if let Some(tray) = &mut self.tray {
-                    tray.sync(&self.state, &self.artwork);
-                }
+                self.sync_tray();
 
                 // Update 60 FPS spectrum frame from live lock-free audio ringbuffer (or harmonic fallback)
                 self.spectrum = self.analyzer.next_frame(self.state.is_playing, 0.016);
@@ -1615,13 +1646,25 @@ impl GrooveApp {
             Message::ArtworkLoaded(Some((url, decoded))) => {
                 tracing::info!("[UI] ArtworkLoaded -> cached texture for {}", url);
                 self.artwork.insert_remote(url, decoded);
-                if let Some(tray) = &mut self.tray {
-                    tray.sync(&self.state, &self.artwork);
-                }
             }
             Message::ArtworkLoaded(None) => {}
         }
+        self.sync_tray();
         Task::none()
+    }
+
+    fn sync_tray(&mut self) {
+        if let Some(tray) = &mut self.tray {
+            tray.sync(&self.state, &self.artwork);
+            if let Some(snapshot) = tray.snapshot() {
+                if let Err(err) = snapshot.check_sync_with_playback(&self.state) {
+                    panic!(
+                        "[FORMAL VERIFICATION FAILURE] Tray progress invariant violated ({}): {}",
+                        err.code, err.details
+                    );
+                }
+            }
+        }
     }
 
     fn spawn_missing_artwork_tasks(&mut self) -> Task<Message> {
@@ -2430,7 +2473,7 @@ impl GrooveApp {
             .height(Length::Fixed(78.0));
 
         let duration_f = (track.duration_secs.max(1)) as f32;
-        let current_pos = self.state.position_secs.clamp(0.0, duration_f);
+        let current_pos = self.state.synced_position_secs().clamp(0.0, duration_f);
 
         let seek_slider = slider(0.0..=duration_f, current_pos, Message::SeekChanged)
             .on_release(Message::SeekReleased)
@@ -2439,7 +2482,7 @@ impl GrooveApp {
             .style(theme::seek_slider_style);
 
         let timestamps_row = row![
-            text(format_seconds(current_pos as u32))
+            text(format_seconds(self.state.synced_elapsed_secs()))
                 .size(11.5)
                 .color(palette::INK_MUTED),
             horizontal_space(),
@@ -4828,5 +4871,56 @@ mod tests {
         assert!(app.state.is_discography_exhausted());
         app.assert_invariants();
         let _ = app.view();
+    }
+
+    #[test]
+    fn tray_and_player_progress_indicators_are_always_in_sync() {
+        use groove_core::{ArtworkTheme, TrayMenuSnapshot};
+        let (mut app, _) = GrooveApp::new();
+
+        // Load podcast episode "MAGA's Midterm Defectors" (duration 27:42 = 1662s)
+        app.state.current_track = Track {
+            id: "ep-daily".into(),
+            spotify_uri: "spotify:episode:2MAi0BvDc6GTFvKFPXnkCL".into(),
+            title: "MAGA's Midterm Defectors".into(),
+            artist: "The Daily".into(),
+            album: "The Daily".into(),
+            duration_secs: 1662,
+            liked: false,
+            cover_art_url: None,
+            artwork_theme: ArtworkTheme::SunriseMountainLake,
+        };
+        app.state.is_playing = true;
+        app.apply_engine_event(EngineEvent::PositionTick(972.0)); // 16:12
+        app.assert_invariants();
+
+        let snap = TrayMenuSnapshot::from_playback_state(&app.state);
+        assert!(snap.check_sync_with_playback(&app.state).is_ok());
+        assert_eq!(app.state.synced_elapsed_secs(), 972);
+        assert_eq!(snap.elapsed_secs, 972);
+        assert_eq!(snap.remaining_secs, 690); // -11:30
+        assert!(snap.progress_label.contains("16:12 / 27:42"));
+        assert!(snap.progress_label.contains("(-11:30)"));
+
+        // Seek via UI slider to 08:43 (523s) and release
+        let _ = app.update(Message::SeekChanged(523.0));
+        app.assert_invariants();
+        let snap_after_scrub = TrayMenuSnapshot::from_playback_state(&app.state);
+        assert!(snap_after_scrub.check_sync_with_playback(&app.state).is_ok());
+        assert_eq!(app.state.synced_elapsed_secs(), 523);
+        assert_eq!(snap_after_scrub.elapsed_secs, 523);
+        assert_eq!(snap_after_scrub.remaining_secs, 1139);
+        assert!(snap_after_scrub.progress_label.contains("8:43 / 27:42"));
+
+        let _ = app.update(Message::SeekReleased);
+        app.assert_invariants();
+
+        // Pause playback -> playback_rate_milli must drop to 0 so macOS Now Playing does not drift
+        let _ = app.update(Message::TogglePlayPause);
+        assert!(!app.state.is_playing);
+        app.assert_invariants();
+        let snap_paused = TrayMenuSnapshot::from_playback_state(&app.state);
+        assert_eq!(snap_paused.playback_rate_milli, 0);
+        assert_eq!(snap_paused.elapsed_secs, app.state.synced_elapsed_secs());
     }
 }
