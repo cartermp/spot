@@ -75,8 +75,13 @@ impl TeeSink {
         sample_producer: AudioSampleProducer,
         volume_scaler: AtomicVolumeScaler,
     ) -> Self {
+        let verified_device =
+            groove_audio::resolve_cpal_output_device_name(device_name.as_deref());
+        tracing::info!(
+            "Opening TeeSink with format={format:?}, requested_device={device_name:?}, verified_device={verified_device:?}"
+        );
         let inner = match audio_backend::find(None) {
-            Some(builder) => Some(builder(device_name, format)),
+            Some(builder) => Some(builder(verified_device, format)),
             None => {
                 warn!("No librespot audio backend found; TeeSink will tap visualizer samples only");
                 None

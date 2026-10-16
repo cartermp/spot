@@ -489,7 +489,58 @@ pub fn enumerate_output_devices() -> Vec<AudioDevice> {
         devices[0].is_default = true;
     }
 
+    tracing::info!(
+        "Enumerated {} audio output devices (default={:?}): {:?}",
+        devices.len(),
+        default_name,
+        devices.iter().map(|d| (&d.name, d.is_default)).collect::<Vec<_>>()
+    );
+
     devices
+}
+
+/// Validates a requested output device name against live `cpal` host output devices.
+/// Returns `Some(exact_cpal_name)` only if `cpal` has a matching output device, or `None`
+/// to use the system default output device (preventing `rodio::open` from panicking on
+/// virtual/fallback device names).
+pub fn resolve_cpal_output_device_name(requested: Option<&str>) -> Option<String> {
+    let host = cpal::default_host();
+    let default_dev_name = host
+        .default_output_device()
+        .and_then(|d| d.name().ok());
+
+    let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        tracing::info!(
+            "Using system default CoreAudio output device: {:?}",
+            default_dev_name
+        );
+        return None;
+    };
+
+    if let Ok(mut output_devices) = host.output_devices() {
+        if let Some(matched) = output_devices.find_map(|d| {
+            let raw_name = d.name().ok()?;
+            if raw_name == req || raw_name.trim().eq_ignore_ascii_case(req) {
+                Some(raw_name)
+            } else {
+                None
+            }
+        }) {
+            tracing::info!(
+                "Resolved requested audio device {:?} -> live cpal device {:?}",
+                req,
+                matched
+            );
+            return Some(matched);
+        }
+    }
+
+    tracing::warn!(
+        "Requested audio device {:?} is not a live cpal output device; falling back to system default {:?}",
+        req,
+        default_dev_name
+    );
+    None
 }
 
 #[cfg(test)]

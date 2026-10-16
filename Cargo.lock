@@ -1915,6 +1915,7 @@ dependencies = [
  "librespot-oauth",
  "librespot-playback",
  "librespot-protocol",
+ "protobuf",
  "reqwest",
  "serde",
  "serde_json",

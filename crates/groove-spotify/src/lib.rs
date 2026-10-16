@@ -61,12 +61,16 @@ async fn run_engine_loop(
     // Merge real macOS CoreAudio output devices if available.
     merge_output_devices(&mut state, enumerate_output_devices());
 
-    // Reflect cached credentials if already stored on disk, and auto-connect in background.
-    let has_cached_creds = auth::cached_credentials().is_some();
+    // Reflect cached credentials if already stored on disk, and auto-connect in background
+    // (disabled during unit tests so tests remain fast, offline, and deterministic).
+    let has_cached_creds = !cfg!(test) && auth::cached_credentials().is_some();
     if has_cached_creds {
+        info!("[Engine] Found cached Spotify credentials; reconnecting in background...");
         state.connection = ConnectionStatus::Connecting {
             status: "Reconnecting Spotify session...".to_string(),
         };
+    } else {
+        info!("[Engine] Starting in preview mode (no cached credentials or running tests)");
     }
 
     let volume_scaler = AtomicVolumeScaler::new(state.volume);
@@ -74,14 +78,26 @@ async fn run_engine_loop(
     let mut live_session: Option<Session> = None;
     let mut player: Option<Arc<Player>> = None;
     let mut player_events: Option<PlayerEventChannel> = None;
+    let mut player_has_loaded_track = false;
+    let mut search_abort_handle: Option<tokio::task::AbortHandle> = None;
+    let mut artist_abort_handle: Option<tokio::task::AbortHandle> = None;
     let (auth_result_tx, auth_result_rx) =
         flume::unbounded::<Result<auth::AuthenticatedSession, auth::SpotifyAuthError>>();
 
     if has_cached_creds {
         let tx = auth_result_tx.clone();
         tokio::spawn(async move {
-            if let Ok(Some(session)) = auth::try_connect_cached(None).await {
-                let _ = tx.send(Ok(session));
+            match auth::try_connect_cached(None).await {
+                Ok(Some(session)) => {
+                    let _ = tx.send(Ok(session));
+                }
+                Ok(None) => {
+                    warn!("[Engine] Cached credentials did not yield an active session");
+                }
+                Err(err) => {
+                    warn!("[Engine] Auto-reconnect with cached credentials failed: {err}");
+                    let _ = tx.send(Err(err));
+                }
             }
         });
     }
@@ -109,6 +125,7 @@ async fn run_engine_loop(
                     &mut live_session,
                     &mut player,
                     &mut player_events,
+                    &mut player_has_loaded_track,
                 )
                 .await;
             }
@@ -129,6 +146,9 @@ async fn run_engine_loop(
                     &mut live_session,
                     &mut player,
                     &mut player_events,
+                    &mut player_has_loaded_track,
+                    &mut search_abort_handle,
+                    &mut artist_abort_handle,
                     &auth_result_tx,
                 )
                 .await;
@@ -140,6 +160,7 @@ async fn run_engine_loop(
                     &mut state,
                     &event_tx,
                     &player,
+                    &mut player_has_loaded_track,
                 );
             }
 
@@ -156,6 +177,7 @@ async fn run_engine_loop(
                                 state.is_playing,
                                 0.0,
                             );
+                            player_has_loaded_track = true;
                         }
                         let _ = event_tx.send(EngineEvent::TrackChanged(state.current_track.clone()));
                         let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
@@ -180,14 +202,29 @@ fn handle_librespot_event(
     state: &mut PlaybackState,
     event_tx: &Sender<EngineEvent>,
     player: &Option<Arc<Player>>,
+    player_has_loaded_track: &mut bool,
 ) {
     match event {
-        PlayerEvent::Playing { position_ms, .. } => {
+        PlayerEvent::Playing {
+            track_id,
+            position_ms,
+            ..
+        } => {
+            info!(
+                "[LibrespotPlayer] Event: Playing track={track_id:?} at position_ms={position_ms}"
+            );
             state.is_playing = true;
             state.position_secs = position_ms as f32 / 1000.0;
             let _ = event_tx.send(EngineEvent::PlayStateChanged(true));
         }
-        PlayerEvent::Paused { position_ms, .. } => {
+        PlayerEvent::Paused {
+            track_id,
+            position_ms,
+            ..
+        } => {
+            info!(
+                "[LibrespotPlayer] Event: Paused track={track_id:?} at position_ms={position_ms}"
+            );
             state.is_playing = false;
             state.position_secs = position_ms as f32 / 1000.0;
             let _ = event_tx.send(EngineEvent::PlayStateChanged(false));
@@ -198,7 +235,8 @@ fn handle_librespot_event(
             state.position_secs = position_ms as f32 / 1000.0;
             let _ = event_tx.send(EngineEvent::PositionTick(state.position_secs));
         }
-        PlayerEvent::EndOfTrack { .. } => {
+        PlayerEvent::EndOfTrack { track_id, .. } => {
+            info!("[LibrespotPlayer] Event: EndOfTrack ({track_id:?}) -> advancing queue");
             advance_queue_track(state, true, true);
             if let Some(active_player) = player.as_ref() {
                 load_track_on_player(
@@ -207,11 +245,26 @@ fn handle_librespot_event(
                     state.is_playing,
                     0.0,
                 );
+                *player_has_loaded_track = true;
             }
             let _ = event_tx.send(EngineEvent::TrackChanged(state.current_track.clone()));
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
-        _ => {}
+        PlayerEvent::Loading {
+            track_id,
+            position_ms,
+            ..
+        } => {
+            info!(
+                "[LibrespotPlayer] Event: Loading track={track_id:?} at position_ms={position_ms}"
+            );
+        }
+        PlayerEvent::Unavailable { track_id, .. } => {
+            warn!("[LibrespotPlayer] Event: Track unavailable ({track_id:?})");
+        }
+        other => {
+            debug!("[LibrespotPlayer] Event: {other:?}");
+        }
     }
 }
 
@@ -226,23 +279,30 @@ async fn apply_auth_result(
     live_session: &mut Option<Session>,
     player: &mut Option<Arc<Player>>,
     player_events: &mut Option<PlayerEventChannel>,
+    player_has_loaded_track: &mut bool,
 ) {
     match auth_res {
         Ok(auth_session) => {
+            info!(
+                "[Engine] Applying authenticated Spotify session for user='{}' (has_token={})",
+                auth_session.username,
+                auth_session.access_token.is_some()
+            );
             web_client.set_access_token(auth_session.access_token.clone());
-            let mut username = auth_session.username.clone();
-            let mut is_premium = true;
+            let username = auth_session.username.clone();
+            let is_premium = true;
 
-            if web_client.access_token().is_some() {
-                if let Ok(profile) = web_client.fetch_user_profile().await {
-                    username = profile.display_username();
-                    is_premium = profile.is_premium();
-                }
-                let user_playlists = web_client.fetch_user_playlists().await;
-                if !user_playlists.is_empty() {
-                    state.playlists = user_playlists;
-                    let _ = event_tx.send(EngineEvent::PlaylistsLoaded(state.playlists.clone()));
-                }
+            let user_playlists = web_client
+                .fetch_user_playlists_with_session(Some(&auth_session.session))
+                .await;
+            if !user_playlists.is_empty() {
+                state.playlists = user_playlists;
+                let _ = event_tx.send(EngineEvent::PlaylistsLoaded(state.playlists.clone()));
+            }
+
+            if let Some(old_player) = player.take() {
+                info!("[Engine] Stopping previous librespot Player instance before replacement");
+                old_player.stop();
             }
 
             let device_arg = if state.selected_device.is_default {
@@ -256,26 +316,48 @@ async fn apply_auth_result(
                 sample_producer.clone(),
                 volume_scaler.clone(),
             );
-            load_track_on_player(
-                &new_player,
-                &state.current_track,
-                state.is_playing,
-                state.position_secs,
-            );
+            *player_has_loaded_track = false;
 
-            *live_session = Some(auth_session.session);
+            // If the user already selected a non-mockup track, load it into the new player.
+            if state.current_track.id != "higher-ground" {
+                load_track_on_player(
+                    &new_player,
+                    &state.current_track,
+                    state.is_playing,
+                    state.position_secs,
+                );
+                *player_has_loaded_track = true;
+            }
+
+            *live_session = Some(auth_session.session.clone());
             *player = Some(new_player);
             *player_events = Some(new_events);
+
+            // Pre-warm the Search catalog with real Spotify artists, portraits, albums, and cover art
+            let warm_client = web_client.clone();
+            let warm_session = auth_session.session;
+            let warm_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let featured = warm_client
+                    .search_catalog_with_session(Some(&warm_session), "")
+                    .await;
+                let _ = warm_tx.send(EngineEvent::SearchResults {
+                    query: String::new(),
+                    artists: featured.artists,
+                    albums: featured.albums,
+                    tracks: featured.tracks,
+                });
+            });
 
             state.connection = ConnectionStatus::Connected {
                 username,
                 is_premium,
                 live_session: true,
             };
-            info!("Spotify Premium engine connected and player initialized");
+            info!("[Engine] Spotify Premium engine connected and player ready");
         }
         Err(err) => {
-            warn!("Spotify authentication failed: {err}");
+            warn!("[Engine] Spotify authentication failed: {err}");
             state.connection = ConnectionStatus::Disconnected {
                 reason: Some(err.to_string()),
             };
@@ -311,14 +393,31 @@ async fn handle_command(
     live_session: &mut Option<Session>,
     player: &mut Option<Arc<Player>>,
     player_events: &mut Option<PlayerEventChannel>,
+    player_has_loaded_track: &mut bool,
+    search_abort_handle: &mut Option<tokio::task::AbortHandle>,
+    artist_abort_handle: &mut Option<tokio::task::AbortHandle>,
     auth_result_tx: &Sender<Result<auth::AuthenticatedSession, auth::SpotifyAuthError>>,
 ) {
     match cmd {
         PlayerCommand::TogglePlayPause => {
             state.is_playing = !state.is_playing;
+            info!(
+                "[Engine] Command: TogglePlayPause -> is_playing={} (track='{}', uri='{}')",
+                state.is_playing, state.current_track.title, state.current_track.spotify_uri
+            );
             if let Some(active_player) = player.as_ref() {
                 if state.is_playing {
-                    active_player.play();
+                    if !*player_has_loaded_track {
+                        load_track_on_player(
+                            active_player,
+                            &state.current_track,
+                            true,
+                            state.position_secs,
+                        );
+                        *player_has_loaded_track = true;
+                    } else {
+                        active_player.play();
+                    }
                 } else {
                     active_player.pause();
                 }
@@ -328,14 +427,29 @@ async fn handle_command(
 
         PlayerCommand::Play => {
             state.is_playing = true;
+            info!(
+                "[Engine] Command: Play (track='{}', uri='{}')",
+                state.current_track.title, state.current_track.spotify_uri
+            );
             if let Some(active_player) = player.as_ref() {
-                active_player.play();
+                if !*player_has_loaded_track {
+                    load_track_on_player(
+                        active_player,
+                        &state.current_track,
+                        true,
+                        state.position_secs,
+                    );
+                    *player_has_loaded_track = true;
+                } else {
+                    active_player.play();
+                }
             }
             let _ = event_tx.send(EngineEvent::PlayStateChanged(true));
         }
 
         PlayerCommand::Pause => {
             state.is_playing = false;
+            info!("[Engine] Command: Pause");
             if let Some(active_player) = player.as_ref() {
                 active_player.pause();
             }
@@ -344,6 +458,10 @@ async fn handle_command(
 
         PlayerCommand::NextTrack => {
             advance_queue_track(state, true, false);
+            info!(
+                "[Engine] Command: NextTrack -> '{}' by '{}' ({})",
+                state.current_track.title, state.current_track.artist, state.current_track.spotify_uri
+            );
             if let Some(active_player) = player.as_ref() {
                 load_track_on_player(
                     active_player,
@@ -351,12 +469,17 @@ async fn handle_command(
                     state.is_playing,
                     0.0,
                 );
+                *player_has_loaded_track = true;
             }
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
         PlayerCommand::PreviousTrack => {
             advance_queue_track(state, false, false);
+            info!(
+                "[Engine] Command: PreviousTrack -> '{}' by '{}' ({})",
+                state.current_track.title, state.current_track.artist, state.current_track.spotify_uri
+            );
             if let Some(active_player) = player.as_ref() {
                 load_track_on_player(
                     active_player,
@@ -364,6 +487,7 @@ async fn handle_command(
                     state.is_playing,
                     0.0,
                 );
+                *player_has_loaded_track = true;
             }
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
@@ -376,6 +500,7 @@ async fn handle_command(
                 pos.max(0.0)
             };
             state.position_secs = clamped;
+            info!("[Engine] Command: SeekSeconds -> {clamped:.1}s");
             if let Some(active_player) = player.as_ref() {
                 active_player.seek((clamped * 1000.0) as u32);
             }
@@ -386,6 +511,7 @@ async fn handle_command(
             let clamped = vol.clamp(0.0, 1.0);
             state.volume = clamped;
             volume_scaler.set(clamped);
+            info!("[Engine] Command: SetVolume -> {:.0}%", clamped * 100.0);
             if let Some(active_player) = player.as_ref() {
                 let raw_vol = (clamped as f64 * u16::MAX as f64).round() as u16;
                 active_player.emit_volume_changed_event(raw_vol);
@@ -395,11 +521,13 @@ async fn handle_command(
 
         PlayerCommand::ToggleShuffle => {
             state.shuffle = !state.shuffle;
+            info!("[Engine] Command: ToggleShuffle -> {}", state.shuffle);
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
         PlayerCommand::CycleRepeat => {
             state.repeat = state.repeat.next();
+            info!("[Engine] Command: CycleRepeat -> {:?}", state.repeat);
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
@@ -407,6 +535,10 @@ async fn handle_command(
             state.current_track.liked = !state.current_track.liked;
             let liked = state.current_track.liked;
             let current_id = state.current_track.id.clone();
+            info!(
+                "[Engine] Command: ToggleLikeCurrent ('{}') -> liked={liked}",
+                state.current_track.title
+            );
             for track in &mut state.queue {
                 if track.id == current_id {
                     track.liked = liked;
@@ -422,17 +554,26 @@ async fn handle_command(
                 .find(|t| t.id == track_id || t.spotify_uri == track_id)
                 .cloned()
             {
+                info!(
+                    "[Engine] Command: SelectQueueTrack -> '{}' by '{}' ({})",
+                    selected.title, selected.artist, selected.spotify_uri
+                );
                 state.current_track = selected;
                 state.position_secs = 0.0;
                 state.is_playing = true;
                 if let Some(active_player) = player.as_ref() {
                     load_track_on_player(active_player, &state.current_track, true, 0.0);
+                    *player_has_loaded_track = true;
                 }
             }
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
         PlayerCommand::PlayTrack(track) => {
+            info!(
+                "[Engine] Command: PlayTrack -> '{}' by '{}' (uri={}, cover={:?})",
+                track.title, track.artist, track.spotify_uri, track.cover_art_url
+            );
             if !state
                 .queue
                 .iter()
@@ -445,11 +586,13 @@ async fn handle_command(
             state.is_playing = true;
             if let Some(active_player) = player.as_ref() {
                 load_track_on_player(active_player, &state.current_track, true, 0.0);
+                *player_has_loaded_track = true;
             }
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
         PlayerCommand::SelectPlaylist(playlist_id) => {
+            info!("[Engine] Command: SelectPlaylist('{playlist_id}')");
             ensure_fresh_web_token(web_client, live_session).await;
             let mut resolved_key = playlist_id.clone();
             for playlist in &mut state.playlists {
@@ -463,7 +606,9 @@ async fn handle_command(
             }
             state.active_playlist_id = Some(resolved_key.clone());
 
-            let tracks = web_client.fetch_playlist_tracks(&resolved_key).await;
+            let tracks = web_client
+                .fetch_playlist_tracks_with_session(live_session.as_ref(), &resolved_key)
+                .await;
             if !tracks.is_empty() {
                 state.current_track = tracks[0].clone();
                 state.queue = tracks;
@@ -471,43 +616,73 @@ async fn handle_command(
                 state.is_playing = true;
                 if let Some(active_player) = player.as_ref() {
                     load_track_on_player(active_player, &state.current_track, true, 0.0);
+                    *player_has_loaded_track = true;
                 }
             }
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
         PlayerCommand::SelectArtist(artist_id_or_uri) => {
-            ensure_fresh_web_token(web_client, live_session).await;
-            let detail = web_client
-                .fetch_artist_detail(live_session.as_ref(), &artist_id_or_uri)
-                .await;
-            let _ = event_tx.send(EngineEvent::ArtistDetailLoaded(Box::new(detail)));
+            info!("[Engine] Command: SelectArtist('{artist_id_or_uri}')");
+            if let Some(prev) = artist_abort_handle.take() {
+                prev.abort();
+            }
+            let client = web_client.clone();
+            let sess = live_session.clone();
+            let tx = event_tx.clone();
+            let jh = tokio::spawn(async move {
+                let detail = client
+                    .fetch_artist_detail(sess.as_ref(), &artist_id_or_uri)
+                    .await;
+                info!(
+                    "[Engine] ArtistDetailLoaded for '{}' ({} albums, {} top tracks)",
+                    detail.artist.name,
+                    detail.albums.len(),
+                    detail.top_tracks.len()
+                );
+                let _ = tx.send(EngineEvent::ArtistDetailLoaded(Box::new(detail)));
+            });
+            *artist_abort_handle = Some(jh.abort_handle());
         }
 
         PlayerCommand::PlayAlbum(album_id_or_uri) => {
+            info!("[Engine] Command: PlayAlbum('{album_id_or_uri}')");
             ensure_fresh_web_token(web_client, live_session).await;
             let tracks = web_client
                 .fetch_album_tracks(live_session.as_ref(), &album_id_or_uri)
                 .await;
             if !tracks.is_empty() {
+                info!(
+                    "[Engine] PlayAlbum loaded {} tracks; starting with '{}'",
+                    tracks.len(),
+                    tracks[0].title
+                );
                 state.current_track = tracks[0].clone();
                 state.queue = tracks;
                 state.position_secs = 0.0;
                 state.is_playing = true;
                 if let Some(active_player) = player.as_ref() {
                     load_track_on_player(active_player, &state.current_track, true, 0.0);
+                    *player_has_loaded_track = true;
                 }
                 let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
             }
         }
 
         PlayerCommand::SelectOutputDevice(device) => {
+            info!(
+                "[Engine] Command: SelectOutputDevice -> '{}' (id={}, is_default={})",
+                device.name, device.id, device.is_default
+            );
             if !state.devices.iter().any(|d| d.id == device.id) {
                 state.devices.push(device.clone());
             }
             state.selected_device = device.clone();
 
             if let Some(session) = live_session.as_ref() {
+                if let Some(old_player) = player.take() {
+                    old_player.stop();
+                }
                 let device_arg = if device.is_default {
                     None
                 } else {
@@ -519,12 +694,15 @@ async fn handle_command(
                     sample_producer.clone(),
                     volume_scaler.clone(),
                 );
-                load_track_on_player(
-                    &new_player,
-                    &state.current_track,
-                    state.is_playing,
-                    state.position_secs,
-                );
+                if *player_has_loaded_track || state.current_track.id != "higher-ground" {
+                    load_track_on_player(
+                        &new_player,
+                        &state.current_track,
+                        state.is_playing,
+                        state.position_secs,
+                    );
+                    *player_has_loaded_track = true;
+                }
                 *player = Some(new_player);
                 *player_events = Some(new_events);
             }
@@ -536,6 +714,10 @@ async fn handle_command(
             client_id,
             force_reauth,
         } => {
+            info!(
+                "[Engine] Command: AuthenticateSpotify (force_reauth={force_reauth}, custom_client_id={})",
+                client_id.is_some()
+            );
             state.connection = ConnectionStatus::Connecting {
                 status: "Opening Spotify login in browser...".to_string(),
             };
@@ -549,12 +731,14 @@ async fn handle_command(
         }
 
         PlayerCommand::LogoutSpotify => {
+            info!("[Engine] Command: LogoutSpotify -> clearing credentials and stopping player");
             auth::clear_cached_credentials();
             if let Some(active_player) = player.take() {
                 active_player.stop();
             }
             *player_events = None;
             *live_session = None;
+            *player_has_loaded_track = false;
             web_client.set_access_token(None);
             state.connection = ConnectionStatus::Disconnected { reason: None };
             let _ = event_tx.send(EngineEvent::ConnectionUpdated(state.connection.clone()));
@@ -562,17 +746,49 @@ async fn handle_command(
         }
 
         PlayerCommand::SearchCatalog(query) => {
-            ensure_fresh_web_token(web_client, live_session).await;
-            let results = web_client.search_catalog(&query).await;
-            let _ = event_tx.send(EngineEvent::SearchResults {
-                query,
-                artists: results.artists,
-                albums: results.albums,
-                tracks: results.tracks,
+            if let Some(prev) = search_abort_handle.take() {
+                info!(
+                    "[Engine] Cancelling previous in-flight search task; new query='{}'",
+                    query
+                );
+                prev.abort();
+            }
+
+            let client = web_client.clone();
+            let sess = live_session.clone();
+            let tx = event_tx.clone();
+            let jh = tokio::spawn(async move {
+                // Debounce live network search by 140ms when typing non-empty queries on a live session
+                if sess.is_some() && !query.trim().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(140)).await;
+                }
+                info!(
+                    "[Engine] Running SearchCatalog for query='{}' (live_session={})",
+                    query,
+                    sess.is_some()
+                );
+                let results = client
+                    .search_catalog_with_session(sess.as_ref(), &query)
+                    .await;
+                info!(
+                    "[Engine] SearchResults ready for query='{}': {} artists, {} albums, {} tracks",
+                    query,
+                    results.artists.len(),
+                    results.albums.len(),
+                    results.tracks.len()
+                );
+                let _ = tx.send(EngineEvent::SearchResults {
+                    query,
+                    artists: results.artists,
+                    albums: results.albums,
+                    tracks: results.tracks,
+                });
             });
+            *search_abort_handle = Some(jh.abort_handle());
         }
 
         PlayerCommand::RefreshDevices => {
+            info!("[Engine] Command: RefreshDevices");
             merge_output_devices(state, enumerate_output_devices());
             let _ = event_tx.send(EngineEvent::DevicesUpdated(state.devices.clone()));
         }
@@ -608,6 +824,10 @@ fn load_track_on_player(player: &Player, track: &Track, start_playing: bool, pos
     match SpotifyUri::from_uri(&track.spotify_uri) {
         Ok(uri) if uri.is_playable() => {
             let position_ms = (position_secs.max(0.0) * 1000.0) as u32;
+            info!(
+                "[LibrespotPlayer] Loading track '{}' ({}) start_playing={} position_ms={}",
+                track.title, track.spotify_uri, start_playing, position_ms
+            );
             player.load(uri, start_playing, position_ms);
         }
         Ok(_) => {
@@ -628,15 +848,25 @@ fn merge_output_devices(state: &mut PlaybackState, detected: Vec<AudioDevice>) {
     }
 
     let current_id = state.selected_device.id.clone();
+    let had_real_default = detected
+        .iter()
+        .find(|d| d.id == current_id && d.is_default)
+        .cloned();
     state.devices = detected;
 
-    if let Some(existing) = state.devices.iter().find(|d| d.id == current_id).cloned() {
-        state.selected_device = existing;
+    if let Some(existing_default) = had_real_default {
+        state.selected_device = existing_default;
     } else if let Some(default_dev) = state.devices.iter().find(|d| d.is_default).cloned() {
         state.selected_device = default_dev;
+    } else if let Some(existing) = state.devices.iter().find(|d| d.id == current_id).cloned() {
+        state.selected_device = existing;
     } else if let Some(first) = state.devices.first().cloned() {
         state.selected_device = first;
     }
+    info!(
+        "[Audio] Active output device selected: '{}' (id={}, is_default={})",
+        state.selected_device.name, state.selected_device.id, state.selected_device.is_default
+    );
 }
 
 fn advance_queue_track(state: &mut PlaybackState, forward: bool, auto_ended: bool) {

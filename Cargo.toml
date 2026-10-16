@@ -40,6 +40,7 @@ librespot-playback = { version = "0.8", features = ["rodio-backend"] }
 librespot-oauth = "0.8"
 librespot-metadata = "0.8"
 librespot-protocol = "0.8"
+protobuf = "3.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # GUI

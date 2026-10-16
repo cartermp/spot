@@ -116,8 +116,18 @@ impl GrooveApp {
         // Discover real CoreAudio output devices immediately on startup
         let discovered = groove_audio::enumerate_output_devices();
         if !discovered.is_empty() {
+            if let Some(def) = discovered.iter().find(|d| d.is_default).cloned() {
+                state.selected_device = def;
+            } else if let Some(first) = discovered.first().cloned() {
+                state.selected_device = first;
+            }
             state.devices = discovered;
         }
+        tracing::info!(
+            "[UI] GrooveApp initialized (selected_device='{}', is_default={})",
+            state.selected_device.name,
+            state.selected_device.is_default
+        );
 
         let search_results = state.queue.clone();
         let search_artists = all_curated_artists();
@@ -177,6 +187,7 @@ impl GrooveApp {
                 }
             }
             Message::SelectNav(nav) => {
+                tracing::info!("[UI] SelectNav -> {:?}", nav);
                 self.viewing_artist = false;
                 self.active_nav = nav;
                 if nav == NavSection::Search && self.search_artists.is_empty() {
@@ -188,12 +199,15 @@ impl GrooveApp {
             }
             Message::TogglePlayPause => {
                 self.state.is_playing = !self.state.is_playing;
+                tracing::info!("[UI] TogglePlayPause clicked -> is_playing={}", self.state.is_playing);
                 let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
             }
             Message::NextTrack => {
+                tracing::info!("[UI] NextTrack clicked");
                 let _ = self.engine.command_tx.send(PlayerCommand::NextTrack);
             }
             Message::PreviousTrack => {
+                tracing::info!("[UI] PreviousTrack clicked");
                 let _ = self.engine.command_tx.send(PlayerCommand::PreviousTrack);
             }
             Message::SeekChanged(val) => {
@@ -202,6 +216,7 @@ impl GrooveApp {
             }
             Message::SeekReleased => {
                 if let Some(pos) = self.scrubbing_position.take() {
+                    tracing::info!("[UI] SeekReleased -> {pos:.1}s");
                     let _ = self.engine.command_tx.send(PlayerCommand::SeekSeconds(pos));
                 }
             }
@@ -214,20 +229,28 @@ impl GrooveApp {
             }
             Message::ToggleShuffle => {
                 self.state.shuffle = !self.state.shuffle;
+                tracing::info!("[UI] ToggleShuffle -> {}", self.state.shuffle);
                 let _ = self.engine.command_tx.send(PlayerCommand::ToggleShuffle);
             }
             Message::CycleRepeat => {
                 self.state.repeat = self.state.repeat.next();
+                tracing::info!("[UI] CycleRepeat -> {:?}", self.state.repeat);
                 let _ = self.engine.command_tx.send(PlayerCommand::CycleRepeat);
             }
             Message::ToggleLike => {
                 self.state.current_track.liked = !self.state.current_track.liked;
+                tracing::info!(
+                    "[UI] ToggleLike ('{}') -> {}",
+                    self.state.current_track.title,
+                    self.state.current_track.liked
+                );
                 let _ = self
                     .engine
                     .command_tx
                     .send(PlayerCommand::ToggleLikeCurrent);
             }
             Message::SelectQueueTrack(track_id) => {
+                tracing::info!("[UI] SelectQueueTrack('{track_id}')");
                 let _ = self
                     .engine
                     .command_tx
@@ -236,6 +259,12 @@ impl GrooveApp {
                 self.active_nav = NavSection::NowPlaying;
             }
             Message::PlaySpecificTrack(track) => {
+                tracing::info!(
+                    "[UI] PlaySpecificTrack: '{}' by '{}' ({})",
+                    track.title,
+                    track.artist,
+                    track.spotify_uri
+                );
                 let _ = self
                     .engine
                     .command_tx
@@ -244,6 +273,7 @@ impl GrooveApp {
                 self.active_nav = NavSection::NowPlaying;
             }
             Message::SelectPlaylist(playlist_id) => {
+                tracing::info!("[UI] SelectPlaylist('{playlist_id}')");
                 let _ = self
                     .engine
                     .command_tx
@@ -252,6 +282,7 @@ impl GrooveApp {
                 self.active_nav = NavSection::NowPlaying;
             }
             Message::OpenArtist(artist_id_or_name) => {
+                tracing::info!("[UI] OpenArtist('{artist_id_or_name}')");
                 self.viewing_artist = true;
                 let _ = self
                     .engine
@@ -259,9 +290,11 @@ impl GrooveApp {
                     .send(PlayerCommand::SelectArtist(artist_id_or_name));
             }
             Message::CloseArtistView => {
+                tracing::info!("[UI] CloseArtistView");
                 self.viewing_artist = false;
             }
             Message::PlayAlbum(album_uri) => {
+                tracing::info!("[UI] PlayAlbum('{album_uri}')");
                 let _ = self
                     .engine
                     .command_tx
@@ -272,6 +305,11 @@ impl GrooveApp {
             Message::PlayArtistTopTracks => {
                 if let Some(detail) = &self.selected_artist {
                     if let Some(first) = detail.top_tracks.first().cloned() {
+                        tracing::info!(
+                            "[UI] PlayArtistTopTracks -> starting with '{}' ({})",
+                            first.title,
+                            first.spotify_uri
+                        );
                         let _ = self
                             .engine
                             .command_tx
@@ -284,6 +322,7 @@ impl GrooveApp {
             Message::CreateNewPlaylist => {
                 let next_idx = self.state.playlists.len() + 1;
                 let new_id = format!("custom-playlist-{next_idx}");
+                tracing::info!("[UI] CreateNewPlaylist -> '{new_id}'");
                 self.state.playlists.push(groove_core::Playlist {
                     id: new_id,
                     spotify_uri: format!("spotify:playlist:custom{next_idx}"),
@@ -295,6 +334,7 @@ impl GrooveApp {
                 });
             }
             Message::SelectOutputDevice(device) => {
+                tracing::info!("[UI] SelectOutputDevice -> '{}' (id={})", device.name, device.id);
                 self.state.selected_device = device.clone();
                 let _ = self
                     .engine
@@ -302,6 +342,7 @@ impl GrooveApp {
                     .send(PlayerCommand::SelectOutputDevice(device));
             }
             Message::ConnectSpotifyClicked { force_reauth } => {
+                tracing::info!("[UI] ConnectSpotifyClicked(force_reauth={force_reauth})");
                 let client_id = std::env::var("SPOTIFY_CLIENT_ID").ok();
                 let _ = self
                     .engine
@@ -312,9 +353,11 @@ impl GrooveApp {
                     });
             }
             Message::LogoutSpotifyClicked => {
+                tracing::info!("[UI] LogoutSpotifyClicked");
                 let _ = self.engine.command_tx.send(PlayerCommand::LogoutSpotify);
             }
             Message::SearchQueryChanged(query) => {
+                tracing::info!("[UI] SearchQueryChanged -> '{}'", query);
                 self.search_query = query.clone();
                 let _ = self
                     .engine
@@ -325,6 +368,7 @@ impl GrooveApp {
                 self.show_track_details_banner = !self.show_track_details_banner;
             }
             Message::ArtworkLoaded(Some((url, handle))) => {
+                tracing::info!("[UI] ArtworkLoaded -> cached texture for {}", url);
                 self.artwork.insert_remote(url, handle);
             }
             Message::ArtworkLoaded(None) => {}
@@ -385,6 +429,7 @@ impl GrooveApp {
         if tasks.is_empty() {
             Task::none()
         } else {
+            tracing::info!("[UI] Spawning {} background artwork download task(s)", tasks.len());
             Task::batch(tasks)
         }
     }
@@ -392,6 +437,14 @@ impl GrooveApp {
     fn apply_engine_event(&mut self, event: EngineEvent) {
         match event {
             EngineEvent::StateSynced(new_state) => {
+                tracing::info!(
+                    "[UI] EngineEvent::StateSynced (track='{}', playing={}, queue={}, playlists={}, connection={:?})",
+                    new_state.current_track.title,
+                    new_state.is_playing,
+                    new_state.queue.len(),
+                    new_state.playlists.len(),
+                    new_state.connection
+                );
                 let scrubbing = self.scrubbing_position;
                 self.state = *new_state;
                 if let Some(pos) = scrubbing {
@@ -404,34 +457,63 @@ impl GrooveApp {
                 }
             }
             EngineEvent::PlayStateChanged(playing) => {
+                tracing::info!("[UI] EngineEvent::PlayStateChanged({playing})");
                 self.state.is_playing = playing;
             }
             EngineEvent::TrackChanged(track) => {
+                tracing::info!(
+                    "[UI] EngineEvent::TrackChanged -> '{}' by '{}'",
+                    track.title,
+                    track.artist
+                );
                 self.state.current_track = track;
             }
             EngineEvent::QueueUpdated(queue) => {
+                tracing::info!("[UI] EngineEvent::QueueUpdated ({} tracks)", queue.len());
                 self.state.queue = queue;
             }
             EngineEvent::PlaylistsLoaded(playlists) => {
+                tracing::info!(
+                    "[UI] EngineEvent::PlaylistsLoaded ({} playlists)",
+                    playlists.len()
+                );
                 self.state.playlists = playlists;
             }
             EngineEvent::DevicesUpdated(devices) => {
+                tracing::info!(
+                    "[UI] EngineEvent::DevicesUpdated ({} devices)",
+                    devices.len()
+                );
                 self.state.devices = devices;
             }
             EngineEvent::ConnectionUpdated(conn) => {
+                tracing::info!("[UI] EngineEvent::ConnectionUpdated -> {:?}", conn);
                 self.state.connection = conn;
             }
             EngineEvent::SearchResults {
+                query,
                 artists,
                 albums,
                 tracks,
-                ..
             } => {
+                tracing::info!(
+                    "[UI] EngineEvent::SearchResults(query='{}') -> {} artists, {} albums, {} tracks",
+                    query,
+                    artists.len(),
+                    albums.len(),
+                    tracks.len()
+                );
                 self.search_artists = artists;
                 self.search_albums = albums;
                 self.search_results = tracks;
             }
             EngineEvent::ArtistDetailLoaded(detail) => {
+                tracing::info!(
+                    "[UI] EngineEvent::ArtistDetailLoaded('{}') -> {} albums, {} top tracks",
+                    detail.artist.name,
+                    detail.albums.len(),
+                    detail.top_tracks.len()
+                );
                 self.selected_artist = Some(*detail);
                 self.viewing_artist = true;
             }

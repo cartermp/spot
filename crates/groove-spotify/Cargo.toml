@@ -19,4 +19,5 @@ librespot-playback.workspace = true
 librespot-oauth.workspace = true
 librespot-metadata.workspace = true
 librespot-protocol.workspace = true
+protobuf.workspace = true
 reqwest.workspace = true

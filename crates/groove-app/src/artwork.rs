@@ -118,13 +118,35 @@ pub async fn download_and_decode_artwork(url: String) -> Option<(String, image::
         .and_then(|p| fs::read(p).ok())
         .filter(|b| !b.is_empty())
     {
+        tracing::info!(
+            "[Artwork] Loaded {} bytes from disk cache for {}",
+            existing.len(),
+            trimmed
+        );
         existing
     } else {
-        let resp = reqwest::get(&trimmed).await.ok()?;
+        tracing::info!("[Artwork] Downloading remote image: {}", trimmed);
+        let resp = match reqwest::get(&trimmed).await {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!("[Artwork] HTTP error downloading {}: {err}", trimmed);
+                return None;
+            }
+        };
         if !resp.status().is_success() {
+            tracing::warn!(
+                "[Artwork] Non-success HTTP status {} for {}",
+                resp.status(),
+                trimmed
+            );
             return None;
         }
         let bytes = resp.bytes().await.ok()?.to_vec();
+        tracing::info!(
+            "[Artwork] Downloaded {} bytes from CDN for {}",
+            bytes.len(),
+            trimmed
+        );
         if let Some(path) = &disk_path {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
@@ -139,6 +161,7 @@ pub async fn download_and_decode_artwork(url: String) -> Option<(String, image::
         .await
         .ok()??;
 
+    tracing::info!("[Artwork] Decoded GPU texture (300x300 rounded RGBA) for {}", url_clone);
     Some((url_clone, handle))
 }
 
