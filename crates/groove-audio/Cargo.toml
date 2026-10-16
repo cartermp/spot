@@ -1,0 +1,12 @@
+[package]
+name = "groove-audio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+groove-core.workspace = true
+cpal.workspace = true
+rtrb.workspace = true
+realfft.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

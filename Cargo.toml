@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/groove-core",
+    "crates/groove-audio",
+    "crates/groove-spotify",
+    "crates/groove-app",
+]
+default-members = ["crates/groove-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Groove Contributors"]
+
+[workspace.dependencies]
+groove-core = { path = "crates/groove-core" }
+groove-audio = { path = "crates/groove-audio" }
+groove-spotify = { path = "crates/groove-spotify" }
+
+tokio = { version = "1.40", features = ["full"] }
+flume = "0.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+thiserror = "2.0"
+dirs = "5.0"
+
+# Audio & DSP
+cpal = "0.15"
+rtrb = "0.3"
+realfft = "3.4"
+
+# Spotify Premium & Web API
+librespot-core = "0.8"
+librespot-playback = { version = "0.8", features = ["rodio-backend"] }
+librespot-oauth = "0.8"
+librespot-metadata = "0.8"
+librespot-protocol = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# GUI
+iced = { version = "0.13", features = ["tokio", "wgpu", "image", "svg", "canvas", "advanced"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

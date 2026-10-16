@@ -1,0 +1,960 @@
+mod artwork;
+mod icons;
+mod theme;
+mod visualizer;
+
+use artwork::ArtworkCache;
+use groove_audio::SpectrumAnalyzer;
+use groove_core::{
+    format_seconds, AudioDevice, EngineEvent, NavSection, PlaybackState, PlayerCommand, RepeatMode,
+    SpectrumFrame, Track,
+};
+use groove_spotify::{spawn_engine, EngineHandle};
+use iced::alignment::{Horizontal, Vertical};
+use iced::widget::{
+    button, column, container, horizontal_rule, horizontal_space, image, pick_list, row,
+    scrollable, slider, svg, text, text_input, vertical_space,
+};
+use iced::window;
+use iced::{Alignment, Element, Length, Padding, Size, Subscription, Task, Theme};
+use std::time::Duration;
+use theme::{palette, INSTRUMENT_SERIF_BYTES, SERIF_FONT};
+use visualizer::RibbonVisualizer;
+
+pub fn main() -> iced::Result {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    #[cfg(target_os = "macos")]
+    let platform_specific = window::settings::PlatformSpecific {
+        title_hidden: true,
+        titlebar_transparent: true,
+        fullsize_content_view: true,
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let platform_specific = window::settings::PlatformSpecific::default();
+
+    let window_settings = window::Settings {
+        size: Size::new(1120.0, 740.0),
+        min_size: Some(Size::new(940.0, 640.0)),
+        resizable: true,
+        decorations: true,
+        platform_specific,
+        ..Default::default()
+    };
+
+    iced::application("Groove", GrooveApp::update, GrooveApp::view)
+        .window(window_settings)
+        .font(INSTRUMENT_SERIF_BYTES)
+        .subscription(GrooveApp::subscription)
+        .theme(|_| Theme::Light)
+        .antialiasing(true)
+        .run_with(GrooveApp::new)
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    AnimationTick,
+    SelectNav(NavSection),
+    TogglePlayPause,
+    NextTrack,
+    PreviousTrack,
+    SeekChanged(f32),
+    SeekReleased,
+    VolumeChanged(f32),
+    ToggleShuffle,
+    CycleRepeat,
+    ToggleLike,
+    SelectQueueTrack(String),
+    SelectPlaylist(String),
+    CreateNewPlaylist,
+    SelectOutputDevice(AudioDevice),
+    ConnectSpotifyClicked,
+    SearchQueryChanged(String),
+    ToggleTrackMenu,
+}
+
+pub struct GrooveApp {
+    state: PlaybackState,
+    active_nav: NavSection,
+    analyzer: SpectrumAnalyzer,
+    spectrum: SpectrumFrame,
+    engine: EngineHandle,
+    artwork: ArtworkCache,
+    scrubbing_position: Option<f32>,
+    search_query: String,
+    search_results: Vec<Track>,
+    show_track_details_banner: bool,
+}
+
+impl GrooveApp {
+    pub fn new() -> (Self, Task<Message>) {
+        let (analyzer, sample_producer) = SpectrumAnalyzer::new();
+        let engine = spawn_engine(sample_producer);
+        let mut state = PlaybackState::mockup_default();
+
+        // Discover real CoreAudio output devices immediately on startup
+        let discovered = groove_audio::enumerate_output_devices();
+        if !discovered.is_empty() {
+            state.devices = discovered;
+        }
+
+        let search_results = state.queue.clone();
+
+        (
+            Self {
+                state,
+                active_nav: NavSection::NowPlaying,
+                analyzer,
+                spectrum: SpectrumFrame::calm_preview(0.0),
+                engine,
+                artwork: ArtworkCache::new(),
+                scrubbing_position: None,
+                search_query: String::new(),
+                search_results,
+                show_track_details_banner: false,
+            },
+            Task::none(),
+        )
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        // 60 FPS frame ticker driving both the RealFFT ribbon visualizer and non-blocking EngineEvent drain
+        iced::time::every(Duration::from_millis(16)).map(|_| Message::AnimationTick)
+    }
+
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::AnimationTick => {
+                // Drain any pending events from the async Spotify + Audio engine
+                while let Ok(event) = self.engine.event_rx.try_recv() {
+                    self.apply_engine_event(event);
+                }
+
+                // Update 60 FPS spectrum frame from live lock-free audio ringbuffer (or harmonic fallback)
+                self.spectrum = self.analyzer.next_frame(self.state.is_playing, 0.016);
+            }
+            Message::SelectNav(nav) => {
+                self.active_nav = nav;
+            }
+            Message::TogglePlayPause => {
+                self.state.is_playing = !self.state.is_playing;
+                let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
+            }
+            Message::NextTrack => {
+                let _ = self.engine.command_tx.send(PlayerCommand::NextTrack);
+            }
+            Message::PreviousTrack => {
+                let _ = self.engine.command_tx.send(PlayerCommand::PreviousTrack);
+            }
+            Message::SeekChanged(val) => {
+                self.scrubbing_position = Some(val);
+                self.state.position_secs = val;
+            }
+            Message::SeekReleased => {
+                if let Some(pos) = self.scrubbing_position.take() {
+                    let _ = self.engine.command_tx.send(PlayerCommand::SeekSeconds(pos));
+                }
+            }
+            Message::VolumeChanged(vol) => {
+                self.state.volume = vol.clamp(0.0, 1.0);
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::SetVolume(self.state.volume));
+            }
+            Message::ToggleShuffle => {
+                self.state.shuffle = !self.state.shuffle;
+                let _ = self.engine.command_tx.send(PlayerCommand::ToggleShuffle);
+            }
+            Message::CycleRepeat => {
+                self.state.repeat = self.state.repeat.next();
+                let _ = self.engine.command_tx.send(PlayerCommand::CycleRepeat);
+            }
+            Message::ToggleLike => {
+                self.state.current_track.liked = !self.state.current_track.liked;
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::ToggleLikeCurrent);
+            }
+            Message::SelectQueueTrack(track_id) => {
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::SelectQueueTrack(track_id));
+                self.active_nav = NavSection::NowPlaying;
+            }
+            Message::SelectPlaylist(playlist_id) => {
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::SelectPlaylist(playlist_id));
+                self.active_nav = NavSection::NowPlaying;
+            }
+            Message::CreateNewPlaylist => {
+                let next_idx = self.state.playlists.len() + 1;
+                let new_id = format!("custom-playlist-{next_idx}");
+                self.state.playlists.push(groove_core::Playlist {
+                    id: new_id,
+                    spotify_uri: format!("spotify:playlist:custom{next_idx}"),
+                    name: format!("Late Night #{next_idx}"),
+                    subtitle: "Custom Groove mixtape".into(),
+                    track_count: 12,
+                    is_playing_context: false,
+                    artwork_theme: groove_core::ArtworkTheme::AlpineMist,
+                });
+            }
+            Message::SelectOutputDevice(device) => {
+                self.state.selected_device = device.clone();
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::SelectOutputDevice(device));
+            }
+            Message::ConnectSpotifyClicked => {
+                let client_id = std::env::var("SPOTIFY_CLIENT_ID").ok();
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::AuthenticateSpotify { client_id });
+            }
+            Message::SearchQueryChanged(query) => {
+                self.search_query = query.clone();
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::SearchCatalog(query));
+            }
+            Message::ToggleTrackMenu => {
+                self.show_track_details_banner = !self.show_track_details_banner;
+            }
+        }
+        Task::none()
+    }
+
+    fn apply_engine_event(&mut self, event: EngineEvent) {
+        match event {
+            EngineEvent::StateSynced(new_state) => {
+                let scrubbing = self.scrubbing_position;
+                self.state = *new_state;
+                if let Some(pos) = scrubbing {
+                    self.state.position_secs = pos;
+                }
+            }
+            EngineEvent::PositionTick(pos) => {
+                if self.scrubbing_position.is_none() {
+                    self.state.position_secs = pos;
+                }
+            }
+            EngineEvent::PlayStateChanged(playing) => {
+                self.state.is_playing = playing;
+            }
+            EngineEvent::TrackChanged(track) => {
+                self.state.current_track = track;
+            }
+            EngineEvent::QueueUpdated(queue) => {
+                self.state.queue = queue;
+            }
+            EngineEvent::PlaylistsLoaded(playlists) => {
+                self.state.playlists = playlists;
+            }
+            EngineEvent::DevicesUpdated(devices) => {
+                self.state.devices = devices;
+            }
+            EngineEvent::ConnectionUpdated(conn) => {
+                self.state.connection = conn;
+            }
+            EngineEvent::SearchResults { tracks, .. } => {
+                self.search_results = tracks;
+            }
+        }
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let sidebar = self.view_sidebar();
+        let center_stage = match self.active_nav {
+            NavSection::NowPlaying => self.view_now_playing_stage(),
+            NavSection::Search => self.view_search_stage(),
+            NavSection::Home | NavSection::YourLibrary => self.view_library_stage(),
+        };
+        let queue_pane = self.view_queue_pane();
+
+        row![sidebar, center_stage, queue_pane]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// Column 1: Frosted warm-stone left sidebar matching the Groove mockup.
+    fn view_sidebar(&self) -> Element<'_, Message> {
+        let brand_header = row![
+            svg(icons::groove_logo())
+                .width(Length::Fixed(30.0))
+                .height(Length::Fixed(30.0)),
+            column![
+                text("Groove")
+                    .font(SERIF_FONT)
+                    .size(28)
+                    .color(palette::INK_PRIMARY),
+                text("A natural home\nfor your music")
+                    .size(12)
+                    .line_height(1.25)
+                    .color(palette::INK_SECONDARY),
+            ]
+            .spacing(2)
+        ]
+        .spacing(12)
+        .align_y(Alignment::Start)
+        .padding(Padding {
+            top: 4.0,
+            right: 8.0,
+            bottom: 10.0,
+            left: 8.0,
+        });
+
+        let nav_items = column![
+            self.view_nav_item(NavSection::Home, icons::nav_home()),
+            self.view_nav_item(NavSection::Search, icons::nav_search()),
+            self.view_nav_item(NavSection::NowPlaying, icons::nav_now_playing()),
+            self.view_nav_item(NavSection::YourLibrary, icons::nav_library()),
+        ]
+        .spacing(4);
+
+        let playlists_header = row![
+            text("Playlists").size(12.5).color(palette::INK_SECONDARY),
+            horizontal_space(),
+            button(
+                svg(icons::plus_icon())
+                    .width(Length::Fixed(14.0))
+                    .height(Length::Fixed(14.0))
+            )
+            .on_press(Message::CreateNewPlaylist)
+            .padding(4)
+            .style(theme::icon_ghost_button)
+        ]
+        .align_y(Alignment::Center)
+        .padding(Padding {
+            top: 6.0,
+            right: 6.0,
+            bottom: 4.0,
+            left: 8.0,
+        });
+
+        let mut playlist_col = column![].spacing(4);
+        for playlist in &self.state.playlists {
+            let thumb = image(self.artwork.thumb_handle(playlist.artwork_theme))
+                .width(Length::Fixed(32.0))
+                .height(Length::Fixed(32.0));
+
+            let active_dot: Element<'_, Message> = if playlist.is_playing_context {
+                container(text(""))
+                    .width(Length::Fixed(7.0))
+                    .height(Length::Fixed(7.0))
+                    .style(|_| container::Style {
+                        background: Some(iced::Background::Color(palette::EMERALD)),
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .into()
+            } else {
+                horizontal_space().width(Length::Fixed(7.0)).into()
+            };
+
+            let item_row = row![
+                thumb,
+                text(&playlist.name)
+                    .size(13.5)
+                    .color(palette::INK_PRIMARY)
+                    .width(Length::Fill),
+                active_dot
+            ]
+            .spacing(11)
+            .align_y(Alignment::Center);
+
+            playlist_col = playlist_col.push(
+                button(item_row)
+                    .on_press(Message::SelectPlaylist(playlist.id.clone()))
+                    .width(Length::Fill)
+                    .padding(Padding::from([5, 8]))
+                    .style(theme::subtle_row_button(playlist.is_playing_context)),
+            );
+        }
+
+        let playlists_scroll = scrollable(playlist_col).height(Length::Fill);
+
+        let conn_label = self.state.connection.display_label();
+        let status_dot = container(text(""))
+            .width(Length::Fixed(6.5))
+            .height(Length::Fixed(6.5))
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(palette::EMERALD)),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        let footer_card = button(
+            row![
+                svg(icons::spotify_badge())
+                    .width(Length::Fixed(24.0))
+                    .height(Length::Fixed(24.0)),
+                column![
+                    text("Spotify streaming")
+                        .size(12.5)
+                        .color(palette::INK_PRIMARY),
+                    row![
+                        status_dot,
+                        text(conn_label).size(11.5).color(palette::INK_SECONDARY)
+                    ]
+                    .spacing(5)
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                text("›").size(18).color(palette::INK_SECONDARY),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .on_press(Message::ConnectSpotifyClicked)
+        .width(Length::Fill)
+        .padding(Padding::from([8, 8]))
+        .style(theme::subtle_row_button(false));
+
+        let content = column![
+            vertical_space().height(Length::Fixed(34.0)),
+            brand_header,
+            vertical_space().height(Length::Fixed(6.0)),
+            nav_items,
+            vertical_space().height(Length::Fixed(10.0)),
+            horizontal_rule(1),
+            playlists_header,
+            playlists_scroll,
+            horizontal_rule(1),
+            footer_card,
+        ]
+        .spacing(6)
+        .padding(Padding {
+            top: 10.0,
+            right: 16.0,
+            bottom: 14.0,
+            left: 16.0,
+        });
+
+        container(content)
+            .width(Length::Fixed(246.0))
+            .height(Length::Fill)
+            .style(theme::sidebar_container)
+            .into()
+    }
+
+    fn view_nav_item<'a>(
+        &self,
+        section: NavSection,
+        icon_handle: svg::Handle,
+    ) -> Element<'a, Message> {
+        let is_active = self.active_nav == section;
+        let label_text = text(section.label())
+            .size(14)
+            .color(palette::INK_PRIMARY);
+
+        let content = row![
+            svg(icon_handle)
+                .width(Length::Fixed(18.0))
+                .height(Length::Fixed(18.0)),
+            label_text,
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+
+        button(content)
+            .on_press(Message::SelectNav(section))
+            .width(Length::Fill)
+            .padding(Padding::from([9, 12]))
+            .style(theme::nav_pill_button(is_active))
+            .into()
+    }
+
+    /// Column 2: Main "Now Playing" center stage matching the Groove mockup.
+    fn view_now_playing_stage(&self) -> Element<'_, Message> {
+        let track = &self.state.current_track;
+
+        let hero_art = container(
+            image(self.artwork.hero_handle(track.artwork_theme))
+                .width(Length::Fixed(352.0))
+                .height(Length::Fixed(352.0)),
+        )
+        .style(theme::album_art_shadow_card);
+
+        let title_and_actions = row![
+            column![
+                text(&track.title)
+                    .font(SERIF_FONT)
+                    .size(31)
+                    .color(palette::INK_PRIMARY),
+                text(&track.artist)
+                    .font(SERIF_FONT)
+                    .size(18)
+                    .color(palette::INK_SECONDARY),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            row![
+                button(
+                    svg(icons::heart_icon(track.liked))
+                        .width(Length::Fixed(20.0))
+                        .height(Length::Fixed(20.0))
+                )
+                .on_press(Message::ToggleLike)
+                .padding(8)
+                .style(theme::icon_ghost_button),
+                button(
+                    svg(icons::dots_horizontal())
+                        .width(Length::Fixed(20.0))
+                        .height(Length::Fixed(20.0))
+                )
+                .on_press(Message::ToggleTrackMenu)
+                .padding(8)
+                .style(theme::icon_ghost_button),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fixed(430.0));
+
+        let telemetry_badge: Element<'_, Message> = if self.show_track_details_banner {
+            container(
+                text(format!(
+                    "320 kbps Ogg Vorbis • 32-bit F32 DSP • Album: {} • URI: {}",
+                    track.album, track.spotify_uri
+                ))
+                .size(11.5)
+                .color(palette::INK_SECONDARY),
+            )
+            .padding(Padding::from([4, 10]))
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(palette::DEVICE_PILL_BG)),
+                border: iced::Border {
+                    radius: 8.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into()
+        } else {
+            vertical_space().height(Length::Fixed(0.0)).into()
+        };
+
+        let visualizer_row = container(RibbonVisualizer::view(self.spectrum))
+            .width(Length::Fixed(430.0))
+            .height(Length::Fixed(78.0));
+
+        let duration_f = (track.duration_secs.max(1)) as f32;
+        let current_pos = self.state.position_secs.clamp(0.0, duration_f);
+
+        let seek_slider = slider(0.0..=duration_f, current_pos, Message::SeekChanged)
+            .on_release(Message::SeekReleased)
+            .step(0.25_f32)
+            .width(Length::Fixed(430.0))
+            .style(theme::seek_slider_style);
+
+        let timestamps_row = row![
+            text(format_seconds(current_pos as u32))
+                .size(11.5)
+                .color(palette::INK_MUTED),
+            horizontal_space(),
+            text(format_seconds(track.duration_secs))
+                .size(11.5)
+                .color(palette::INK_MUTED),
+        ]
+        .width(Length::Fixed(430.0));
+
+        let scrubber_block = column![seek_slider, timestamps_row].spacing(4);
+
+        let play_pause_icon = if self.state.is_playing {
+            icons::pause_icon()
+        } else {
+            icons::play_icon()
+        };
+
+        let transport_row = row![
+            button(
+                svg(icons::shuffle_icon(self.state.shuffle))
+                    .width(Length::Fixed(18.0))
+                    .height(Length::Fixed(18.0))
+            )
+            .on_press(Message::ToggleShuffle)
+            .padding(10)
+            .style(theme::icon_ghost_button),
+            button(
+                svg(icons::prev_icon())
+                    .width(Length::Fixed(20.0))
+                    .height(Length::Fixed(20.0))
+            )
+            .on_press(Message::PreviousTrack)
+            .padding(10)
+            .style(theme::icon_ghost_button),
+            button(
+                container(
+                    svg(play_pause_icon)
+                        .width(Length::Fixed(22.0))
+                        .height(Length::Fixed(22.0))
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Horizontal::Center)
+                .align_y(Vertical::Center)
+            )
+            .on_press(Message::TogglePlayPause)
+            .width(Length::Fixed(56.0))
+            .height(Length::Fixed(56.0))
+            .style(theme::play_circle_button),
+            button(
+                svg(icons::next_icon())
+                    .width(Length::Fixed(20.0))
+                    .height(Length::Fixed(20.0))
+            )
+            .on_press(Message::NextTrack)
+            .padding(10)
+            .style(theme::icon_ghost_button),
+            button(
+                svg(icons::repeat_icon(self.state.repeat != RepeatMode::Off))
+                    .width(Length::Fixed(18.0))
+                    .height(Length::Fixed(18.0))
+            )
+            .on_press(Message::CycleRepeat)
+            .padding(10)
+            .style(theme::icon_ghost_button),
+        ]
+        .spacing(24)
+        .align_y(Alignment::Center);
+
+        let volume_control = row![
+            svg(icons::volume_icon())
+                .width(Length::Fixed(16.0))
+                .height(Length::Fixed(16.0)),
+            slider(0.0..=1.0, self.state.volume, Message::VolumeChanged)
+                .step(0.01_f32)
+                .width(Length::Fixed(165.0))
+                .style(theme::volume_slider_style),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        let device_picker = container(
+            row![
+                svg(icons::airplay_speaker_icon())
+                    .width(Length::Fixed(15.0))
+                    .height(Length::Fixed(15.0)),
+                pick_list(
+                    self.state.devices.as_slice(),
+                    Some(self.state.selected_device.clone()),
+                    Message::SelectOutputDevice,
+                )
+                .text_size(12.0)
+                .padding(Padding::from([4, 8]))
+                .style(theme::device_pick_list_style),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .padding(Padding {
+                top: 2.0,
+                right: 4.0,
+                bottom: 2.0,
+                left: 10.0,
+            }),
+        )
+        .style(|_| container::Style {
+            background: Some(iced::Background::Color(palette::DEVICE_PILL_BG)),
+            border: iced::Border {
+                radius: 16.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let utility_row = row![volume_control, horizontal_space(), device_picker]
+            .align_y(Alignment::Center)
+            .width(Length::Fixed(450.0));
+
+        let stage_column = column![
+            vertical_space(),
+            hero_art,
+            vertical_space().height(Length::Fixed(18.0)),
+            title_and_actions,
+            telemetry_badge,
+            vertical_space().height(Length::Fixed(4.0)),
+            visualizer_row,
+            scrubber_block,
+            vertical_space().height(Length::Fixed(10.0)),
+            transport_row,
+            vertical_space().height(Length::Fixed(18.0)),
+            utility_row,
+            vertical_space(),
+        ]
+        .align_x(Alignment::Center)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(Padding::from([24, 32]));
+
+        container(stage_column)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Horizontal::Center)
+            .align_y(Vertical::Center)
+            .style(theme::center_stage_container)
+            .into()
+    }
+
+    fn view_search_stage(&self) -> Element<'_, Message> {
+        let header = row![
+            text("Search Catalog")
+                .font(SERIF_FONT)
+                .size(32)
+                .color(palette::INK_PRIMARY),
+            horizontal_space(),
+            button(text("Back to Now Playing").size(12.5))
+                .on_press(Message::SelectNav(NavSection::NowPlaying))
+                .padding(Padding::from([6, 12]))
+                .style(theme::nav_pill_button(true)),
+        ]
+        .align_y(Alignment::Center);
+
+        let input = text_input("Search tracks, artists, or albums...", &self.search_query)
+            .on_input(Message::SearchQueryChanged)
+            .padding(12)
+            .size(14);
+
+        let mut results_col = column![].spacing(8);
+        let list = if self.search_query.trim().is_empty() {
+            &self.state.queue
+        } else {
+            &self.search_results
+        };
+
+        for track in list {
+            let is_current = track.id == self.state.current_track.id;
+            let row_item = button(
+                row![
+                    image(self.artwork.thumb_handle(track.artwork_theme))
+                        .width(Length::Fixed(44.0))
+                        .height(Length::Fixed(44.0)),
+                    column![
+                        text(&track.title).size(14.5).color(palette::INK_PRIMARY),
+                        text(format!("{} • {}", track.artist, track.album))
+                            .size(12.5)
+                            .color(palette::INK_SECONDARY),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    text(track.formatted_duration())
+                        .size(12.5)
+                        .color(palette::INK_MUTED),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::SelectQueueTrack(track.id.clone()))
+            .width(Length::Fill)
+            .padding(Padding::from([8, 10]))
+            .style(theme::subtle_row_button(is_current));
+
+            results_col = results_col.push(row_item);
+        }
+
+        container(
+            column![
+                vertical_space().height(Length::Fixed(20.0)),
+                header,
+                input,
+                scrollable(results_col).height(Length::Fill),
+            ]
+            .spacing(18)
+            .padding(Padding::from([28, 36])),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::center_stage_container)
+        .into()
+    }
+
+    fn view_library_stage(&self) -> Element<'_, Message> {
+        let heading = if self.active_nav == NavSection::Home {
+            "Home"
+        } else {
+            "Your Library"
+        };
+
+        let header = row![
+            text(heading)
+                .font(SERIF_FONT)
+                .size(32)
+                .color(palette::INK_PRIMARY),
+            horizontal_space(),
+            button(text("Open Now Playing").size(12.5))
+                .on_press(Message::SelectNav(NavSection::NowPlaying))
+                .padding(Padding::from([6, 12]))
+                .style(theme::nav_pill_button(true)),
+        ]
+        .align_y(Alignment::Center);
+
+        let mut playlist_cards = column![].spacing(10);
+        for playlist in &self.state.playlists {
+            let card = button(
+                row![
+                    image(self.artwork.thumb_handle(playlist.artwork_theme))
+                        .width(Length::Fixed(52.0))
+                        .height(Length::Fixed(52.0)),
+                    column![
+                        text(&playlist.name).size(15).color(palette::INK_PRIMARY),
+                        text(&playlist.subtitle)
+                            .size(12.5)
+                            .color(palette::INK_SECONDARY),
+                    ]
+                    .spacing(3)
+                    .width(Length::Fill),
+                    text(format!("{} tracks", playlist.track_count))
+                        .size(12)
+                        .color(palette::INK_MUTED),
+                ]
+                .spacing(14)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::SelectPlaylist(playlist.id.clone()))
+            .width(Length::Fill)
+            .padding(Padding::from([10, 12]))
+            .style(theme::subtle_row_button(playlist.is_playing_context));
+
+            playlist_cards = playlist_cards.push(card);
+        }
+
+        container(
+            column![
+                vertical_space().height(Length::Fixed(20.0)),
+                header,
+                scrollable(playlist_cards).height(Length::Fill),
+            ]
+            .spacing(18)
+            .padding(Padding::from([28, 36])),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::center_stage_container)
+        .into()
+    }
+
+    /// Column 3: Right "Up Next" queue pane matching the Groove mockup.
+    fn view_queue_pane(&self) -> Element<'_, Message> {
+        let header = text("Up Next")
+            .font(SERIF_FONT)
+            .size(25)
+            .color(palette::INK_PRIMARY);
+
+        let mut list = column![].spacing(10);
+        for track in &self.state.queue {
+            let is_current = track.id == self.state.current_track.id;
+
+            let leading_indicator: Element<'_, Message> = if is_current {
+                svg(icons::active_bars())
+                    .width(Length::Fixed(14.0))
+                    .height(Length::Fixed(14.0))
+                    .into()
+            } else {
+                horizontal_space().width(Length::Fixed(14.0)).into()
+            };
+
+            let cover = image(self.artwork.thumb_handle(track.artwork_theme))
+                .width(Length::Fixed(46.0))
+                .height(Length::Fixed(46.0));
+
+            let meta = column![
+                text(&track.title).size(14).color(palette::INK_PRIMARY),
+                text(&track.artist).size(12.5).color(palette::INK_SECONDARY),
+            ]
+            .spacing(2)
+            .width(Length::Fill);
+
+            let duration = text(track.formatted_duration())
+                .size(12.5)
+                .color(palette::INK_MUTED);
+
+            let row_btn = button(
+                row![leading_indicator, cover, meta, duration]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+            )
+            .on_press(Message::SelectQueueTrack(track.id.clone()))
+            .width(Length::Fill)
+            .padding(Padding::from([6, 8]))
+            .style(theme::subtle_row_button(false));
+
+            list = list.push(row_btn);
+        }
+
+        let content = column![
+            vertical_space().height(Length::Fixed(34.0)),
+            container(header).padding(Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 8.0,
+                left: 22.0,
+            }),
+            scrollable(list).height(Length::Fill),
+        ]
+        .spacing(10)
+        .padding(Padding {
+            top: 14.0,
+            right: 20.0,
+            bottom: 20.0,
+            left: 14.0,
+        });
+
+        container(content)
+            .width(Length::Fixed(295.0))
+            .height(Length::Fill)
+            .style(theme::queue_pane_container)
+            .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artwork_cache_generates_all_themes() {
+        let cache = ArtworkCache::new();
+        let _hero = cache.hero_handle(groove_core::ArtworkTheme::SunriseMountainLake);
+        let _thumb = cache.thumb_handle(groove_core::ArtworkTheme::GoldenCanyon);
+    }
+
+    #[test]
+    fn app_initializes_and_handles_navigation_and_playback_messages() {
+        let (mut app, _) = GrooveApp::new();
+        assert_eq!(app.state.current_track.title, "Higher Ground");
+        assert_eq!(app.active_nav, NavSection::NowPlaying);
+
+        let _ = app.update(Message::SelectNav(NavSection::Search));
+        assert_eq!(app.active_nav, NavSection::Search);
+
+        let _ = app.update(Message::ToggleLike);
+        assert!(app.state.current_track.liked);
+
+        let _ = app.update(Message::AnimationTick);
+        for &band in &app.spectrum.bands {
+            assert!(band.is_finite() && (0.0..=1.0).contains(&band));
+        }
+    }
+}

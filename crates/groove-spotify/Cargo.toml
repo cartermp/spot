@@ -1,0 +1,22 @@
+[package]
+name = "groove-spotify"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+groove-core.workspace = true
+groove-audio.workspace = true
+tokio.workspace = true
+flume.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+librespot-core.workspace = true
+librespot-playback.workspace = true
+librespot-oauth.workspace = true
+librespot-metadata.workspace = true
+librespot-protocol.workspace = true
+reqwest.workspace = true

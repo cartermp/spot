@@ -1,0 +1,20 @@
+[package]
+name = "groove-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "groove"
+path = "src/main.rs"
+
+[dependencies]
+groove-core.workspace = true
+groove-audio.workspace = true
+groove-spotify.workspace = true
+iced.workspace = true
+image.workspace = true
+flume.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
