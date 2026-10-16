@@ -46,6 +46,17 @@ pub fn nav_search() -> svg::Handle {
     )
 }
 
+pub fn nav_podcasts() -> svg::Handle {
+    handle(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#2C3036" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="3" width="6" height="10" rx="3"/>
+            <path d="M5.5 10.5a6.5 6.5 0 0 0 13 0"/>
+            <line x1="12" y1="17" x2="12" y2="21"/>
+            <line x1="8.5" y1="21" x2="15.5" y2="21"/>
+        </svg>"##,
+    )
+}
+
 pub fn nav_now_playing() -> svg::Handle {
     handle(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#17191C" stroke-width="2.1" stroke-linecap="round">

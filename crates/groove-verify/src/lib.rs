@@ -17,12 +17,14 @@ use std::time::Instant;
 use groove_audio::{verify_log_bin_edges_partition, SpectrumAnalyzer};
 use groove_core::{
     advance_queue_verified, coprime_shuffle_step, delete_last_word_verified,
-    format_connected_account_label, gcd_usize, is_opaque_spotify_user_id, merge_devices_verified,
-    resolve_playable_track_candidate, sanitize_pcm_sample, sanitize_position_secs,
-    sanitize_spotify_biography, sanitize_unit_float, summarize_artist_bio, ArtworkTheme,
-    AudioDevice, FormalInvariant, NavHistoryMachine, NavRouteTarget, PlaybackState, Playlist,
-    RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode, SpectrumFrame, Track,
-    TrayMenuSnapshot, VerifiedTransportAction, SPECTRUM_BANDS,
+    episode_to_playable_track_verified, format_connected_account_label, gcd_usize,
+    is_opaque_spotify_user_id, merge_devices_verified, normalize_spotify_episode_uri,
+    normalize_spotify_show_uri, resolve_playable_track_candidate, sanitize_pcm_sample,
+    sanitize_position_secs, sanitize_spotify_biography, sanitize_unit_float, summarize_artist_bio,
+    ArtworkTheme, AudioDevice, FormalInvariant, NavHistoryMachine, NavRouteTarget, PlaybackState,
+    Playlist, PodcastEpisode, PodcastShowDetail, PodcastShowSummary, RecentSearchEntry,
+    RecentSearchKind, RecentSearchStore, RepeatMode, SpectrumFrame, Track, TrayMenuSnapshot,
+    VerifiedTransportAction, SPECTRUM_BANDS,
 };
 use groove_spotify::sink::AtomicVolumeScaler;
 use stateright::{Checker, Model, Property};
@@ -1609,6 +1611,143 @@ pub fn prove_word_deletion_account_and_tray_snapshot_proptest() -> ProofCertific
     }
 }
 
+/// Proof 14 (`PROP-PODCAST-14`): Formally verifies:
+/// 1. `normalize_spotify_show_uri` & `normalize_spotify_episode_uri` (`INV-E1`): canonical 22-char
+///    base62 normalization from `spotify:show:<id>`, `spotify:episode:<id>`, and `https://open.spotify.com/...`
+///    URLs, idempotence, and strict disjointness between show and episode URIs.
+/// 2. `episode_to_playable_track_verified` (`INV-E2..E4`): total conversion of arbitrary podcast episode
+///    metadata into a playable `Track` (`spotify:episode:<id>`, duration in `1..=86_400`, non-empty single-line
+///    title/show), and preservation of `PlaybackState` + `TrayMenuSnapshot` invariants (`Podcast: <Show>`).
+pub fn prove_podcast_uri_and_episode_track_invariants_proptest() -> ProofCertificate {
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
+
+    let t0 = Instant::now();
+
+    // 1. Deterministic checks on canonical Spotify show & episode URIs and URLs
+    let sample_id = "2MAi0BvDc6GTFvKFPXnkCL";
+    let show_uri = format!("spotify:show:{sample_id}");
+    let show_url = format!("https://open.spotify.com/show/{sample_id}?si=12345");
+    assert_eq!(normalize_spotify_show_uri(&show_uri), Some(show_uri.clone()));
+    assert_eq!(normalize_spotify_show_uri(&show_url), Some(show_uri.clone()));
+    assert_eq!(normalize_spotify_episode_uri(&show_uri), None);
+
+    let ep_uri = format!("spotify:episode:{sample_id}");
+    let ep_url = format!("https://open.spotify.com/episode/{sample_id}?si=abc");
+    assert_eq!(normalize_spotify_episode_uri(&ep_uri), Some(ep_uri.clone()));
+    assert_eq!(normalize_spotify_episode_uri(&ep_url), Some(ep_uri.clone()));
+    assert_eq!(normalize_spotify_show_uri(&ep_uri), None);
+
+    let mut runner = TestRunner::new(Config {
+        cases: 300,
+        failure_persistence: None,
+        ..Config::default()
+    });
+
+    let strategy = (
+        "[0-9A-Za-z]{22}",
+        "\\PC{0,90}",
+        "\\PC{0,70}",
+        any::<u32>(),
+        any::<bool>(),
+    );
+
+    let total_cases = AtomicUsize::new(8);
+    runner
+        .run(
+            &strategy,
+            |(base62_id, raw_ep_title, raw_show_title, raw_duration, is_playing)| {
+                // Verify INV-E1 idempotence & URL/URI equivalence
+                let s_uri = format!("spotify:show:{base62_id}");
+                let s_url = format!("https://open.spotify.com/show/{base62_id}?si=xyz");
+                let norm_s1 = normalize_spotify_show_uri(&s_uri).unwrap();
+                let norm_s2 = normalize_spotify_show_uri(&s_url).unwrap();
+                prop_assert_eq!(&norm_s1, &norm_s2);
+                prop_assert_eq!(normalize_spotify_show_uri(&norm_s1).unwrap(), norm_s1);
+                prop_assert!(normalize_spotify_episode_uri(&s_uri).is_none());
+
+                let e_uri = format!("spotify:episode:{base62_id}");
+                let e_url = format!("https://open.spotify.com/episode/{base62_id}?context=show");
+                let norm_e1 = normalize_spotify_episode_uri(&e_uri).unwrap();
+                let norm_e2 = normalize_spotify_episode_uri(&e_url).unwrap();
+                prop_assert_eq!(&norm_e1, &norm_e2);
+
+                // Verify INV-E2..E4: episode_to_playable_track_verified
+                let raw_episode = PodcastEpisode {
+                    id: base62_id.clone(),
+                    spotify_uri: e_uri.clone(),
+                    title: raw_ep_title,
+                    show_title: raw_show_title,
+                    show_uri: s_uri.clone(),
+                    description: "Episode notes".into(),
+                    release_date: "2025-10-14".into(),
+                    duration_secs: raw_duration,
+                    cover_art_url: None,
+                    artwork_theme: ArtworkTheme::SunriseMountainLake,
+                };
+                let track = episode_to_playable_track_verified(&raw_episode);
+                prop_assert!(track.spotify_uri.starts_with("spotify:episode:"));
+                prop_assert!((1..=86_400).contains(&track.duration_secs));
+                prop_assert!(!track.title.trim().is_empty());
+                prop_assert!(!track.artist.trim().is_empty());
+                prop_assert!(!track.title.contains('\n') && !track.title.contains('\r'));
+                prop_assert!(!track.artist.contains('\n') && !track.artist.contains('\r'));
+
+                // Verify PlaybackState + TrayMenuSnapshot invariants when playing a podcast episode
+                let mut state = PlaybackState::mockup_default();
+                state.apply_verified_action(VerifiedTransportAction::PlayTrack(track.clone()));
+                state.is_playing = is_playing;
+                prop_assert!(state.check_invariants().is_ok());
+
+                let tray_snap = TrayMenuSnapshot::from_playback_state(&state);
+                prop_assert!(tray_snap.check_invariants().is_ok());
+                prop_assert!(tray_snap.album_subtitle.starts_with("Podcast: "));
+
+                // Verify PodcastShowDetail invariants (INV-S1..S3)
+                let detail = PodcastShowDetail {
+                    show: PodcastShowSummary {
+                        id: base62_id.clone(),
+                        spotify_uri: s_uri.clone(),
+                        title: track.artist.clone(),
+                        publisher: track.artist.clone(),
+                        description: "Podcast description".into(),
+                        category: "Technology".into(),
+                        episode_count: 1,
+                        cover_art_url: None,
+                        artwork_theme: ArtworkTheme::SunriseMountainLake,
+                    },
+                    episodes: vec![PodcastEpisode {
+                        id: base62_id,
+                        spotify_uri: track.spotify_uri,
+                        title: track.title,
+                        show_title: track.artist,
+                        show_uri: s_uri,
+                        description: "Episode notes".into(),
+                        release_date: "2025-10-14".into(),
+                        duration_secs: track.duration_secs,
+                        cover_art_url: None,
+                        artwork_theme: ArtworkTheme::SunriseMountainLake,
+                    }],
+                };
+                prop_assert!(detail.check_invariants().is_ok());
+
+                total_cases.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .expect("Podcast URI and episode-to-track proof must succeed");
+
+    ProofCertificate {
+        id: "PROP-PODCAST-14",
+        subsystem: "groove-core / groove-spotify (Podcasts & Episodes)",
+        method: "Proptest URI Normalization & Episode-to-Track Totality Proof",
+        theorem: "INV-E1..E4 (Show/Episode URI Bijection & Bounded Duration) & INV-S1..S3 (ShowDetail)",
+        states_or_cases_explored: total_cases.load(Ordering::Relaxed),
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        verified: true,
+    }
+}
+
 /// Runs the complete Groove formal verification suite and returns a structured [`VerificationSuiteReport`].
 pub fn run_all_formal_proofs() -> VerificationSuiteReport {
     let suite_start = Instant::now();
@@ -1626,6 +1765,7 @@ pub fn run_all_formal_proofs() -> VerificationSuiteReport {
         prove_biography_sanitizer_proptest(),
         prove_stateful_command_sequences_proptest(),
         prove_word_deletion_account_and_tray_snapshot_proptest(),
+        prove_podcast_uri_and_episode_track_invariants_proptest(),
     ];
 
     let total_states_or_cases = certificates
@@ -1649,6 +1789,6 @@ mod tests {
     fn formal_verification_suite_proves_all_theorems() {
         let report = run_all_formal_proofs();
         assert!(report.all_verified());
-        assert_eq!(report.certificates.len(), 13);
+        assert_eq!(report.certificates.len(), 14);
     }
 }

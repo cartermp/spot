@@ -11,8 +11,9 @@ use groove_core::{
     sanitize_position_secs, sanitize_unit_float, select_device_verified, summarize_artist_bio,
     AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, AudioDevice, ConnectionStatus,
     EngineEvent, FormalInvariant, InvariantViolation, NavHistoryMachine, NavRouteTarget,
-    NavSection, PlaybackState, PlayerCommand, RecentSearchEntry, RecentSearchKind,
-    RecentSearchStore, RepeatMode, SpectrumFrame, Track, VerifiedTransportAction,
+    NavSection, PlaybackState, PlayerCommand, PodcastEpisode, PodcastShowDetail,
+    PodcastShowSummary, RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode,
+    SpectrumFrame, Track, VerifiedTransportAction,
 };
 use groove_spotify::{spawn_engine, EngineHandle};
 use iced::alignment::{Horizontal, Vertical};
@@ -86,6 +87,10 @@ pub enum StageRoute {
         artist_name: Option<String>,
         artist_uri: Option<String>,
     },
+    Show {
+        id_or_uri: String,
+        label: String,
+    },
 }
 
 impl StageRoute {
@@ -94,6 +99,7 @@ impl StageRoute {
             StageRoute::Section(sec) => sec.label(),
             StageRoute::Artist { label, .. } => label,
             StageRoute::Album { label, .. } => label,
+            StageRoute::Show { label, .. } => label,
         }
     }
 
@@ -102,6 +108,7 @@ impl StageRoute {
             StageRoute::Section(_) => None,
             StageRoute::Artist { .. } => Some("Artist"),
             StageRoute::Album { .. } => Some("Album"),
+            StageRoute::Show { .. } => Some("Podcast"),
         }
     }
 
@@ -139,6 +146,19 @@ impl StageRoute {
                     id_or_uri: b,
                     label: lb,
                     ..
+                },
+            ) => {
+                a.eq_ignore_ascii_case(b)
+                    || (!la.is_empty() && !lb.is_empty() && la.eq_ignore_ascii_case(lb))
+            }
+            (
+                StageRoute::Show {
+                    id_or_uri: a,
+                    label: la,
+                },
+                StageRoute::Show {
+                    id_or_uri: b,
+                    label: lb,
                 },
             ) => {
                 a.eq_ignore_ascii_case(b)
@@ -182,6 +202,13 @@ pub enum Message {
     PlayAlbum(String),
     PlayAlbumTrack(usize),
     PlayArtistTopTracks,
+    OpenShow(String),
+    PlayShow(String),
+    PlayShowEpisode(usize),
+    PlaySearchEpisode(PodcastEpisode),
+    ToggleShowBio,
+    PodcastFilterChanged(String),
+    ClearPodcastFilter,
     CreateNewPlaylist,
     SelectOutputDevice(AudioDevice),
     ConnectSpotifyClicked { force_reauth: bool },
@@ -216,11 +243,17 @@ pub struct GrooveApp {
     recent_searches: RecentSearchStore,
     search_artists: Vec<ArtistSummary>,
     search_albums: Vec<AlbumSummary>,
+    search_shows: Vec<PodcastShowSummary>,
+    search_episodes: Vec<PodcastEpisode>,
     search_results: Vec<Track>,
+    podcast_directory: Vec<PodcastShowSummary>,
+    podcast_filter_query: String,
     selected_artist: Option<ArtistDetail>,
     selected_album: Option<AlbumDetail>,
+    selected_show: Option<PodcastShowDetail>,
     artist_bio_expanded: bool,
     artist_top_tracks_expanded: bool,
+    show_bio_expanded: bool,
     show_track_details_banner: bool,
 }
 
@@ -230,12 +263,20 @@ impl FormalInvariant for GrooveApp {
         self.nav_history.check_invariants()?;
         self.recent_searches.check_invariants()?;
         self.spectrum.check_invariants()?;
+        if let Some(show) = &self.selected_show {
+            show.check_invariants()?;
+        }
         Ok(())
     }
 }
 
 impl GrooveApp {
     pub fn new() -> (Self, Task<Message>) {
+        #[cfg(test)]
+        // SAFETY: Test-only isolation so unit tests never touch user credentials or recent searches.
+        unsafe {
+            std::env::set_var("GROOVE_TEST_CACHE_DIR", "1");
+        }
         let (analyzer, sample_producer) = SpectrumAnalyzer::new();
         let engine = spawn_engine(sample_producer);
         let mut state = PlaybackState::mockup_default();
@@ -253,8 +294,9 @@ impl GrooveApp {
         let artwork = ArtworkCache::new();
         let tray = GrooveTray::try_new(&state, &artwork);
         let tray_init_attempted = tray.is_some();
+        let podcast_directory = groove_spotify::web_api::featured_podcast_shows();
 
-        let app = Self {
+        let mut app = Self {
             state,
             active_nav: NavSection::NowPlaying,
             nav_history: NavHistoryMachine::new(StageRoute::Section(NavSection::NowPlaying), 32),
@@ -272,16 +314,23 @@ impl GrooveApp {
             recent_searches,
             search_artists: Vec::new(),
             search_albums: Vec::new(),
+            search_shows: Vec::new(),
+            search_episodes: Vec::new(),
             search_results: Vec::new(),
+            podcast_directory,
+            podcast_filter_query: String::new(),
             selected_artist: None,
             selected_album: None,
+            selected_show: None,
             artist_bio_expanded: false,
             artist_top_tracks_expanded: false,
+            show_bio_expanded: false,
             show_track_details_banner: false,
         };
         debug_assert!(app.check_invariants().is_ok());
 
-        (app, Task::none())
+        let initial_artwork_tasks = app.spawn_missing_artwork_tasks();
+        (app, initial_artwork_tasks)
     }
 
     fn current_route(&self) -> &StageRoute {
@@ -379,6 +428,54 @@ impl GrooveApp {
                         .send(PlayerCommand::SelectAlbum(id_or_uri));
                 }
             }
+            StageRoute::Show { id_or_uri, label } => {
+                self.show_bio_expanded = false;
+                let already_loaded = self.selected_show.as_ref().is_some_and(|d| {
+                    !d.episodes.is_empty()
+                        && (d.show.spotify_uri.eq_ignore_ascii_case(&id_or_uri)
+                            || d.show.id.eq_ignore_ascii_case(&id_or_uri)
+                            || d.show.title.eq_ignore_ascii_case(&id_or_uri)
+                            || (!label.is_empty() && d.show.title.eq_ignore_ascii_case(&label)))
+                });
+                if !already_loaded {
+                    let _ = self
+                        .engine
+                        .command_tx
+                        .send(PlayerCommand::SelectShow(id_or_uri));
+                }
+            }
+        }
+    }
+
+    fn resolve_show_meta(&self, show_id_or_uri: &str) -> (String, String, Option<PodcastShowSummary>) {
+        for show in self.search_shows.iter().chain(self.podcast_directory.iter()) {
+            if show.spotify_uri.eq_ignore_ascii_case(show_id_or_uri)
+                || show.id.eq_ignore_ascii_case(show_id_or_uri)
+                || show.title.eq_ignore_ascii_case(show_id_or_uri)
+            {
+                return (show.title.clone(), show.publisher.clone(), Some(show.clone()));
+            }
+        }
+        if let Some(detail) = &self.selected_show {
+            if detail.show.spotify_uri.eq_ignore_ascii_case(show_id_or_uri)
+                || detail.show.id.eq_ignore_ascii_case(show_id_or_uri)
+                || detail.show.title.eq_ignore_ascii_case(show_id_or_uri)
+            {
+                return (
+                    detail.show.title.clone(),
+                    detail.show.publisher.clone(),
+                    Some(detail.show.clone()),
+                );
+            }
+        }
+        if show_id_or_uri.starts_with("spotify:show:") {
+            ("Podcast".to_string(), "Spotify Podcasts".to_string(), None)
+        } else {
+            (
+                show_id_or_uri.to_string(),
+                "Spotify Podcasts".to_string(),
+                None,
+            )
         }
     }
 
@@ -875,6 +972,135 @@ impl GrooveApp {
                     }
                 }
             }
+            Message::OpenShow(show_uri) => {
+                let (label, publisher, summary_opt) = self.resolve_show_meta(&show_uri);
+                tracing::info!(
+                    "[UI] OpenShow('{show_uri}') -> label='{label}', publisher='{publisher}'"
+                );
+                if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
+                    && label != "Podcast"
+                {
+                    self.record_recent_search_entry(RecentSearchEntry {
+                        label: label.clone(),
+                        subtitle: format!("Podcast · {publisher}"),
+                        query: label.clone(),
+                        kind: RecentSearchKind::Show {
+                            uri: show_uri.clone(),
+                            publisher: publisher.clone(),
+                        },
+                    });
+                }
+                let already_same = self.selected_show.as_ref().is_some_and(|d| {
+                    !d.episodes.is_empty()
+                        && (d.show.spotify_uri.eq_ignore_ascii_case(&show_uri)
+                            || d.show.id.eq_ignore_ascii_case(&show_uri)
+                            || d.show.title.eq_ignore_ascii_case(&show_uri))
+                });
+                if !already_same {
+                    self.selected_show = summary_opt.map(|show| PodcastShowDetail {
+                        show,
+                        episodes: Vec::new(),
+                    });
+                    if self.selected_show.is_none() {
+                        self.selected_show =
+                            Some(groove_spotify::web_api::fallback_show_detail(&show_uri));
+                    }
+                }
+                self.show_bio_expanded = false;
+                self.push_route(StageRoute::Show {
+                    id_or_uri: show_uri.clone(),
+                    label,
+                });
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::SelectShow(show_uri));
+            }
+            Message::PlayShow(show_uri) => {
+                let (label, publisher, _) = self.resolve_show_meta(&show_uri);
+                tracing::info!("[UI] PlayShow('{show_uri}') -> label='{label}'");
+                if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
+                    && label != "Podcast"
+                {
+                    self.record_recent_search_entry(RecentSearchEntry {
+                        label: label.clone(),
+                        subtitle: format!("Podcast · {publisher}"),
+                        query: label,
+                        kind: RecentSearchKind::Show {
+                            uri: show_uri.clone(),
+                            publisher,
+                        },
+                    });
+                }
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::PlayShow(show_uri));
+                self.push_route(StageRoute::Section(NavSection::NowPlaying));
+            }
+            Message::PlayShowEpisode(ep_idx) => {
+                if let Some(detail) = &self.selected_show {
+                    if let Some(chosen_ep) = detail.episodes.get(ep_idx) {
+                        let chosen_track = chosen_ep.into_playable_track();
+                        tracing::info!(
+                            "[UI] PlayShowEpisode({ep_idx}) -> '{}' from show '{}' ({})",
+                            chosen_track.title,
+                            detail.show.title,
+                            chosen_track.spotify_uri
+                        );
+                        self.state.queue = detail
+                            .episodes
+                            .iter()
+                            .map(PodcastEpisode::into_playable_track)
+                            .collect();
+                        self.state
+                            .apply_verified_action(VerifiedTransportAction::PlayTrack(
+                                chosen_track.clone(),
+                            ));
+                        let _ = self
+                            .engine
+                            .command_tx
+                            .send(PlayerCommand::PlayTrack(chosen_track));
+                        self.push_route(StageRoute::Section(NavSection::NowPlaying));
+                    }
+                }
+            }
+            Message::PlaySearchEpisode(episode) => {
+                let track = episode.into_playable_track();
+                tracing::info!(
+                    "[UI] PlaySearchEpisode -> '{}' ({})",
+                    track.title,
+                    track.spotify_uri
+                );
+                if matches!(self.current_route(), StageRoute::Section(NavSection::Search)) {
+                    self.record_recent_search_entry(RecentSearchEntry {
+                        label: episode.show_title.clone(),
+                        subtitle: format!("Podcast · {}", episode.title),
+                        query: episode.show_title.clone(),
+                        kind: RecentSearchKind::Show {
+                            uri: episode.show_uri.clone(),
+                            publisher: episode.show_title.clone(),
+                        },
+                    });
+                }
+                self.state
+                    .apply_verified_action(VerifiedTransportAction::PlayTrack(track.clone()));
+                let _ = self.engine.command_tx.send(PlayerCommand::PlayTrack(track));
+                self.push_route(StageRoute::Section(NavSection::NowPlaying));
+            }
+            Message::ToggleShowBio => {
+                self.show_bio_expanded = !self.show_bio_expanded;
+            }
+            Message::PodcastFilterChanged(query) => {
+                let trimmed = query.trim().to_string();
+                self.podcast_filter_query = query;
+                if groove_core::normalize_spotify_show_uri(&trimmed).is_some() {
+                    return self.update(Message::OpenShow(trimmed));
+                }
+            }
+            Message::ClearPodcastFilter => {
+                self.podcast_filter_query.clear();
+            }
             Message::CreateNewPlaylist => {
                 let next_idx = self.state.playlists.len() + 1;
                 let new_id = format!("custom-playlist-{next_idx}");
@@ -941,6 +1167,8 @@ impl GrooveApp {
                     if shortened.trim().is_empty() {
                         self.search_artists.clear();
                         self.search_albums.clear();
+                        self.search_shows.clear();
+                        self.search_episodes.clear();
                         self.search_results.clear();
                     }
                     let _ = self
@@ -962,6 +1190,8 @@ impl GrooveApp {
                 if query.trim().is_empty() {
                     self.search_artists.clear();
                     self.search_albums.clear();
+                    self.search_shows.clear();
+                    self.search_episodes.clear();
                     self.search_results.clear();
                 }
                 let _ = self
@@ -991,6 +1221,8 @@ impl GrooveApp {
                     if shortened.trim().is_empty() {
                         self.search_artists.clear();
                         self.search_albums.clear();
+                        self.search_shows.clear();
+                        self.search_episodes.clear();
                         self.search_results.clear();
                     }
                     let _ = self
@@ -1021,6 +1253,8 @@ impl GrooveApp {
                 self.search_query.clear();
                 self.search_artists.clear();
                 self.search_albums.clear();
+                self.search_shows.clear();
+                self.search_episodes.clear();
                 self.search_results.clear();
                 let _ = self
                     .engine
@@ -1053,6 +1287,9 @@ impl GrooveApp {
                         }
                         RecentSearchKind::Album { uri, .. } => {
                             return self.update(Message::OpenAlbum(uri));
+                        }
+                        RecentSearchKind::Show { uri, .. } => {
+                            return self.update(Message::OpenShow(uri));
                         }
                     }
                 }
@@ -1103,6 +1340,21 @@ impl GrooveApp {
                 urls.push(u.clone());
             }
         }
+        for show in &self.search_shows {
+            if let Some(u) = &show.cover_art_url {
+                urls.push(u.clone());
+            }
+        }
+        for ep in &self.search_episodes {
+            if let Some(u) = &ep.cover_art_url {
+                urls.push(u.clone());
+            }
+        }
+        for show in &self.podcast_directory {
+            if let Some(u) = &show.cover_art_url {
+                urls.push(u.clone());
+            }
+        }
         for t in &self.search_results {
             if let Some(u) = &t.cover_art_url {
                 urls.push(u.clone());
@@ -1129,6 +1381,16 @@ impl GrooveApp {
             }
             for t in &detail.tracks {
                 if let Some(u) = &t.cover_art_url {
+                    urls.push(u.clone());
+                }
+            }
+        }
+        if let Some(detail) = &self.selected_show {
+            if let Some(u) = &detail.show.cover_art_url {
+                urls.push(u.clone());
+            }
+            for ep in &detail.episodes {
+                if let Some(u) = &ep.cover_art_url {
                     urls.push(u.clone());
                 }
             }
@@ -1212,22 +1474,32 @@ impl GrooveApp {
                 query,
                 artists,
                 albums,
+                shows,
+                episodes,
                 tracks,
             } => {
                 tracing::info!(
-                    "[UI] EngineEvent::SearchResults(query='{}') -> {} artists, {} albums, {} tracks",
+                    "[UI] EngineEvent::SearchResults(query='{}') -> {} artists, {} albums, {} shows, {} episodes, {} tracks",
                     query,
                     artists.len(),
                     albums.len(),
+                    shows.len(),
+                    episodes.len(),
                     tracks.len()
                 );
                 if query.trim().len() >= 2
-                    && (!artists.is_empty() || !albums.is_empty() || !tracks.is_empty())
+                    && (!artists.is_empty()
+                        || !albums.is_empty()
+                        || !shows.is_empty()
+                        || !episodes.is_empty()
+                        || !tracks.is_empty())
                 {
                     self.record_recent_query_from_search(&query);
                 }
                 self.search_artists = artists;
                 self.search_albums = albums;
+                self.search_shows = shows;
+                self.search_episodes = episodes;
                 self.search_results = tracks;
             }
             EngineEvent::ArtistDetailLoaded(detail) => {
@@ -1274,6 +1546,22 @@ impl GrooveApp {
                     }
                 }
             }
+            EngineEvent::ShowDetailLoaded(detail) => {
+                tracing::info!(
+                    "[UI] EngineEvent::ShowDetailLoaded('{}' by '{}') -> {} episodes",
+                    detail.show.title,
+                    detail.show.publisher,
+                    detail.episodes.len()
+                );
+                let loaded_title = detail.show.title.clone();
+                let loaded_uri = detail.show.spotify_uri.clone();
+                self.selected_show = Some(*detail);
+                self.show_bio_expanded = false;
+                if let StageRoute::Show { id_or_uri, label } = self.nav_history.current_mut() {
+                    *id_or_uri = loaded_uri;
+                    *label = loaded_title;
+                }
+            }
         }
     }
 
@@ -1282,8 +1570,10 @@ impl GrooveApp {
         let center_stage = match self.current_route() {
             StageRoute::Artist { .. } => self.view_artist_stage(),
             StageRoute::Album { .. } => self.view_album_stage(),
+            StageRoute::Show { .. } => self.view_show_stage(),
             StageRoute::Section(NavSection::NowPlaying) => self.view_now_playing_stage(),
             StageRoute::Section(NavSection::Search) => self.view_search_stage(),
+            StageRoute::Section(NavSection::Podcasts) => self.view_podcasts_stage(),
             StageRoute::Section(NavSection::Home | NavSection::YourLibrary) => {
                 self.view_library_stage()
             }
@@ -1326,6 +1616,7 @@ impl GrooveApp {
         let nav_items = column![
             self.view_nav_item(NavSection::Home, icons::nav_home()),
             self.view_nav_item(NavSection::Search, icons::nav_search()),
+            self.view_nav_item(NavSection::Podcasts, icons::nav_podcasts()),
             self.view_nav_item(NavSection::NowPlaying, icons::nav_now_playing()),
             self.view_nav_item(NavSection::YourLibrary, icons::nav_library()),
         ]
@@ -1599,13 +1890,40 @@ impl GrooveApp {
                     .style(theme::nav_pill_button(false)),
                 );
             }
+            StageRoute::Show { .. } => {
+                let back_label = self
+                    .nav_history
+                    .previous_entry()
+                    .map(|r| truncate_nav_label(r.label(), 20))
+                    .unwrap_or_else(|| "Podcasts".to_string());
+                let back_msg = if self.can_go_back() {
+                    Message::NavigateBack
+                } else {
+                    Message::SelectNav(NavSection::Podcasts)
+                };
+                nav_row = nav_row.push(
+                    button(
+                        row![
+                            text("←").size(13).color(palette::EMERALD),
+                            text(back_label).size(12.5).color(palette::INK_PRIMARY),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .on_press(back_msg)
+                    .padding(Padding::from([6, 12]))
+                    .style(theme::nav_pill_button(false)),
+                );
+            }
             StageRoute::Section(_) => {}
         }
 
-        // Only show a forward pill if forward history points to an Artist or Album sub-page
+        // Only show a forward pill if forward history points to an Artist, Album, or Show sub-page
         if self.can_go_forward() {
             if let Some(
-                StageRoute::Artist { label, .. } | StageRoute::Album { label, .. },
+                StageRoute::Artist { label, .. }
+                | StageRoute::Album { label, .. }
+                | StageRoute::Show { label, .. },
             ) = self.nav_history.next_entry()
             {
                 nav_row = nav_row.push(
@@ -1643,6 +1961,8 @@ impl GrooveApp {
         )
         .style(theme::album_art_shadow_card);
 
+        let is_episode = track.spotify_uri.starts_with("spotify:episode:");
+
         let artist_link_btn = button(
             row![
                 text(&track.artist)
@@ -1654,19 +1974,33 @@ impl GrooveApp {
             .spacing(4)
             .align_y(Alignment::Center),
         )
-        .on_press(Message::OpenArtist(track.artist.clone()))
+        .on_press(if is_episode {
+            Message::OpenShow(track.artist.clone())
+        } else {
+            Message::OpenArtist(track.artist.clone())
+        })
         .padding(Padding::from([1, 4]))
         .style(theme::icon_ghost_button);
 
         let album_link_btn = button(
             row![
-                text(&track.album).size(13.5).color(palette::INK_MUTED),
+                text(if is_episode {
+                    "Podcast Episode"
+                } else {
+                    &track.album
+                })
+                .size(13.5)
+                .color(palette::INK_MUTED),
                 text("›").size(13).color(palette::INK_MUTED),
             ]
             .spacing(3)
             .align_y(Alignment::Center),
         )
-        .on_press(Message::OpenAlbum(track.album.clone()))
+        .on_press(if is_episode {
+            Message::OpenShow(track.album.clone())
+        } else {
+            Message::OpenAlbum(track.album.clone())
+        })
         .padding(Padding::from([1, 4]))
         .style(theme::icon_ghost_button);
 
@@ -1983,7 +2317,7 @@ impl GrooveApp {
         .align_y(Alignment::Center);
 
         let input = text_input(
-            "Search artists, albums, or tracks on Spotify...",
+            "Search artists, albums, podcasts, or tracks on Spotify...",
             &self.search_query,
         )
         .id(search_input_id())
@@ -2032,9 +2366,9 @@ impl GrooveApp {
                 let mut r = row![].spacing(8);
                 for (idx, entry) in chunk {
                     let badge_color = match entry.kind {
-                        RecentSearchKind::Artist { .. } | RecentSearchKind::Album { .. } => {
-                            palette::EMERALD
-                        }
+                        RecentSearchKind::Artist { .. }
+                        | RecentSearchKind::Album { .. }
+                        | RecentSearchKind::Show { .. } => palette::EMERALD,
                         _ => palette::INK_MUTED,
                     };
                     let chip = container(
@@ -2200,6 +2534,131 @@ impl GrooveApp {
             );
         }
 
+        // 2b. Podcasts section
+        if !self.search_shows.is_empty() {
+            let mut shows_grid = column![].spacing(8);
+            for pair in self.search_shows.chunks(2).take(3) {
+                let mut r = row![].spacing(10);
+                for show in pair {
+                    let cover = image(
+                        self.artwork
+                            .thumb_or_url(show.cover_art_url.as_deref(), show.artwork_theme),
+                    )
+                    .width(Length::Fixed(52.0))
+                    .height(Length::Fixed(52.0));
+
+                    let show_card = row![
+                        button(
+                            row![
+                                cover,
+                                column![
+                                    text(&show.title).size(14).color(palette::INK_PRIMARY),
+                                    text(format!(
+                                        "{} · {} · {} eps",
+                                        show.publisher, show.category, show.episode_count
+                                    ))
+                                    .size(11.5)
+                                    .color(palette::INK_SECONDARY),
+                                ]
+                                .spacing(2)
+                                .width(Length::Fill),
+                                text("Episodes ›").size(11.5).color(palette::INK_MUTED),
+                            ]
+                            .spacing(12)
+                            .align_y(Alignment::Center),
+                        )
+                        .on_press(Message::OpenShow(show.spotify_uri.clone()))
+                        .width(Length::Fill)
+                        .padding(Padding::from([8, 10]))
+                        .style(theme::subtle_row_button(false)),
+                        button(text("▶").size(12).color(palette::EMERALD))
+                            .on_press(Message::PlayShow(show.spotify_uri.clone()))
+                            .padding(Padding::from([10, 10]))
+                            .style(theme::subtle_row_button(false)),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center)
+                    .width(Length::FillPortion(1));
+
+                    r = r.push(show_card);
+                }
+                if pair.len() == 1 {
+                    r = r.push(horizontal_space().width(Length::FillPortion(1)));
+                }
+                shows_grid = shows_grid.push(r);
+            }
+
+            content_col = content_col.push(
+                column![
+                    text("Podcasts")
+                        .font(SERIF_FONT)
+                        .size(22)
+                        .color(palette::INK_PRIMARY),
+                    shows_grid,
+                ]
+                .spacing(8),
+            );
+        }
+
+        // 2c. Podcast Episodes section
+        if !self.search_episodes.is_empty() {
+            let mut episodes_col = column![].spacing(6);
+            for ep in &self.search_episodes {
+                let is_current = ep.spotify_uri == self.state.current_track.spotify_uri;
+                let row_item = row![
+                    button(
+                        row![
+                            image(
+                                self.artwork
+                                    .thumb_or_url(ep.cover_art_url.as_deref(), ep.artwork_theme)
+                            )
+                            .width(Length::Fixed(44.0))
+                            .height(Length::Fixed(44.0)),
+                            column![
+                                text(&ep.title).size(14.0).color(palette::INK_PRIMARY),
+                                text(format!(
+                                    "{} • {} • {}",
+                                    ep.show_title,
+                                    ep.release_date,
+                                    ep.formatted_duration()
+                                ))
+                                .size(12.0)
+                                .color(palette::INK_SECONDARY),
+                            ]
+                            .spacing(2)
+                            .width(Length::Fill),
+                            text("▶ Episode").size(11.5).color(palette::EMERALD),
+                        ]
+                        .spacing(12)
+                        .align_y(Alignment::Center),
+                    )
+                    .on_press(Message::PlaySearchEpisode(ep.clone()))
+                    .width(Length::Fill)
+                    .padding(Padding::from([7, 10]))
+                    .style(theme::subtle_row_button(is_current)),
+                    button(text("Show ›").size(11.5).color(palette::INK_SECONDARY))
+                        .on_press(Message::OpenShow(ep.show_uri.clone()))
+                        .padding(Padding::from([8, 10]))
+                        .style(theme::subtle_row_button(false)),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center);
+
+                episodes_col = episodes_col.push(row_item);
+            }
+
+            content_col = content_col.push(
+                column![
+                    text("Podcast Episodes")
+                        .font(SERIF_FONT)
+                        .size(22)
+                        .color(palette::INK_PRIMARY),
+                    episodes_col,
+                ]
+                .spacing(8),
+            );
+        }
+
         // 3. Tracks section
         if !self.search_results.is_empty() {
             let mut tracks_col = column![].spacing(6);
@@ -2256,9 +2715,13 @@ impl GrooveApp {
                 ]
                 .spacing(8),
             );
-        } else if self.search_query.trim().is_empty() && self.recent_searches.is_empty() {
+        } else if self.search_query.trim().is_empty()
+            && self.recent_searches.is_empty()
+            && self.search_shows.is_empty()
+            && self.search_episodes.is_empty()
+        {
             content_col = content_col.push(
-                text("Search above for artists, albums, and tracks on Spotify.")
+                text("Search above for artists, albums, podcasts, and tracks on Spotify.")
                     .size(13.5)
                     .color(palette::INK_MUTED),
             );
@@ -2278,6 +2741,351 @@ impl GrooveApp {
             .height(Length::Fill)
             .style(theme::center_stage_container)
             .into()
+    }
+
+    /// Dedicated Podcasts discovery directory stage (`NavSection::Podcasts`).
+    fn view_podcasts_stage(&self) -> Element<'_, Message> {
+        let header = row![
+            column![
+                text("Podcasts")
+                    .font(SERIF_FONT)
+                    .size(32)
+                    .color(palette::INK_PRIMARY),
+                text("Stream full episodes and show archives over Spotify Premium")
+                    .size(13.0)
+                    .color(palette::INK_SECONDARY),
+            ]
+            .spacing(2),
+            horizontal_space(),
+        ]
+        .align_y(Alignment::Center);
+
+        let filter_input = text_input(
+            "Filter podcasts by title, host, topic, or paste a spotify:show:... link...",
+            &self.podcast_filter_query,
+        )
+        .on_input(Message::PodcastFilterChanged)
+        .padding(11)
+        .size(13.5)
+        .width(Length::Fill);
+
+        let mut filter_row = row![filter_input].spacing(8).align_y(Alignment::Center);
+        if !self.podcast_filter_query.is_empty() {
+            filter_row = filter_row.push(
+                button(text("Clear").size(12.0).color(palette::INK_SECONDARY))
+                    .on_press(Message::ClearPodcastFilter)
+                    .padding(Padding::from([9, 14]))
+                    .style(theme::subtle_row_button(false)),
+            );
+        }
+
+        let filtered_shows: Vec<PodcastShowSummary> =
+            if self.podcast_filter_query.trim().is_empty() {
+                self.podcast_directory.clone()
+            } else {
+                groove_spotify::web_api::search_podcast_shows(&self.podcast_filter_query)
+            };
+
+        let mut grid_col = column![].spacing(14);
+        for chunk in filtered_shows.chunks(3) {
+            let mut card_row = row![].spacing(14);
+            for show in chunk {
+                let cover = container(
+                    image(
+                        self.artwork
+                            .hero_or_url(show.cover_art_url.as_deref(), show.artwork_theme),
+                    )
+                    .width(Length::Fixed(132.0))
+                    .height(Length::Fixed(132.0)),
+                )
+                .style(theme::album_art_shadow_card);
+
+                let card = column![
+                    button(
+                        column![
+                            cover,
+                            vertical_space().height(Length::Fixed(4.0)),
+                            text(show.category.to_uppercase())
+                                .size(9.5)
+                                .color(palette::EMERALD),
+                            text(truncate_nav_label(&show.title, 28))
+                                .size(14.0)
+                                .color(palette::INK_PRIMARY),
+                            text(format!(
+                                "{} • {} eps",
+                                truncate_nav_label(&show.publisher, 22),
+                                show.episode_count
+                            ))
+                            .size(11.5)
+                            .color(palette::INK_SECONDARY),
+                        ]
+                        .spacing(3)
+                        .align_x(Alignment::Start),
+                    )
+                    .on_press(Message::OpenShow(show.spotify_uri.clone()))
+                    .width(Length::Fill)
+                    .padding(Padding::from([10, 10]))
+                    .style(theme::subtle_row_button(false)),
+                    row![
+                        button(text("Episodes ›").size(11.0).color(palette::INK_SECONDARY))
+                            .on_press(Message::OpenShow(show.spotify_uri.clone()))
+                            .padding(Padding::from([3, 8]))
+                            .style(theme::subtle_row_button(false)),
+                        horizontal_space(),
+                        button(text("▶ Latest").size(11.0).color(palette::EMERALD))
+                            .on_press(Message::PlayShow(show.spotify_uri.clone()))
+                            .padding(Padding::from([3, 8]))
+                            .style(theme::subtle_row_button(true)),
+                    ]
+                    .align_y(Alignment::Center)
+                    .padding(Padding::from([0, 6])),
+                ]
+                .spacing(2)
+                .width(Length::FillPortion(1));
+
+                card_row = card_row.push(card);
+            }
+            for _ in chunk.len()..3 {
+                card_row = card_row.push(horizontal_space().width(Length::FillPortion(1)));
+            }
+            grid_col = grid_col.push(card_row);
+        }
+
+        let mut top_col =
+            column![vertical_space().height(Length::Fixed(10.0)), header, filter_row].spacing(14);
+        if let Some(banner) = self.view_spotify_auth_banner() {
+            top_col = top_col.push(banner);
+        }
+        top_col = top_col
+            .push(scrollable(grid_col).height(Length::Fill))
+            .padding(Padding::from([20, 34]));
+
+        container(top_col)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::center_stage_container)
+            .into()
+    }
+
+    /// Dedicated Podcast Show detail & episode list stage (`StageRoute::Show`).
+    fn view_show_stage(&self) -> Element<'_, Message> {
+        let Some(detail) = &self.selected_show else {
+            return container(
+                column![
+                    vertical_space().height(Length::Fixed(10.0)),
+                    self.view_navigation_bar(),
+                    vertical_space().height(Length::Fixed(40.0)),
+                    text("Loading podcast episodes & artwork...")
+                        .font(SERIF_FONT)
+                        .size(28)
+                        .color(palette::INK_SECONDARY),
+                ]
+                .spacing(14)
+                .padding(Padding::from([20, 34])),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::center_stage_container)
+            .into();
+        };
+
+        let cover = container(
+            image(self.artwork.hero_or_url(
+                detail.show.cover_art_url.as_deref(),
+                detail.show.artwork_theme,
+            ))
+            .width(Length::Fixed(208.0))
+            .height(Length::Fixed(208.0)),
+        )
+        .style(theme::album_art_shadow_card);
+
+        let eyebrow = format!("PODCAST  •  {}", detail.show.category.to_uppercase());
+        let stats_line = format!(
+            "{} episodes  •  {} loaded  •  Spotify Podcasts",
+            detail.show.episode_count.max(detail.episodes.len()),
+            detail.episodes.len()
+        );
+
+        let (desc_preview, full_desc, has_more_desc) =
+            summarize_artist_bio(&detail.show.description, 185);
+        let desc_toggle_label = if self.show_bio_expanded {
+            "Collapse Description ▴"
+        } else {
+            "Read Description ▾"
+        };
+
+        let mut action_row = row![
+            button(text("▶  Play Latest Episode").size(12.5))
+                .on_press(Message::PlayShow(detail.show.spotify_uri.clone()))
+                .padding(Padding::from([8, 16]))
+                .style(theme::subtle_row_button(true)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        if has_more_desc {
+            action_row = action_row.push(
+                button(
+                    text(desc_toggle_label)
+                        .size(12.0)
+                        .color(palette::INK_SECONDARY),
+                )
+                .on_press(Message::ToggleShowBio)
+                .padding(Padding::from([7, 13]))
+                .style(theme::subtle_row_button(false)),
+            );
+        }
+
+        let hero_header = row![
+            cover,
+            column![
+                text(eyebrow).size(10.5).color(palette::EMERALD),
+                text(&detail.show.title)
+                    .font(SERIF_FONT)
+                    .size(36)
+                    .color(palette::INK_PRIMARY),
+                text(&detail.show.publisher)
+                    .font(SERIF_FONT)
+                    .size(20)
+                    .color(palette::INK_SECONDARY),
+                text(stats_line).size(12.0).color(palette::INK_MUTED),
+                text(desc_preview)
+                    .size(12.5)
+                    .line_height(1.38)
+                    .color(palette::INK_SECONDARY),
+                vertical_space().height(Length::Fixed(4.0)),
+                action_row,
+            ]
+            .spacing(5)
+            .width(Length::Fill),
+        ]
+        .spacing(24)
+        .align_y(Alignment::Center);
+
+        let expanded_desc_card: Option<Element<'_, Message>> = if self.show_bio_expanded {
+            Some(
+                container(
+                    column![
+                        text("About this Podcast")
+                            .font(SERIF_FONT)
+                            .size(19)
+                            .color(palette::INK_PRIMARY),
+                        text(full_desc)
+                            .size(13.0)
+                            .line_height(1.48)
+                            .color(palette::INK_SECONDARY),
+                    ]
+                    .spacing(8),
+                )
+                .width(Length::Fill)
+                .padding(Padding::from([14, 18]))
+                .style(|_| container::Style {
+                    background: Some(iced::Background::Color(palette::SIDEBAR_ACTIVE_PILL)),
+                    border: iced::Border {
+                        radius: 12.0.into(),
+                        color: palette::DIVIDER,
+                        width: 1.0,
+                    },
+                    ..Default::default()
+                })
+                .into(),
+            )
+        } else {
+            None
+        };
+
+        let mut episodes_col = column![
+            row![
+                text("Recent Episodes")
+                    .font(SERIF_FONT)
+                    .size(23)
+                    .color(palette::INK_PRIMARY),
+                text(format!("{} episodes", detail.episodes.len()))
+                    .size(12.5)
+                    .color(palette::INK_MUTED),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+        ]
+        .spacing(8);
+
+        if detail.episodes.is_empty() {
+            episodes_col = episodes_col.push(
+                text("Fetching latest episodes from Spotify...")
+                    .size(13.5)
+                    .color(palette::INK_MUTED),
+            );
+        }
+
+        for (idx, ep) in detail.episodes.iter().enumerate() {
+            let is_current = ep.spotify_uri == self.state.current_track.spotify_uri;
+            let (ep_notes_preview, _, _) = summarize_artist_bio(&ep.description, 130);
+
+            let ep_row = button(
+                row![
+                    image(
+                        self.artwork
+                            .thumb_or_url(ep.cover_art_url.as_deref(), ep.artwork_theme)
+                    )
+                    .width(Length::Fixed(52.0))
+                    .height(Length::Fixed(52.0)),
+                    column![
+                        text(&ep.title).size(14.5).color(palette::INK_PRIMARY),
+                        text(format!("{}  •  {}", ep.release_date, ep.formatted_duration()))
+                            .size(11.5)
+                            .color(palette::EMERALD),
+                        text(ep_notes_preview)
+                            .size(12.0)
+                            .color(palette::INK_SECONDARY),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    container(
+                        text(if is_current && self.state.is_playing {
+                            "Playing"
+                        } else {
+                            "▶ Play"
+                        })
+                        .size(12.0)
+                        .color(palette::EMERALD),
+                    )
+                    .padding(Padding::from([6, 12])),
+                ]
+                .spacing(14)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::PlayShowEpisode(idx))
+            .width(Length::Fill)
+            .padding(Padding::from([10, 12]))
+            .style(theme::subtle_row_button(is_current));
+
+            episodes_col = episodes_col.push(ep_row);
+        }
+
+        let mut stage_col = column![hero_header].spacing(18).padding(Padding {
+            top: 0.0,
+            right: 16.0,
+            bottom: 16.0,
+            left: 0.0,
+        });
+        if let Some(desc_card) = expanded_desc_card {
+            stage_col = stage_col.push(desc_card);
+        }
+        stage_col = stage_col.push(horizontal_rule(1)).push(episodes_col);
+
+        container(
+            column![
+                vertical_space().height(Length::Fixed(10.0)),
+                self.view_navigation_bar(),
+                scrollable(stage_col).height(Length::Fill),
+            ]
+            .spacing(14)
+            .padding(Padding::from([20, 34])),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::center_stage_container)
+        .into()
     }
 
     /// Dedicated Artist profile & album discography stage with real cover artwork.
@@ -2936,6 +3744,9 @@ fn recent_searches_file_path() -> PathBuf {
 }
 
 fn load_recent_searches() -> RecentSearchStore {
+    if cfg!(test) {
+        return RecentSearchStore::new(10);
+    }
     let path = recent_searches_file_path();
     let Ok(bytes) = std::fs::read(&path) else {
         return RecentSearchStore::new(10);
@@ -2945,6 +3756,9 @@ fn load_recent_searches() -> RecentSearchStore {
 }
 
 fn save_recent_searches(entries: &[RecentSearchEntry]) {
+    if cfg!(test) {
+        return;
+    }
     let path = recent_searches_file_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -3073,7 +3887,58 @@ mod tests {
         };
         assert_eq!(app.state.connection.display_label(), "Connected • Premium");
         assert!(app.view_spotify_auth_banner().is_none());
+    }
 
-        let _ = app.update(Message::LogoutSpotifyClicked);
+    #[test]
+    fn podcasts_directory_show_detail_and_episode_playback_preserve_invariants() {
+        let (mut app, _) = GrooveApp::new();
+        assert!(!app.podcast_directory.is_empty());
+
+        // Navigate to Podcasts section
+        let _ = app.update(Message::SelectNav(NavSection::Podcasts));
+        assert_eq!(app.active_nav, NavSection::Podcasts);
+        let _ = app.view();
+        app.assert_invariants();
+
+        // Filter podcasts and open a show
+        let _ = app.update(Message::PodcastFilterChanged("Huberman".into()));
+        let first_show = app.podcast_directory[0].clone();
+        let _ = app.update(Message::OpenShow(first_show.spotify_uri.clone()));
+        assert!(matches!(app.current_route(), StageRoute::Show { .. }));
+        app.assert_invariants();
+
+        // Simulate ShowDetailLoaded with playable episodes
+        let sample_ep = PodcastEpisode {
+            id: "2MAi0BvDc6GTFvKFPXnkCL".into(),
+            spotify_uri: "spotify:episode:2MAi0BvDc6GTFvKFPXnkCL".into(),
+            title: "Episode #1: Deep Focus & Neuroplasticity".into(),
+            show_title: first_show.title.clone(),
+            show_uri: first_show.spotify_uri.clone(),
+            description: "Detailed show notes on focus and sleep.".into(),
+            release_date: "2025-10-14".into(),
+            duration_secs: 4520,
+            cover_art_url: first_show.cover_art_url.clone(),
+            artwork_theme: first_show.artwork_theme,
+        };
+        app.apply_engine_event(EngineEvent::ShowDetailLoaded(Box::new(PodcastShowDetail {
+            show: first_show.clone(),
+            episodes: vec![sample_ep],
+        })));
+        app.assert_invariants();
+
+        // Expand/collapse show description and render show stage
+        let _ = app.update(Message::ToggleShowBio);
+        assert!(app.show_bio_expanded);
+        let _ = app.view();
+
+        // Play episode 0 from the show page
+        let _ = app.update(Message::PlayShowEpisode(0));
+        assert_eq!(
+            app.state.current_track.spotify_uri,
+            "spotify:episode:2MAi0BvDc6GTFvKFPXnkCL"
+        );
+        assert!(app.state.is_playing);
+        assert_eq!(app.state.current_track.formatted_duration(), "1:15:20");
+        app.assert_invariants();
     }
 }

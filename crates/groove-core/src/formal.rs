@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AudioDevice, PlaybackState, RepeatMode, SpectrumFrame, Track,
+    AudioDevice, PlaybackState, PodcastEpisode, PodcastShowDetail, RepeatMode, SpectrumFrame,
+    Track,
 };
 
 /// Detailed error returned when a formal state invariant is violated.
@@ -774,6 +775,7 @@ pub enum RecentSearchKind {
     Query,
     Artist { uri: String },
     Album { uri: String, artist_name: String },
+    Show { uri: String, publisher: String },
     Track { uri: String, artist_name: String },
 }
 
@@ -783,6 +785,7 @@ impl RecentSearchKind {
             RecentSearchKind::Query => "SEARCH",
             RecentSearchKind::Artist { .. } => "ARTIST",
             RecentSearchKind::Album { .. } => "ALBUM",
+            RecentSearchKind::Show { .. } => "PODCAST",
             RecentSearchKind::Track { .. } => "TRACK",
         }
     }
@@ -1309,8 +1312,13 @@ impl TrayMenuSnapshot {
             "Groove — Ready to Play".to_string()
         };
 
+        let is_podcast_episode = state.current_track.spotify_uri.starts_with("spotify:episode:");
         let album_subtitle = if has_track && !clean_album.is_empty() {
-            format!("Album: {clean_album} • 320 kbps")
+            if is_podcast_episode {
+                format!("Podcast: {clean_album}")
+            } else {
+                format!("Album: {clean_album} • 320 kbps")
+            }
         } else {
             "Spotify Premium • 320 kbps Ogg Vorbis".to_string()
         };
@@ -1393,6 +1401,176 @@ impl FormalInvariant for TrayMenuSnapshot {
                     self.play_pause_label, self.is_playing
                 ),
             });
+        }
+
+        Ok(())
+    }
+}
+
+fn normalize_spotify_entity_kind_uri(input: &str, kind: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let prefix = format!("spotify:{kind}:");
+    let candidate = if let Some(rest) = trimmed.strip_prefix(&prefix) {
+        rest.split(['?', '#', '/']).next().unwrap_or(rest)
+    } else if let Some(idx) = trimmed.find(&format!("open.spotify.com/{kind}/")) {
+        let after = &trimmed[idx + format!("open.spotify.com/{kind}/").len()..];
+        after.split(['?', '#', '/']).next().unwrap_or(after)
+    } else {
+        trimmed
+    };
+
+    if candidate.len() == 22 && candidate.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(format!("spotify:{kind}:{candidate}"))
+    } else {
+        None
+    }
+}
+
+/// Normalizes a Spotify Podcast Show identifier (`"spotify:show:<id>"`,
+/// `"https://open.spotify.com/show/<id>?si=..."`, or a bare 22-char base62 ID)
+/// into its canonical `"spotify:show:<22-char-base62>"` URI.
+///
+/// Formal Guarantees:
+/// - **INV-E1 (Show URI Totality, Canonicality & Idempotence)**:
+///   Never panics on any UTF-8 input; if `Some(uri)` is returned, `uri.starts_with("spotify:show:")`,
+///   `uri.len() == 13 + 22`, and `normalize_spotify_show_uri(&uri) == Some(uri)`.
+pub fn normalize_spotify_show_uri(input: &str) -> Option<String> {
+    normalize_spotify_entity_kind_uri(input, "show")
+}
+
+/// Normalizes a Spotify Podcast Episode identifier (`"spotify:episode:<id>"`,
+/// `"https://open.spotify.com/episode/<id>?si=..."`, or a bare 22-char base62 ID)
+/// into its canonical `"spotify:episode:<22-char-base62>"` URI.
+///
+/// Formal Guarantees:
+/// - **INV-E1 (Episode URI Totality, Canonicality & Idempotence)**:
+///   Never panics on any UTF-8 input; if `Some(uri)` is returned, `uri.starts_with("spotify:episode:")`,
+///   `uri.len() == 16 + 22`, and `normalize_spotify_episode_uri(&uri) == Some(uri)`.
+pub fn normalize_spotify_episode_uri(input: &str) -> Option<String> {
+    normalize_spotify_entity_kind_uri(input, "episode")
+}
+
+/// Converts a `PodcastEpisode` into a verified playable `Track` for the transport queue,
+/// Now Playing stage, scrubber, and macOS menu bar tray.
+///
+/// Formal Guarantees:
+/// - **INV-E2 (Playable Episode URI Guarantee)**: `track.spotify_uri.starts_with("spotify:episode:")`
+///   and `!track.id.is_empty()`.
+/// - **INV-E3 (Positive Bounded Duration)**: `1 <= track.duration_secs <= 86_400`, preventing
+///   zero-duration scrubber division or runaway bounds.
+/// - **INV-E4 (Single-Line Non-Empty Metadata)**: `track.title`, `track.artist`, and `track.album`
+///   are non-empty and contain no newlines.
+pub fn episode_to_playable_track_verified(ep: &PodcastEpisode) -> Track {
+    let raw_id: String = ep
+        .id
+        .trim()
+        .strip_prefix("spotify:episode:")
+        .unwrap_or(ep.id.trim())
+        .chars()
+        .filter(|c| !c.is_control() && !c.is_whitespace())
+        .collect();
+    let id = if raw_id.is_empty() {
+        "episode-unknown".to_string()
+    } else {
+        raw_id
+    };
+
+    let spotify_uri = normalize_spotify_episode_uri(&ep.spotify_uri)
+        .or_else(|| normalize_spotify_episode_uri(&id))
+        .unwrap_or_else(|| format!("spotify:episode:{id}"));
+
+    let clean_title: String = ep.title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = if clean_title.is_empty() {
+        "Podcast Episode".to_string()
+    } else {
+        clean_title
+    };
+
+    let clean_show: String = ep
+        .show_title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let show_title = if clean_show.is_empty() {
+        "Spotify Podcast".to_string()
+    } else {
+        clean_show
+    };
+
+    let duration_secs = ep.duration_secs.clamp(1, 86_400);
+
+    Track {
+        id,
+        spotify_uri,
+        title,
+        artist: show_title.clone(),
+        album: show_title,
+        duration_secs,
+        liked: false,
+        cover_art_url: ep.cover_art_url.clone(),
+        artwork_theme: ep.artwork_theme,
+    }
+}
+
+impl FormalInvariant for PodcastShowDetail {
+    fn check_invariants(&self) -> Result<(), InvariantViolation> {
+        // INV-S1: Canonical `spotify:show:` URI and non-empty show ID.
+        if self.show.id.trim().is_empty() || !self.show.spotify_uri.starts_with("spotify:show:") {
+            return Err(InvariantViolation {
+                code: "INV-S1",
+                subsystem: "PodcastShowDetail",
+                details: format!(
+                    "show id '{}' or spotify_uri '{}' is invalid",
+                    self.show.id, self.show.spotify_uri
+                ),
+            });
+        }
+
+        // INV-S2: Non-empty single-line show title and publisher.
+        if self.show.title.trim().is_empty()
+            || self.show.title.contains('\n')
+            || self.show.publisher.trim().is_empty()
+            || self.show.publisher.contains('\n')
+        {
+            return Err(InvariantViolation {
+                code: "INV-S2",
+                subsystem: "PodcastShowDetail",
+                details: "show title or publisher is blank or contains newline".to_string(),
+            });
+        }
+
+        // INV-S3: Every episode has a valid `spotify:episode:` URI, positive duration, and converts to a valid Track.
+        for (idx, ep) in self.episodes.iter().enumerate() {
+            if ep.id.trim().is_empty()
+                || !ep.spotify_uri.starts_with("spotify:episode:")
+                || ep.duration_secs == 0
+            {
+                return Err(InvariantViolation {
+                    code: "INV-S3",
+                    subsystem: "PodcastShowDetail",
+                    details: format!(
+                        "episode[{idx}] has invalid id='{}', uri='{}', or duration_secs={}",
+                        ep.id, ep.spotify_uri, ep.duration_secs
+                    ),
+                });
+            }
+            let playable = episode_to_playable_track_verified(ep);
+            if !playable.spotify_uri.starts_with("spotify:episode:")
+                || playable.id.is_empty()
+                || playable.duration_secs == 0
+                || playable.title.contains('\n')
+                || playable.artist.contains('\n')
+            {
+                return Err(InvariantViolation {
+                    code: "INV-S3",
+                    subsystem: "PodcastShowDetail",
+                    details: format!("episode[{idx}] playable track conversion violated INV-E2..E4"),
+                });
+            }
         }
 
         Ok(())

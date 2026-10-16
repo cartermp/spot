@@ -75,9 +75,13 @@ impl AppCachePaths {
     /// `dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("Groove")`
     /// with `credentials`, `audio_cache`, and `image_cache` subdirectories.
     pub fn resolve() -> Self {
-        let root_dir = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("Groove");
+        let root_dir = if std::env::var("GROOVE_TEST_CACHE_DIR").is_ok() || cfg!(test) {
+            std::env::temp_dir().join("groove-test-cache")
+        } else {
+            dirs::data_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Groove")
+        };
         let credentials_dir = root_dir.join("credentials");
         let audio_cache_dir = root_dir.join("audio_cache");
         let image_cache_dir = root_dir.join("image_cache");

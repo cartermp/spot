@@ -3,11 +3,13 @@ use serde::{Deserialize, Serialize};
 pub mod formal;
 pub use formal::{
     advance_queue_verified, coprime_shuffle_step, delete_last_word_verified,
-    format_connected_account_label, gcd_usize, is_opaque_spotify_user_id, merge_devices_verified,
-    resolve_playable_track_candidate, sanitize_pcm_sample, sanitize_position_secs,
-    sanitize_spotify_biography, sanitize_unit_float, select_device_verified, summarize_artist_bio,
-    FormalInvariant, InvariantViolation, NavHistoryMachine, NavRouteTarget, RecentSearchEntry,
-    RecentSearchKind, RecentSearchStore, TrayMenuSnapshot, VerifiedTransportAction,
+    episode_to_playable_track_verified, format_connected_account_label, gcd_usize,
+    is_opaque_spotify_user_id, merge_devices_verified, normalize_spotify_episode_uri,
+    normalize_spotify_show_uri, resolve_playable_track_candidate, sanitize_pcm_sample,
+    sanitize_position_secs, sanitize_spotify_biography, sanitize_unit_float,
+    select_device_verified, summarize_artist_bio, FormalInvariant, InvariantViolation,
+    NavHistoryMachine, NavRouteTarget, RecentSearchEntry, RecentSearchKind, RecentSearchStore,
+    TrayMenuSnapshot, VerifiedTransportAction,
 };
 
 /// Number of logarithmically spaced frequency bands used by the ribbon visualizer.
@@ -18,6 +20,7 @@ pub const SPECTRUM_BANDS: usize = 32;
 pub enum NavSection {
     Home,
     Search,
+    Podcasts,
     NowPlaying,
     YourLibrary,
 }
@@ -27,6 +30,7 @@ impl NavSection {
         match self {
             NavSection::Home => "Home",
             NavSection::Search => "Search",
+            NavSection::Podcasts => "Podcasts",
             NavSection::NowPlaying => "Now Playing",
             NavSection::YourLibrary => "Your Library",
         }
@@ -168,6 +172,68 @@ pub struct ArtistDetail {
     pub biography: Option<String>,
     pub top_tracks: Vec<Track>,
     pub albums: Vec<AlbumSummary>,
+}
+
+/// Summary card for a podcast show (`spotify:show:<id>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodcastShowSummary {
+    pub id: String,
+    pub spotify_uri: String,
+    pub title: String,
+    pub publisher: String,
+    pub description: String,
+    pub category: String,
+    pub episode_count: usize,
+    pub cover_art_url: Option<String>,
+    pub artwork_theme: ArtworkTheme,
+}
+
+/// Metadata for a single playable podcast episode (`spotify:episode:<id>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodcastEpisode {
+    pub id: String,
+    pub spotify_uri: String,
+    pub title: String,
+    pub show_title: String,
+    pub show_uri: String,
+    pub description: String,
+    pub release_date: String,
+    pub duration_secs: u32,
+    pub cover_art_url: Option<String>,
+    pub artwork_theme: ArtworkTheme,
+}
+
+impl PodcastEpisode {
+    pub fn formatted_duration(&self) -> String {
+        format_episode_duration(self.duration_secs)
+    }
+
+    pub fn into_playable_track(&self) -> Track {
+        episode_to_playable_track_verified(self)
+    }
+}
+
+/// Full podcast show detail including show metadata, description, and episode list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodcastShowDetail {
+    pub show: PodcastShowSummary,
+    pub episodes: Vec<PodcastEpisode>,
+}
+
+/// Formats podcast episode duration in human-readable form (e.g., `42 min`, `1 hr 18 min`).
+pub fn format_episode_duration(total_secs: u32) -> String {
+    let total_mins = (total_secs.max(60)) / 60;
+    let hours = total_mins / 60;
+    let mins = total_mins % 60;
+    if hours > 0 {
+        if mins == 0 {
+            format!("{hours} hr")
+        } else {
+            format!("{hours} hr {mins} min")
+        }
+    } else {
+        format!("{total_mins} min")
+    }
 }
 
 /// Formats follower counts compactly (e.g. `1.4M`, `284K`).
@@ -385,6 +451,8 @@ pub enum PlayerCommand {
     SelectArtist(String),
     SelectAlbum(String),
     PlayAlbum(String),
+    SelectShow(String),
+    PlayShow(String),
     SelectOutputDevice(AudioDevice),
     AuthenticateSpotify {
         client_id: Option<String>,
@@ -410,17 +478,27 @@ pub enum EngineEvent {
         query: String,
         artists: Vec<ArtistSummary>,
         albums: Vec<AlbumSummary>,
+        shows: Vec<PodcastShowSummary>,
+        episodes: Vec<PodcastEpisode>,
         tracks: Vec<Track>,
     },
     ArtistDetailLoaded(Box<ArtistDetail>),
     AlbumDetailLoaded(Box<AlbumDetail>),
+    ShowDetailLoaded(Box<PodcastShowDetail>),
 }
 
-/// Formats seconds as `M:SS` (e.g., `2:17`, `4:28`).
+/// Formats seconds as `M:SS` (e.g., `2:17`, `4:28`) or `H:MM:SS` for long podcast episodes.
 pub fn format_seconds(total_secs: u32) -> String {
-    let mins = total_secs / 60;
-    let secs = total_secs % 60;
-    format!("{mins}:{secs:02}")
+    if total_secs >= 3600 {
+        let hours = total_secs / 3600;
+        let mins = (total_secs % 3600) / 60;
+        let secs = total_secs % 60;
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        format!("{mins}:{secs:02}")
+    }
 }
 
 #[cfg(test)]

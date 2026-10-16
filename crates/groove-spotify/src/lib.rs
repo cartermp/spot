@@ -721,6 +721,60 @@ async fn handle_command(
             }
         }
 
+        PlayerCommand::SelectShow(show_id_or_uri) => {
+            info!("[Engine] Command: SelectShow('{show_id_or_uri}')");
+            let client = web_client.clone();
+            let sess = live_session.clone();
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                let detail = client
+                    .fetch_show_detail(sess.as_ref(), &show_id_or_uri)
+                    .await;
+                info!(
+                    "[Engine] ShowDetailLoaded for '{}' by '{}' ({} episodes)",
+                    detail.show.title,
+                    detail.show.publisher,
+                    detail.episodes.len()
+                );
+                let _ = tx.send(EngineEvent::ShowDetailLoaded(Box::new(detail)));
+            });
+        }
+
+        PlayerCommand::PlayShow(show_id_or_uri) => {
+            info!("[Engine] Command: PlayShow('{show_id_or_uri}')");
+            let detail = web_client
+                .fetch_show_detail(live_session.as_ref(), &show_id_or_uri)
+                .await;
+            let tracks: Vec<Track> = detail
+                .episodes
+                .iter()
+                .map(|ep| ep.into_playable_track())
+                .collect();
+            let _ = event_tx.send(EngineEvent::ShowDetailLoaded(Box::new(detail)));
+            if !tracks.is_empty() {
+                info!(
+                    "[Engine] PlayShow loaded {} episodes; starting with '{}'",
+                    tracks.len(),
+                    tracks[0].title
+                );
+                state.current_track = tracks[0].clone();
+                state.queue = tracks;
+                state.position_secs = 0.0;
+                state.is_playing = true;
+                if let Some(active_player) = player.as_ref() {
+                    load_track_on_player(
+                        active_player,
+                        live_session.as_ref(),
+                        &state.current_track,
+                        true,
+                        0.0,
+                    );
+                    *player_has_loaded_track = true;
+                }
+                let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
+            }
+        }
+
         PlayerCommand::SelectOutputDevice(device) => {
             info!(
                 "[Engine] Command: SelectOutputDevice -> '{}' (id={}, is_default={})",
@@ -821,16 +875,20 @@ async fn handle_command(
                     .search_catalog_with_session(sess.as_ref(), &query)
                     .await;
                 info!(
-                    "[Engine] SearchResults ready for query='{}': {} artists, {} albums, {} tracks",
+                    "[Engine] SearchResults ready for query='{}': {} artists, {} albums, {} shows, {} episodes, {} tracks",
                     query,
                     results.artists.len(),
                     results.albums.len(),
+                    results.shows.len(),
+                    results.episodes.len(),
                     results.tracks.len()
                 );
                 let _ = tx.send(EngineEvent::SearchResults {
                     query,
                     artists: results.artists,
                     albums: results.albums,
+                    shows: results.shows,
+                    episodes: results.episodes,
                     tracks: results.tracks,
                 });
             });
@@ -888,8 +946,19 @@ fn load_track_on_player(
             tokio::spawn(async move {
                 let mut resolved_uri = uri;
                 if let Some(sess) = sess_clone {
-                    use librespot_metadata::{Metadata, Track as LibrespotTrack};
-                    if let Ok(meta) = LibrespotTrack::get(&sess, &resolved_uri).await {
+                    use librespot_metadata::{
+                        Episode as LibrespotEpisode, Metadata, Track as LibrespotTrack,
+                    };
+                    if matches!(resolved_uri, SpotifyUri::Episode { .. }) {
+                        if let Ok(meta_ep) = LibrespotEpisode::get(&sess, &resolved_uri).await {
+                            info!(
+                                "[LibrespotPlayer] Podcast episode '{}' ({}) verified with {} audio files",
+                                title,
+                                raw_uri_str,
+                                meta_ep.audio.0.len()
+                            );
+                        }
+                    } else if let Ok(meta) = LibrespotTrack::get(&sess, &resolved_uri).await {
                         let primary_files = meta.files.len();
                         let mut alt_candidates: Vec<(String, SpotifyUri, usize)> = Vec::new();
                         if primary_files == 0 {

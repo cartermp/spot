@@ -1,12 +1,14 @@
 use std::time::Duration;
 
 use groove_core::{
-    AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, ArtworkTheme, PlaybackState, Playlist,
-    Track,
+    normalize_spotify_episode_uri, normalize_spotify_show_uri, AlbumDetail, AlbumSummary,
+    ArtistDetail, ArtistSummary, ArtworkTheme, PlaybackState, Playlist, PodcastEpisode,
+    PodcastShowDetail, PodcastShowSummary, Track,
 };
 use librespot_core::{Session, SpotifyUri};
 use librespot_metadata::{
-    Album as LibrespotAlbum, Artist as LibrespotArtist, Metadata, Track as LibrespotTrack,
+    Album as LibrespotAlbum, Artist as LibrespotArtist, Episode as LibrespotEpisode, Metadata,
+    Show as LibrespotShow, Track as LibrespotTrack,
 };
 use reqwest::Client;
 use serde::Deserialize;
@@ -15,11 +17,13 @@ use tracing::{info, warn};
 
 const SPOTIFY_API_BASE: &str = "https://api.spotify.com/v1";
 
-/// Combined catalog search results for artists, albums, and tracks.
+/// Combined catalog search results for artists, albums, podcast shows, episodes, and tracks.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogSearchResults {
     pub artists: Vec<ArtistSummary>,
     pub albums: Vec<AlbumSummary>,
+    pub shows: Vec<PodcastShowSummary>,
+    pub episodes: Vec<PodcastEpisode>,
     pub tracks: Vec<Track>,
 }
 
@@ -520,6 +524,8 @@ impl SpotifyWebClient {
                             return CatalogSearchResults {
                                 artists,
                                 albums,
+                                shows: search_podcast_shows(trimmed),
+                                episodes: Vec::new(),
                                 tracks,
                             };
                         }
@@ -552,6 +558,8 @@ impl SpotifyWebClient {
         CatalogSearchResults {
             artists: search_curated_artists(trimmed),
             albums: search_curated_albums(trimmed),
+            shows: search_podcast_shows(trimmed),
+            episodes: Vec::new(),
             tracks: search_curated_tracks(trimmed),
         }
     }
@@ -888,6 +896,114 @@ impl SpotifyWebClient {
             .await
             .tracks
     }
+
+    /// Fetches a podcast show's full detail (metadata, sanitized description, cover art, and
+    /// latest playable episodes) using `librespot_metadata::Show` + `Episode` over `session.spclient()`.
+    pub async fn fetch_show_detail(
+        &self,
+        session: Option<&Session>,
+        show_id_or_uri: &str,
+    ) -> PodcastShowDetail {
+        let trimmed = show_id_or_uri.trim();
+        info!(
+            "[ShowDetail] Fetching podcast show detail for '{}' (has_live_session={})",
+            trimmed,
+            session.is_some()
+        );
+
+        let mut resolved_uri = normalize_spotify_show_uri(trimmed);
+        let mut fallback_show = featured_podcast_shows()
+            .into_iter()
+            .find(|s| {
+                s.id == trimmed
+                    || s.spotify_uri == trimmed
+                    || resolved_uri.as_deref() == Some(s.spotify_uri.as_str())
+                    || s.title.eq_ignore_ascii_case(trimmed)
+            });
+
+        if resolved_uri.is_none() {
+            if let Some(ref fb) = fallback_show {
+                resolved_uri = normalize_spotify_show_uri(&fb.spotify_uri);
+            } else if let Some(first) = search_podcast_shows(trimmed).into_iter().next() {
+                resolved_uri = normalize_spotify_show_uri(&first.spotify_uri);
+                fallback_show = Some(first);
+            }
+        }
+
+        if let (Some(sess), Some(uri_str)) = (session, resolved_uri.as_deref()) {
+            if let Ok(show_uri) = SpotifyUri::from_uri(uri_str) {
+                let category = fallback_show
+                    .as_ref()
+                    .map(|s| s.category.as_str())
+                    .unwrap_or("Podcast");
+                if let Some(detail) = fetch_show_via_spclient(sess, &show_uri, category).await {
+                    return detail;
+                }
+            }
+        }
+
+        let show = fallback_show.unwrap_or_else(|| {
+            let clean_id = resolved_uri
+                .as_deref()
+                .and_then(|u| u.strip_prefix("spotify:show:"))
+                .unwrap_or(trimmed)
+                .to_string();
+            let spotify_uri = resolved_uri
+                .unwrap_or_else(|| format!("spotify:show:{clean_id}"));
+            PodcastShowSummary {
+                id: clean_id,
+                spotify_uri,
+                title: trimmed.to_string(),
+                publisher: "Spotify Podcasts".to_string(),
+                description: "Sign in with Spotify Premium to stream episodes of this show.".to_string(),
+                category: "Podcast".to_string(),
+                episode_count: 0,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::SunriseMountainLake,
+            }
+        });
+
+        PodcastShowDetail {
+            show,
+            episodes: Vec::new(),
+        }
+    }
+}
+
+pub fn fallback_show_detail(trimmed: &str) -> PodcastShowDetail {
+    let resolved_uri = normalize_spotify_show_uri(trimmed);
+    let show = featured_podcast_shows()
+        .into_iter()
+        .find(|s| {
+            s.id == trimmed
+                || s.spotify_uri == trimmed
+                || resolved_uri.as_deref() == Some(s.spotify_uri.as_str())
+                || s.title.eq_ignore_ascii_case(trimmed)
+        })
+        .unwrap_or_else(|| {
+            let clean_id = resolved_uri
+                .as_deref()
+                .and_then(|u| u.strip_prefix("spotify:show:"))
+                .unwrap_or(trimmed)
+                .to_string();
+            let spotify_uri = resolved_uri.unwrap_or_else(|| format!("spotify:show:{clean_id}"));
+            PodcastShowSummary {
+                id: clean_id,
+                spotify_uri,
+                title: trimmed.to_string(),
+                publisher: "Spotify Podcasts".to_string(),
+                description: "Loading podcast episodes from Spotify...".to_string(),
+                category: "Podcast".to_string(),
+                episode_count: 0,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::SunriseMountainLake,
+            }
+        });
+
+    PodcastShowDetail {
+        show,
+        episodes: Vec::new(),
+    }
 }
 
 pub fn fallback_album_detail(trimmed: &str, resolved_uri: Option<String>) -> AlbumDetail {
@@ -1100,6 +1216,81 @@ fn encode_spotify_search_query(query: &str) -> String {
 
 async fn search_via_spclient(session: &Session, query: &str) -> Option<CatalogSearchResults> {
     let t0 = std::time::Instant::now();
+
+    // 1. Check if the user pasted a direct Spotify Podcast Show URI/URL or Episode URI/URL.
+    if let Some(show_uri_str) = normalize_spotify_show_uri(query) {
+        if let Ok(show_uri) = SpotifyUri::from_uri(&show_uri_str) {
+            if let Some(detail) = fetch_show_via_spclient(session, &show_uri, "Podcast").await {
+                let episodes: Vec<PodcastEpisode> = detail.episodes.into_iter().take(6).collect();
+                return Some(CatalogSearchResults {
+                    artists: Vec::new(),
+                    albums: Vec::new(),
+                    shows: vec![detail.show],
+                    episodes,
+                    tracks: Vec::new(),
+                });
+            }
+        }
+    }
+    if let Some(ep_uri_str) = normalize_spotify_episode_uri(query) {
+        if let Ok(ep_uri) = SpotifyUri::from_uri(&ep_uri_str) {
+            if let Ok(meta_ep) = LibrespotEpisode::get(session, &ep_uri).await {
+                let ep = map_librespot_episode(&meta_ep, 0, None, None);
+                let track = ep.into_playable_track();
+                return Some(CatalogSearchResults {
+                    artists: Vec::new(),
+                    albums: Vec::new(),
+                    shows: Vec::new(),
+                    episodes: vec![ep],
+                    tracks: vec![track],
+                });
+            }
+        }
+    }
+
+    // 2. Match podcast shows by query and fetch live show metadata + recent episodes over spclient.
+    let matched_shows = search_podcast_shows(query);
+    let mut podcast_episode_set = tokio::task::JoinSet::new();
+    for (s_idx, show_summary) in matched_shows.iter().take(2).cloned().enumerate() {
+        let sess = session.clone();
+        podcast_episode_set.spawn(async move {
+            let show_uri = SpotifyUri::from_uri(&show_summary.spotify_uri).ok()?;
+            let meta_show = LibrespotShow::get(&sess, &show_uri).await.ok()?;
+            let show_cover = extract_librespot_image_url(&meta_show.covers)
+                .or_else(|| show_summary.cover_art_url.clone());
+
+            // Check both ends of `meta_show.episodes.0` so we get the newest episodes regardless of storage order
+            let mut ep_candidates: Vec<SpotifyUri> =
+                meta_show.episodes.0.iter().take(2).cloned().collect();
+            for tail_uri in meta_show.episodes.0.iter().rev().take(2) {
+                if !ep_candidates.contains(tail_uri) {
+                    ep_candidates.push(tail_uri.clone());
+                }
+            }
+            let mut fetched = Vec::new();
+            for ep_uri in ep_candidates {
+                if let Ok(ep) = LibrespotEpisode::get(&sess, &ep_uri).await {
+                    fetched.push(ep);
+                }
+            }
+            fetched.sort_by(|a, b| b.publish_time.cmp(&a.publish_time));
+            let episodes: Vec<PodcastEpisode> = fetched
+                .into_iter()
+                .take(2)
+                .enumerate()
+                .map(|(e_idx, ep)| {
+                    map_librespot_episode(
+                        &ep,
+                        s_idx * 2 + e_idx,
+                        Some(&show_summary.spotify_uri),
+                        show_cover.clone(),
+                    )
+                })
+                .collect();
+            Some((s_idx, episodes))
+        });
+    }
+
     let encoded = encode_spotify_search_query(query);
     if encoded.is_empty() {
         return None;
@@ -1108,35 +1299,64 @@ async fn search_via_spclient(session: &Session, query: &str) -> Option<CatalogSe
     let search_uri = format!("spotify:search:{encoded}");
     info!("[spclient] Resolving search context '{search_uri}'...");
 
-    let ctx = match session.spclient().get_context(&search_uri).await {
-        Ok(ctx) => ctx,
+    let ctx_opt = match session.spclient().get_context(&search_uri).await {
+        Ok(ctx) => Some(ctx),
         Err(err) => {
             warn!("[spclient] get_context('{search_uri}') failed: {err}");
-            return None;
+            None
         }
     };
 
     let mut track_uris: Vec<SpotifyUri> = Vec::new();
-    for page in &ctx.pages {
-        for track in &page.tracks {
-            if let Some(uri_str) = track.uri.as_deref() {
-                if let Ok(uri) = SpotifyUri::from_uri(uri_str) {
-                    if !track_uris.contains(&uri) {
-                        track_uris.push(uri);
-                        if track_uris.len() >= 10 {
-                            break;
+    let mut episode_uris: Vec<SpotifyUri> = Vec::new();
+    if let Some(ctx) = &ctx_opt {
+        for page in &ctx.pages {
+            for track in &page.tracks {
+                if let Some(uri_str) = track.uri.as_deref() {
+                    if let Ok(uri) = SpotifyUri::from_uri(uri_str) {
+                        match &uri {
+                            SpotifyUri::Track { .. } => {
+                                if !track_uris.contains(&uri) && track_uris.len() < 10 {
+                                    track_uris.push(uri);
+                                }
+                            }
+                            SpotifyUri::Episode { .. } => {
+                                if !episode_uris.contains(&uri) && episode_uris.len() < 6 {
+                                    episode_uris.push(uri);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
             }
-        }
-        if track_uris.len() >= 10 {
-            break;
+            if track_uris.len() >= 10 {
+                break;
+            }
         }
     }
 
-    if track_uris.is_empty() {
-        warn!("[spclient] Search '{query}' returned 0 track URIs in context");
+    let mut episodes: Vec<PodcastEpisode> = Vec::new();
+    let mut indexed_ep_batches = Vec::new();
+    while let Some(Ok(Some((s_idx, ep_batch)))) = podcast_episode_set.join_next().await {
+        indexed_ep_batches.push((s_idx, ep_batch));
+    }
+    indexed_ep_batches.sort_by_key(|(s_idx, _)| *s_idx);
+    for (_, batch) in indexed_ep_batches {
+        episodes.extend(batch);
+    }
+
+    for (idx, ep_uri) in episode_uris.into_iter().enumerate() {
+        if let Ok(meta_ep) = LibrespotEpisode::get(session, &ep_uri).await {
+            let mapped = map_librespot_episode(&meta_ep, episodes.len() + idx, None, None);
+            if !episodes.iter().any(|e| e.spotify_uri == mapped.spotify_uri) {
+                episodes.push(mapped);
+            }
+        }
+    }
+
+    if track_uris.is_empty() && matched_shows.is_empty() && episodes.is_empty() {
+        warn!("[spclient] Search '{query}' returned 0 track/podcast URIs in context");
         return None;
     }
 
@@ -1158,7 +1378,7 @@ async fn search_via_spclient(session: &Session, query: &str) -> Option<CatalogSe
     }
     indexed_tracks.sort_by_key(|(idx, _)| *idx);
 
-    if indexed_tracks.is_empty() {
+    if indexed_tracks.is_empty() && matched_shows.is_empty() && episodes.is_empty() {
         return None;
     }
 
@@ -1282,17 +1502,21 @@ async fn search_via_spclient(session: &Session, query: &str) -> Option<CatalogSe
     let artists: Vec<ArtistSummary> = indexed_artists.into_iter().map(|(_, a)| a).collect();
 
     info!(
-        "[spclient] Search '{}' completed in {:?} -> {} artists, {} albums, {} tracks",
+        "[spclient] Search '{}' completed in {:?} -> {} artists, {} albums, {} shows, {} episodes, {} tracks",
         query,
         t0.elapsed(),
         artists.len(),
         albums.len(),
+        matched_shows.len(),
+        episodes.len(),
         tracks.len()
     );
 
     Some(CatalogSearchResults {
         artists,
         albums,
+        shows: matched_shows,
+        episodes,
         tracks,
     })
 }
@@ -1737,3 +1961,460 @@ pub fn curated_artist_detail(artist_key: &str) -> ArtistDetail {
 pub fn curated_tracks_for_album(_album_key: &str) -> Vec<Track> {
     Vec::new()
 }
+
+fn format_librespot_date(date: &librespot_core::date::Date) -> String {
+    let year = date.year();
+    if year < 1971 {
+        return "Podcast Episode".to_string();
+    }
+    let month_num = date.month() as u8;
+    let day = date.day();
+    let month_str = match month_num {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "",
+    };
+    if !month_str.is_empty() && day > 0 {
+        format!("{month_str} {day}, {year}")
+    } else {
+        year.to_string()
+    }
+}
+
+fn map_librespot_episode(
+    ep: &LibrespotEpisode,
+    idx: usize,
+    show_uri_override: Option<&str>,
+    fallback_cover_url: Option<String>,
+) -> PodcastEpisode {
+    let spotify_uri = ep
+        .id
+        .to_uri()
+        .unwrap_or_else(|_| format!("spotify:episode:ep-{idx}"));
+    let id = spotify_uri
+        .strip_prefix("spotify:episode:")
+        .unwrap_or(&spotify_uri)
+        .to_string();
+    let title: String = ep.name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let show_title: String = if ep.show_name.trim().is_empty() {
+        "Spotify Podcast".to_string()
+    } else {
+        ep.show_name
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let show_uri = show_uri_override
+        .map(str::to_owned)
+        .or_else(|| {
+            featured_podcast_shows()
+                .into_iter()
+                .find(|s| s.title.eq_ignore_ascii_case(&show_title))
+                .map(|s| s.spotify_uri)
+        })
+        .unwrap_or_default();
+    let description = sanitize_spotify_biography(&ep.description);
+    let release_date = format_librespot_date(&ep.publish_time);
+    let duration_secs = ((ep.duration.max(1000) + 500) / 1000) as u32;
+    let cover_art_url = extract_librespot_image_url(&ep.covers).or(fallback_cover_url);
+
+    PodcastEpisode {
+        id,
+        spotify_uri,
+        title: if title.is_empty() {
+            "Podcast Episode".to_string()
+        } else {
+            title
+        },
+        show_title,
+        show_uri,
+        description,
+        release_date,
+        duration_secs: duration_secs.clamp(1, 86_400),
+        cover_art_url,
+        artwork_theme: track_theme_for_index(idx),
+    }
+}
+
+async fn fetch_show_via_spclient(
+    session: &Session,
+    show_uri: &SpotifyUri,
+    fallback_category: &str,
+) -> Option<PodcastShowDetail> {
+    let t0 = std::time::Instant::now();
+    let meta_show = match LibrespotShow::get(session, show_uri).await {
+        Ok(s) => s,
+        Err(err) => {
+            warn!("[spclient] LibrespotShow::get({show_uri:?}) failed: {err}");
+            return None;
+        }
+    };
+
+    let show_uri_str = show_uri.to_uri().ok()?;
+    let show_id = show_uri_str
+        .strip_prefix("spotify:show:")
+        .unwrap_or(&show_uri_str)
+        .to_string();
+
+    let cover_art_url = extract_librespot_image_url(&meta_show.covers);
+    let clean_title: String = meta_show
+        .name
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let clean_publisher: String = meta_show
+        .publisher
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let description = sanitize_spotify_biography(&meta_show.description);
+    let total_episodes = meta_show.episodes.0.len();
+
+    // Sample candidate episodes from both ends of `meta_show.episodes.0` so that whether Spotify
+    // orders the show's episode list newest-first or oldest-first, we always fetch the newest episodes.
+    let mut candidate_uris: Vec<SpotifyUri> =
+        meta_show.episodes.0.iter().take(12).cloned().collect();
+    for tail_uri in meta_show.episodes.0.iter().rev().take(12) {
+        if !candidate_uris.contains(tail_uri) {
+            candidate_uris.push(tail_uri.clone());
+        }
+    }
+
+    let mut ep_set = tokio::task::JoinSet::new();
+    for ep_uri in candidate_uris {
+        let sess = session.clone();
+        ep_set.spawn(async move { LibrespotEpisode::get(&sess, &ep_uri).await.ok() });
+    }
+
+    let mut raw_episodes = Vec::new();
+    while let Some(Ok(Some(ep))) = ep_set.join_next().await {
+        raw_episodes.push(ep);
+    }
+
+    // Sort newest-first by `publish_time` descending
+    raw_episodes.sort_by(|a, b| b.publish_time.cmp(&a.publish_time));
+    raw_episodes.truncate(18);
+
+    let episodes: Vec<PodcastEpisode> = raw_episodes
+        .into_iter()
+        .enumerate()
+        .map(|(idx, ep)| {
+            map_librespot_episode(&ep, idx, Some(&show_uri_str), cover_art_url.clone())
+        })
+        .collect();
+
+    let show = PodcastShowSummary {
+        id: show_id,
+        spotify_uri: show_uri_str,
+        title: if clean_title.is_empty() {
+            "Spotify Podcast".to_string()
+        } else {
+            clean_title
+        },
+        publisher: if clean_publisher.is_empty() {
+            "Spotify Studios".to_string()
+        } else {
+            clean_publisher
+        },
+        description,
+        category: fallback_category.to_string(),
+        episode_count: total_episodes.max(episodes.len()),
+        cover_art_url,
+        artwork_theme: ArtworkTheme::SunriseMountainLake,
+    };
+
+    info!(
+        "[spclient] Loaded podcast show '{}' by '{}' ({} total episodes, {} latest loaded) in {:?}",
+        show.title,
+        show.publisher,
+        show.episode_count,
+        episodes.len(),
+        t0.elapsed()
+    );
+
+    Some(PodcastShowDetail { show, episodes })
+}
+
+/// Verified directory of popular Spotify Podcast Shows (`spotify:show:<id>`) with real Spotify
+/// show URIs and CDN cover artwork. Clicking any show fetches its live metadata and latest
+/// playable episodes directly over `session.spclient()`.
+pub fn featured_podcast_shows() -> Vec<PodcastShowSummary> {
+    let entries: &[(&str, &str, &str, &str, usize, &str, &str)] = &[
+        (
+            "79CkJF3UJTHFV8Dse3Oy0P",
+            "Huberman Lab",
+            "Scicomm Media",
+            "Science & Health",
+            450,
+            "https://i.scdn.co/image/ab6765630000ba8a66aed32f8066a72781b3b12a",
+            "Dr. Andrew Huberman discusses neuroscience, brain function, sleep, focus, and science-based tools for everyday life.",
+        ),
+        (
+            "2MAi0BvDc6GTFvKFPXnkCL",
+            "Lex Fridman Podcast",
+            "Lex Fridman",
+            "Technology & AI",
+            503,
+            "https://i.scdn.co/image/ab6765630000ba8a563ebb538d297875b10114b7",
+            "Conversations about science, technology, AI, history, philosophy, and the nature of intelligence and consciousness.",
+        ),
+        (
+            "3IM0lmZxpFAY7CwMuv9H4g",
+            "The Daily",
+            "The New York Times",
+            "Daily News",
+            3008,
+            "https://i.scdn.co/image/ab6765630000ba8ac209144b2c67a524fcbaa70c",
+            "This is what the news should sound like. The biggest stories of our time, told by the best journalists in the world.",
+        ),
+        (
+            "4XPl3uEEL9hvqMkoZrzbx5",
+            "Darknet Diaries",
+            "Jack Rhysider",
+            "Technology & Security",
+            181,
+            "https://i.scdn.co/image/ab6765630000ba8ad27c58dc12f1c25fb933dd86",
+            "True stories from the dark side of the Internet: hackers, breaches, shadow government activity, and cybercrime.",
+        ),
+        (
+            "4kYCRYJ3yK5DQbP5tbfZby",
+            "Syntax - Tasty Web Development Treats",
+            "Wes Bos & Scott Tolinski",
+            "Software Engineering",
+            1049,
+            "https://i.scdn.co/image/ab6765630000ba8a022aa3738b34a57c09be1410",
+            "Full-stack software development, Rust, TypeScript, modern web tooling, and systems engineering deep dives.",
+        ),
+        (
+            "2VRS1IJCTn2Nlkg33ZVfkM",
+            "99% Invisible",
+            "Roman Mars",
+            "Design & Architecture",
+            833,
+            "https://i.scdn.co/image/ab6765630000ba8ac6608ed650ee535e0b550515",
+            "A weekly exploration of the process and power of design and architecture—the unnoticed thought that shapes our world.",
+        ),
+        (
+            "6E709HRH7XaiZrMfgtNCun",
+            "How I Built This with Guy Raz",
+            "Guy Raz | Wondery",
+            "Business & Founders",
+            877,
+            "https://i.scdn.co/image/ab6765630000ba8a7766e182b12fd85537d3b776",
+            "Guy Raz dives into the stories behind some of the world's best known companies, innovators, and entrepreneurs.",
+        ),
+        (
+            "0ofXAdFIQQRsCYj9754UFx",
+            "Stuff You Should Know",
+            "iHeartPodcasts",
+            "Culture & Curiosity",
+            2909,
+            "https://i.scdn.co/image/ab6765630000ba8ae8e4f69c2594c76b57b841f5",
+            "If you've ever wanted to know about champagne, satanism, the Stonewall Uprising, chaos theory, or Rosa Parks, look no further.",
+        ),
+        (
+            "7iQXmUT7XGuZSzAMjoNWlX",
+            "The Diary Of A CEO with Steven Bartlett",
+            "FlightStory",
+            "Business & Society",
+            904,
+            "https://i.scdn.co/image/ab6765630000ba8a9ad158f746c0f755d9ba5299",
+            "Unfiltered conversations with the most influential thinkers, founders, scientists, and leaders in the world.",
+        ),
+        (
+            "2Shpxw7dPoxRJCdfFXTWLE",
+            "Philosophize This!",
+            "Stephen West",
+            "Philosophy & History",
+            252,
+            "https://i.scdn.co/image/ab6765630000ba8a95eac2e2c10a1560f8adebf6",
+            "Beginner-friendly podcast exploring the thinkers and ideas that forged the modern world.",
+        ),
+        (
+            "5lY4b5PGOvMuOYOjOVEcb9",
+            "Science Vs",
+            "Spotify Studios",
+            "Science",
+            349,
+            "https://i.scdn.co/image/ab6765630000ba8aab4a0a1241885bc663c01796",
+            "Science Vs takes on fads, trends, and the opinionated mob to find out what's fact, what's not, and what's somewhere in between.",
+        ),
+        (
+            "2mTUnDkuKUkhiueKcVWoP0",
+            "Up First from NPR",
+            "NPR",
+            "Daily News",
+            500,
+            "https://i.scdn.co/image/ab6765630000ba8a00a701f4ce8ce4c87d628216",
+            "NPR's Up First is the news you need to start your day. The three biggest stories of the day, with reporting and analysis in 15 minutes.",
+        ),
+        (
+            "1VXcH8QHkjRcTCEd88U3ti",
+            "TED Talks Daily",
+            "TED",
+            "Ideas & Science",
+            2837,
+            "https://i.scdn.co/image/ab6765630000ba8a1eef8dcabec3dca77ace07c8",
+            "Every weekday, TED Talks Daily brings you the latest talks in audio from the world's leading thinkers and creators.",
+        ),
+        (
+            "1bJRgaFZHuzifad4IAApFR",
+            "Masters of Scale",
+            "Reid Hoffman | WaitWhat",
+            "Business & Tech",
+            749,
+            "https://i.scdn.co/image/ab6765630000ba8a19a147a6c90d95a7454aa977",
+            "Iconic founders and executives share the strategies that helped them grow from startups into global companies.",
+        ),
+        (
+            "3i5TCKhc6GY42pOWkpWveG",
+            "The Happiness Lab with Dr. Laurie Santos",
+            "Pushkin Industries",
+            "Psychology",
+            279,
+            "https://i.scdn.co/image/ab6765630000ba8a6cb3eb6640cfa4d5da7c5a29",
+            "Yale professor Dr. Laurie Santos shares the latest scientific research and inspiring stories on human happiness.",
+        ),
+        (
+            "4P86ZzHf7EOlRG7do9LkKZ",
+            "Unlocking Us with Brené Brown",
+            "Vox Media Podcast Network",
+            "Culture & Society",
+            134,
+            "https://i.scdn.co/image/ab6765630000ba8a787e9795b879e5ca8ac4618b",
+            "Conversations that unlock the deeply human part of who we are, so that we can live, love, parent, and lead with more courage.",
+        ),
+        (
+            "4rOoJ6Egrf8K2IrywzwOMk",
+            "The Joe Rogan Experience",
+            "Joe Rogan",
+            "Longform Interviews",
+            2766,
+            "https://i.scdn.co/image/ab6765630000ba8a8007f4df0a76e787cb94308a",
+            "The official podcast of comedian Joe Rogan featuring longform conversations with guests across science, comedy, sports, and culture.",
+        ),
+        (
+            "0U9S5J2ltMaKdxIfLuEjzE",
+            "My Favorite Murder",
+            "Exactly Right Media",
+            "True Crime & Comedy",
+            1232,
+            "https://i.scdn.co/image/ab6765630000ba8a4a2f177477ecd05b6f5be8e0",
+            "Karen Kilgariff and Georgia Hardstark tell each other their favorite tales of true crime and hometown stories.",
+        ),
+    ];
+
+    entries
+        .iter()
+        .enumerate()
+        .map(
+            |(idx, (id, title, publisher, category, ep_count, cover_url, desc))| {
+                PodcastShowSummary {
+                    id: (*id).to_string(),
+                    spotify_uri: format!("spotify:show:{id}"),
+                    title: (*title).to_string(),
+                    publisher: (*publisher).to_string(),
+                    description: (*desc).to_string(),
+                    category: (*category).to_string(),
+                    episode_count: *ep_count,
+                    cover_art_url: Some((*cover_url).to_string()),
+                    artwork_theme: track_theme_for_index(idx),
+                }
+            },
+        )
+        .collect()
+}
+
+/// Searches the verified Spotify Podcast Show directory by title, publisher, category, or description.
+pub fn search_podcast_shows(query: &str) -> Vec<PodcastShowSummary> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return featured_podcast_shows();
+    }
+
+    if let Some(norm_uri) = normalize_spotify_show_uri(trimmed) {
+        if let Some(found) = featured_podcast_shows()
+            .into_iter()
+            .find(|s| s.spotify_uri == norm_uri)
+        {
+            return vec![found];
+        }
+        let id = norm_uri
+            .strip_prefix("spotify:show:")
+            .unwrap_or(&norm_uri)
+            .to_string();
+        return vec![PodcastShowSummary {
+            id,
+            spotify_uri: norm_uri,
+            title: "Spotify Podcast Show".to_string(),
+            publisher: "Spotify Podcasts".to_string(),
+            description: String::new(),
+            category: "Podcast".to_string(),
+            episode_count: 1,
+            cover_art_url: None,
+            artwork_theme: ArtworkTheme::SunriseMountainLake,
+        }];
+    }
+
+    let q_lower = trimmed.to_ascii_lowercase();
+    if q_lower == "podcast" || q_lower == "podcasts" || q_lower == "show" || q_lower == "shows" {
+        return featured_podcast_shows().into_iter().take(8).collect();
+    }
+
+    let tokens: Vec<&str> = q_lower
+        .split_whitespace()
+        .filter(|t| t.len() >= 2)
+        .collect();
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(usize, PodcastShowSummary)> = featured_podcast_shows()
+        .into_iter()
+        .filter_map(|show| {
+            let title_l = show.title.to_ascii_lowercase();
+            let pub_l = show.publisher.to_ascii_lowercase();
+            let cat_l = show.category.to_ascii_lowercase();
+            let desc_l = show.description.to_ascii_lowercase();
+
+            let mut score = 0usize;
+            if title_l == q_lower {
+                score += 100;
+            } else if title_l.contains(&q_lower) {
+                score += 60;
+            }
+            if pub_l.contains(&q_lower) {
+                score += 45;
+            }
+            if cat_l.contains(&q_lower) {
+                score += 35;
+            }
+            for tok in &tokens {
+                if title_l.contains(tok) {
+                    score += 25;
+                } else if pub_l.contains(tok) || cat_l.contains(tok) {
+                    score += 15;
+                } else if desc_l.contains(tok) {
+                    score += 5;
+                }
+            }
+
+            (score > 0).then_some((score, show))
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().take(6).map(|(_, s)| s).collect()
+}
+
+
