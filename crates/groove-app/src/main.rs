@@ -3,13 +3,17 @@ mod icons;
 mod theme;
 mod visualizer;
 
-use artwork::ArtworkCache;
+use artwork::{download_and_decode_artwork, ArtworkCache};
 use groove_audio::SpectrumAnalyzer;
 use groove_core::{
-    format_seconds, AudioDevice, EngineEvent, NavSection, PlaybackState, PlayerCommand, RepeatMode,
+    format_compact_count, format_seconds, AlbumSummary, ArtistDetail, ArtistSummary, AudioDevice,
+    ConnectionStatus, EngineEvent, NavSection, PlaybackState, PlayerCommand, RepeatMode,
     SpectrumFrame, Track,
 };
-use groove_spotify::{spawn_engine, EngineHandle};
+use groove_spotify::{
+    web_api::{all_curated_albums, all_curated_artists, curated_artist_detail},
+    spawn_engine, EngineHandle,
+};
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
     button, column, container, horizontal_rule, horizontal_space, image, pick_list, row,
@@ -71,12 +75,19 @@ pub enum Message {
     CycleRepeat,
     ToggleLike,
     SelectQueueTrack(String),
+    PlaySpecificTrack(Track),
     SelectPlaylist(String),
+    OpenArtist(String),
+    CloseArtistView,
+    PlayAlbum(String),
+    PlayArtistTopTracks,
     CreateNewPlaylist,
     SelectOutputDevice(AudioDevice),
-    ConnectSpotifyClicked,
+    ConnectSpotifyClicked { force_reauth: bool },
+    LogoutSpotifyClicked,
     SearchQueryChanged(String),
     ToggleTrackMenu,
+    ArtworkLoaded(Option<(String, image::Handle)>),
 }
 
 pub struct GrooveApp {
@@ -88,7 +99,11 @@ pub struct GrooveApp {
     artwork: ArtworkCache,
     scrubbing_position: Option<f32>,
     search_query: String,
+    search_artists: Vec<ArtistSummary>,
+    search_albums: Vec<AlbumSummary>,
     search_results: Vec<Track>,
+    selected_artist: Option<ArtistDetail>,
+    viewing_artist: bool,
     show_track_details_banner: bool,
 }
 
@@ -105,6 +120,9 @@ impl GrooveApp {
         }
 
         let search_results = state.queue.clone();
+        let search_artists = all_curated_artists();
+        let search_albums = all_curated_albums();
+        let selected_artist = Some(curated_artist_detail("Lume"));
 
         (
             Self {
@@ -116,7 +134,11 @@ impl GrooveApp {
                 artwork: ArtworkCache::new(),
                 scrubbing_position: None,
                 search_query: String::new(),
+                search_artists,
+                search_albums,
                 search_results,
+                selected_artist,
+                viewing_artist: false,
                 show_track_details_banner: false,
             },
             Task::none(),
@@ -131,16 +153,38 @@ impl GrooveApp {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::AnimationTick => {
+                let mut needs_art_scan = false;
                 // Drain any pending events from the async Spotify + Audio engine
                 while let Ok(event) = self.engine.event_rx.try_recv() {
+                    if matches!(
+                        event,
+                        EngineEvent::StateSynced(_)
+                            | EngineEvent::TrackChanged(_)
+                            | EngineEvent::QueueUpdated(_)
+                            | EngineEvent::SearchResults { .. }
+                            | EngineEvent::ArtistDetailLoaded(_)
+                    ) {
+                        needs_art_scan = true;
+                    }
                     self.apply_engine_event(event);
                 }
 
                 // Update 60 FPS spectrum frame from live lock-free audio ringbuffer (or harmonic fallback)
                 self.spectrum = self.analyzer.next_frame(self.state.is_playing, 0.016);
+
+                if needs_art_scan {
+                    return self.spawn_missing_artwork_tasks();
+                }
             }
             Message::SelectNav(nav) => {
+                self.viewing_artist = false;
                 self.active_nav = nav;
+                if nav == NavSection::Search && self.search_artists.is_empty() {
+                    let _ = self
+                        .engine
+                        .command_tx
+                        .send(PlayerCommand::SearchCatalog(self.search_query.clone()));
+                }
             }
             Message::TogglePlayPause => {
                 self.state.is_playing = !self.state.is_playing;
@@ -188,6 +232,15 @@ impl GrooveApp {
                     .engine
                     .command_tx
                     .send(PlayerCommand::SelectQueueTrack(track_id));
+                self.viewing_artist = false;
+                self.active_nav = NavSection::NowPlaying;
+            }
+            Message::PlaySpecificTrack(track) => {
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::PlayTrack(track));
+                self.viewing_artist = false;
                 self.active_nav = NavSection::NowPlaying;
             }
             Message::SelectPlaylist(playlist_id) => {
@@ -195,7 +248,38 @@ impl GrooveApp {
                     .engine
                     .command_tx
                     .send(PlayerCommand::SelectPlaylist(playlist_id));
+                self.viewing_artist = false;
                 self.active_nav = NavSection::NowPlaying;
+            }
+            Message::OpenArtist(artist_id_or_name) => {
+                self.viewing_artist = true;
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::SelectArtist(artist_id_or_name));
+            }
+            Message::CloseArtistView => {
+                self.viewing_artist = false;
+            }
+            Message::PlayAlbum(album_uri) => {
+                let _ = self
+                    .engine
+                    .command_tx
+                    .send(PlayerCommand::PlayAlbum(album_uri));
+                self.viewing_artist = false;
+                self.active_nav = NavSection::NowPlaying;
+            }
+            Message::PlayArtistTopTracks => {
+                if let Some(detail) = &self.selected_artist {
+                    if let Some(first) = detail.top_tracks.first().cloned() {
+                        let _ = self
+                            .engine
+                            .command_tx
+                            .send(PlayerCommand::PlayTrack(first));
+                        self.viewing_artist = false;
+                        self.active_nav = NavSection::NowPlaying;
+                    }
+                }
             }
             Message::CreateNewPlaylist => {
                 let next_idx = self.state.playlists.len() + 1;
@@ -217,12 +301,18 @@ impl GrooveApp {
                     .command_tx
                     .send(PlayerCommand::SelectOutputDevice(device));
             }
-            Message::ConnectSpotifyClicked => {
+            Message::ConnectSpotifyClicked { force_reauth } => {
                 let client_id = std::env::var("SPOTIFY_CLIENT_ID").ok();
                 let _ = self
                     .engine
                     .command_tx
-                    .send(PlayerCommand::AuthenticateSpotify { client_id });
+                    .send(PlayerCommand::AuthenticateSpotify {
+                        client_id,
+                        force_reauth,
+                    });
+            }
+            Message::LogoutSpotifyClicked => {
+                let _ = self.engine.command_tx.send(PlayerCommand::LogoutSpotify);
             }
             Message::SearchQueryChanged(query) => {
                 self.search_query = query.clone();
@@ -234,8 +324,69 @@ impl GrooveApp {
             Message::ToggleTrackMenu => {
                 self.show_track_details_banner = !self.show_track_details_banner;
             }
+            Message::ArtworkLoaded(Some((url, handle))) => {
+                self.artwork.insert_remote(url, handle);
+            }
+            Message::ArtworkLoaded(None) => {}
         }
         Task::none()
+    }
+
+    fn spawn_missing_artwork_tasks(&mut self) -> Task<Message> {
+        let mut urls: Vec<String> = Vec::new();
+        if let Some(u) = &self.state.current_track.cover_art_url {
+            urls.push(u.clone());
+        }
+        for t in &self.state.queue {
+            if let Some(u) = &t.cover_art_url {
+                urls.push(u.clone());
+            }
+        }
+        for a in &self.search_artists {
+            if let Some(u) = &a.portrait_url {
+                urls.push(u.clone());
+            }
+        }
+        for alb in &self.search_albums {
+            if let Some(u) = &alb.cover_art_url {
+                urls.push(u.clone());
+            }
+        }
+        for t in &self.search_results {
+            if let Some(u) = &t.cover_art_url {
+                urls.push(u.clone());
+            }
+        }
+        if let Some(detail) = &self.selected_artist {
+            if let Some(u) = &detail.artist.portrait_url {
+                urls.push(u.clone());
+            }
+            for alb in &detail.albums {
+                if let Some(u) = &alb.cover_art_url {
+                    urls.push(u.clone());
+                }
+            }
+            for t in &detail.top_tracks {
+                if let Some(u) = &t.cover_art_url {
+                    urls.push(u.clone());
+                }
+            }
+        }
+
+        let mut tasks = Vec::new();
+        for url in urls {
+            if self.artwork.mark_in_flight(&url) {
+                tasks.push(Task::perform(
+                    download_and_decode_artwork(url),
+                    Message::ArtworkLoaded,
+                ));
+            }
+        }
+        if tasks.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(tasks)
+        }
     }
 
     fn apply_engine_event(&mut self, event: EngineEvent) {
@@ -270,18 +421,33 @@ impl GrooveApp {
             EngineEvent::ConnectionUpdated(conn) => {
                 self.state.connection = conn;
             }
-            EngineEvent::SearchResults { tracks, .. } => {
+            EngineEvent::SearchResults {
+                artists,
+                albums,
+                tracks,
+                ..
+            } => {
+                self.search_artists = artists;
+                self.search_albums = albums;
                 self.search_results = tracks;
+            }
+            EngineEvent::ArtistDetailLoaded(detail) => {
+                self.selected_artist = Some(*detail);
+                self.viewing_artist = true;
             }
         }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
         let sidebar = self.view_sidebar();
-        let center_stage = match self.active_nav {
-            NavSection::NowPlaying => self.view_now_playing_stage(),
-            NavSection::Search => self.view_search_stage(),
-            NavSection::Home | NavSection::YourLibrary => self.view_library_stage(),
+        let center_stage = if self.viewing_artist {
+            self.view_artist_stage()
+        } else {
+            match self.active_nav {
+                NavSection::NowPlaying => self.view_now_playing_stage(),
+                NavSection::Search => self.view_search_stage(),
+                NavSection::Home | NavSection::YourLibrary => self.view_library_stage(),
+            }
         };
         let queue_pane = self.view_queue_pane();
 
@@ -392,11 +558,17 @@ impl GrooveApp {
         let playlists_scroll = scrollable(playlist_col).height(Length::Fill);
 
         let conn_label = self.state.connection.display_label();
+        let is_live = self.state.connection.is_live_session();
+        let dot_color = if is_live {
+            palette::EMERALD
+        } else {
+            iced::Color::from_rgb8(0xD9, 0x8A, 0x3C)
+        };
         let status_dot = container(text(""))
             .width(Length::Fixed(6.5))
             .height(Length::Fixed(6.5))
-            .style(|_| container::Style {
-                background: Some(iced::Background::Color(palette::EMERALD)),
+            .style(move |_| container::Style {
+                background: Some(iced::Background::Color(dot_color)),
                 border: iced::Border {
                     radius: 4.0.into(),
                     ..Default::default()
@@ -410,12 +582,16 @@ impl GrooveApp {
                     .width(Length::Fixed(24.0))
                     .height(Length::Fixed(24.0)),
                 column![
-                    text("Spotify streaming")
-                        .size(12.5)
-                        .color(palette::INK_PRIMARY),
+                    text(if is_live {
+                        "Spotify streaming"
+                    } else {
+                        "Connect Spotify"
+                    })
+                    .size(12.5)
+                    .color(palette::INK_PRIMARY),
                     row![
                         status_dot,
-                        text(conn_label).size(11.5).color(palette::INK_SECONDARY)
+                        text(conn_label).size(11.0).color(palette::INK_SECONDARY)
                     ]
                     .spacing(5)
                     .align_y(Alignment::Center),
@@ -427,7 +603,9 @@ impl GrooveApp {
             .spacing(10)
             .align_y(Alignment::Center),
         )
-        .on_press(Message::ConnectSpotifyClicked)
+        .on_press(Message::ConnectSpotifyClicked {
+            force_reauth: is_live,
+        })
         .width(Length::Fill)
         .padding(Padding::from([8, 8]))
         .style(theme::subtle_row_button(false));
@@ -464,7 +642,7 @@ impl GrooveApp {
         section: NavSection,
         icon_handle: svg::Handle,
     ) -> Element<'a, Message> {
-        let is_active = self.active_nav == section;
+        let is_active = self.active_nav == section && !self.viewing_artist;
         let label_text = text(section.label())
             .size(14)
             .color(palette::INK_PRIMARY);
@@ -491,11 +669,29 @@ impl GrooveApp {
         let track = &self.state.current_track;
 
         let hero_art = container(
-            image(self.artwork.hero_handle(track.artwork_theme))
-                .width(Length::Fixed(352.0))
-                .height(Length::Fixed(352.0)),
+            image(
+                self.artwork
+                    .hero_or_url(track.cover_art_url.as_deref(), track.artwork_theme),
+            )
+            .width(Length::Fixed(352.0))
+            .height(Length::Fixed(352.0)),
         )
         .style(theme::album_art_shadow_card);
+
+        let artist_link_btn = button(
+            row![
+                text(&track.artist)
+                    .font(SERIF_FONT)
+                    .size(18)
+                    .color(palette::INK_SECONDARY),
+                text("›").size(15).color(palette::INK_MUTED),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        )
+        .on_press(Message::OpenArtist(track.artist.clone()))
+        .padding(Padding::from([1, 4]))
+        .style(theme::icon_ghost_button);
 
         let title_and_actions = row![
             column![
@@ -503,10 +699,7 @@ impl GrooveApp {
                     .font(SERIF_FONT)
                     .size(31)
                     .color(palette::INK_PRIMARY),
-                text(&track.artist)
-                    .font(SERIF_FONT)
-                    .size(18)
-                    .color(palette::INK_SECONDARY),
+                artist_link_btn,
             ]
             .spacing(2)
             .width(Length::Fill),
@@ -718,27 +911,253 @@ impl GrooveApp {
             .into()
     }
 
+    fn view_spotify_auth_banner(&self) -> Element<'_, Message> {
+        match &self.state.connection {
+            ConnectionStatus::Connected {
+                username,
+                live_session: true,
+                ..
+            } => container(
+                row![
+                    svg(icons::spotify_badge())
+                        .width(Length::Fixed(18.0))
+                        .height(Length::Fixed(18.0)),
+                    text(format!(
+                        "Spotify Premium active as {username} • 320 kbps Ogg Vorbis + live catalog"
+                    ))
+                    .size(12.0)
+                    .color(palette::INK_SECONDARY)
+                    .width(Length::Fill),
+                    button(text("Re-auth").size(11.5))
+                        .on_press(Message::ConnectSpotifyClicked { force_reauth: true })
+                        .padding(Padding::from([4, 10]))
+                        .style(theme::subtle_row_button(true)),
+                    button(text("Sign Out").size(11.5))
+                        .on_press(Message::LogoutSpotifyClicked)
+                        .padding(Padding::from([4, 10]))
+                        .style(theme::subtle_row_button(false)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([8, 12]))
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(palette::SIDEBAR_ACTIVE_PILL)),
+                border: iced::Border {
+                    radius: 12.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into(),
+
+            ConnectionStatus::Connecting { status } => container(
+                row![
+                    svg(icons::spotify_badge())
+                        .width(Length::Fixed(18.0))
+                        .height(Length::Fixed(18.0)),
+                    text(status)
+                        .size(12.5)
+                        .color(palette::INK_PRIMARY)
+                        .width(Length::Fill),
+                    button(text("Retry Browser Login").size(11.5))
+                        .on_press(Message::ConnectSpotifyClicked { force_reauth: true })
+                        .padding(Padding::from([5, 12]))
+                        .style(theme::subtle_row_button(true)),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([9, 12]))
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(palette::DEVICE_PILL_BG)),
+                border: iced::Border {
+                    radius: 12.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into(),
+
+            _ => container(
+                row![
+                    svg(icons::spotify_badge())
+                        .width(Length::Fixed(18.0))
+                        .height(Length::Fixed(18.0)),
+                    column![
+                        text("Sign in with Spotify Premium")
+                            .size(13.0)
+                            .color(palette::INK_PRIMARY),
+                        text("Opens Spotify PKCE login in your browser for live 320 kbps streaming, artist albums, and cover art.")
+                            .size(11.5)
+                            .color(palette::INK_SECONDARY),
+                    ]
+                    .spacing(1)
+                    .width(Length::Fill),
+                    button(text("Connect Spotify").size(12.0))
+                        .on_press(Message::ConnectSpotifyClicked {
+                            force_reauth: false
+                        })
+                        .padding(Padding::from([7, 14]))
+                        .style(theme::subtle_row_button(true)),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([10, 14]))
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(palette::SIDEBAR_ACTIVE_PILL)),
+                border: iced::Border {
+                    radius: 12.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into(),
+        }
+    }
+
     fn view_search_stage(&self) -> Element<'_, Message> {
         let header = row![
-            text("Search Catalog")
+            text("Search & Discover")
                 .font(SERIF_FONT)
                 .size(32)
                 .color(palette::INK_PRIMARY),
             horizontal_space(),
-            button(text("Back to Now Playing").size(12.5))
+            button(text("Now Playing").size(12.5))
                 .on_press(Message::SelectNav(NavSection::NowPlaying))
                 .padding(Padding::from([6, 12]))
                 .style(theme::nav_pill_button(true)),
         ]
         .align_y(Alignment::Center);
 
-        let input = text_input("Search tracks, artists, or albums...", &self.search_query)
-            .on_input(Message::SearchQueryChanged)
-            .padding(12)
-            .size(14);
+        let input = text_input(
+            "Search artists, albums, or tracks on Spotify...",
+            &self.search_query,
+        )
+        .on_input(Message::SearchQueryChanged)
+        .padding(12)
+        .size(14);
 
-        let mut results_col = column![].spacing(8);
-        let list = if self.search_query.trim().is_empty() {
+        let mut content_col = column![].spacing(18);
+
+        // 1. Artists section
+        if !self.search_artists.is_empty() {
+            let mut artists_grid = column![].spacing(8);
+            for pair in self.search_artists.chunks(2).take(3) {
+                let mut r = row![].spacing(10);
+                for artist in pair {
+                    let portrait = image(
+                        self.artwork
+                            .thumb_or_url(artist.portrait_url.as_deref(), artist.artwork_theme),
+                    )
+                    .width(Length::Fixed(52.0))
+                    .height(Length::Fixed(52.0));
+
+                    let artist_card = button(
+                        row![
+                            portrait,
+                            column![
+                                text(&artist.name)
+                                    .font(SERIF_FONT)
+                                    .size(18)
+                                    .color(palette::INK_PRIMARY),
+                                text(artist.subtitle())
+                                    .size(11.5)
+                                    .color(palette::INK_SECONDARY),
+                            ]
+                            .spacing(2)
+                            .width(Length::Fill),
+                            text("Albums ›").size(12).color(palette::INK_MUTED),
+                        ]
+                        .spacing(12)
+                        .align_y(Alignment::Center),
+                    )
+                    .on_press(Message::OpenArtist(artist.spotify_uri.clone()))
+                    .width(Length::FillPortion(1))
+                    .padding(Padding::from([8, 10]))
+                    .style(theme::subtle_row_button(false));
+
+                    r = r.push(artist_card);
+                }
+                if pair.len() == 1 {
+                    r = r.push(horizontal_space().width(Length::FillPortion(1)));
+                }
+                artists_grid = artists_grid.push(r);
+            }
+
+            content_col = content_col.push(
+                column![
+                    text("Artists")
+                        .font(SERIF_FONT)
+                        .size(22)
+                        .color(palette::INK_PRIMARY),
+                    artists_grid,
+                ]
+                .spacing(8),
+            );
+        }
+
+        // 2. Albums section
+        if !self.search_albums.is_empty() {
+            let mut albums_grid = column![].spacing(8);
+            for pair in self.search_albums.chunks(2).take(3) {
+                let mut r = row![].spacing(10);
+                for alb in pair {
+                    let cover = image(
+                        self.artwork
+                            .thumb_or_url(alb.cover_art_url.as_deref(), alb.artwork_theme),
+                    )
+                    .width(Length::Fixed(52.0))
+                    .height(Length::Fixed(52.0));
+
+                    let alb_card = button(
+                        row![
+                            cover,
+                            column![
+                                text(&alb.title).size(14).color(palette::INK_PRIMARY),
+                                text(format!(
+                                    "{} · {} · {}",
+                                    alb.artist_name, alb.release_year, alb.album_type
+                                ))
+                                .size(11.5)
+                                .color(palette::INK_SECONDARY),
+                            ]
+                            .spacing(2)
+                            .width(Length::Fill),
+                            text("Play").size(11.5).color(palette::INK_MUTED),
+                        ]
+                        .spacing(12)
+                        .align_y(Alignment::Center),
+                    )
+                    .on_press(Message::PlayAlbum(alb.spotify_uri.clone()))
+                    .width(Length::FillPortion(1))
+                    .padding(Padding::from([8, 10]))
+                    .style(theme::subtle_row_button(false));
+
+                    r = r.push(alb_card);
+                }
+                if pair.len() == 1 {
+                    r = r.push(horizontal_space().width(Length::FillPortion(1)));
+                }
+                albums_grid = albums_grid.push(r);
+            }
+
+            content_col = content_col.push(
+                column![
+                    text("Albums")
+                        .font(SERIF_FONT)
+                        .size(22)
+                        .color(palette::INK_PRIMARY),
+                    albums_grid,
+                ]
+                .spacing(8),
+            );
+        }
+
+        // 3. Tracks section
+        let mut tracks_col = column![].spacing(6);
+        let list = if self.search_query.trim().is_empty() && self.search_results.is_empty() {
             &self.state.queue
         } else {
             &self.search_results
@@ -746,43 +1165,257 @@ impl GrooveApp {
 
         for track in list {
             let is_current = track.id == self.state.current_track.id;
-            let row_item = button(
-                row![
-                    image(self.artwork.thumb_handle(track.artwork_theme))
+            let row_item = row![
+                button(
+                    row![
+                        image(
+                            self.artwork.thumb_or_url(
+                                track.cover_art_url.as_deref(),
+                                track.artwork_theme
+                            )
+                        )
                         .width(Length::Fixed(44.0))
                         .height(Length::Fixed(44.0)),
-                    column![
-                        text(&track.title).size(14.5).color(palette::INK_PRIMARY),
-                        text(format!("{} • {}", track.artist, track.album))
+                        column![
+                            text(&track.title).size(14.5).color(palette::INK_PRIMARY),
+                            text(format!("{} • {}", track.artist, track.album))
+                                .size(12.5)
+                                .color(palette::INK_SECONDARY),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        text(track.formatted_duration())
                             .size(12.5)
-                            .color(palette::INK_SECONDARY),
+                            .color(palette::INK_MUTED),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::PlaySpecificTrack(track.clone()))
+                .width(Length::Fill)
+                .padding(Padding::from([7, 10]))
+                .style(theme::subtle_row_button(is_current)),
+                button(text("Artist ›").size(11.5).color(palette::INK_SECONDARY))
+                    .on_press(Message::OpenArtist(track.artist.clone()))
+                    .padding(Padding::from([8, 10]))
+                    .style(theme::subtle_row_button(false)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+
+            tracks_col = tracks_col.push(row_item);
+        }
+
+        content_col = content_col.push(
+            column![
+                text("Tracks")
+                    .font(SERIF_FONT)
+                    .size(22)
+                    .color(palette::INK_PRIMARY),
+                tracks_col,
+            ]
+            .spacing(8),
+        );
+
+        container(
+            column![
+                vertical_space().height(Length::Fixed(16.0)),
+                header,
+                self.view_spotify_auth_banner(),
+                input,
+                scrollable(content_col).height(Length::Fill),
+            ]
+            .spacing(14)
+            .padding(Padding::from([24, 34])),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::center_stage_container)
+        .into()
+    }
+
+    /// Dedicated Artist profile & album discography stage with real cover artwork.
+    fn view_artist_stage(&self) -> Element<'_, Message> {
+        let Some(detail) = &self.selected_artist else {
+            return self.view_search_stage();
+        };
+
+        let nav_bar = row![
+            button(text("← Back").size(12.5))
+                .on_press(Message::CloseArtistView)
+                .padding(Padding::from([6, 12]))
+                .style(theme::subtle_row_button(true)),
+            horizontal_space(),
+            button(text("Now Playing").size(12.5))
+                .on_press(Message::SelectNav(NavSection::NowPlaying))
+                .padding(Padding::from([6, 12]))
+                .style(theme::nav_pill_button(true)),
+        ]
+        .align_y(Alignment::Center);
+
+        let portrait = container(
+            image(self.artwork.hero_or_url(
+                detail.artist.portrait_url.as_deref(),
+                detail.artist.artwork_theme,
+            ))
+            .width(Length::Fixed(116.0))
+            .height(Length::Fixed(116.0)),
+        )
+        .style(theme::album_art_shadow_card);
+
+        let followers_text = detail
+            .artist
+            .followers
+            .map(|f| format!("{} followers", format_compact_count(f)))
+            .unwrap_or_else(|| "Verified Artist".to_string());
+
+        let genre_line = if detail.artist.genres.is_empty() {
+            followers_text
+        } else {
+            format!("{}  •  {}", detail.artist.subtitle(), followers_text)
+        };
+
+        let bio_text = detail.biography.as_deref().unwrap_or(
+            "Explore studio albums, singles, and high-resolution 320 kbps streams on Groove.",
+        );
+
+        let hero_header = row![
+            portrait,
+            column![
+                text(&detail.artist.name)
+                    .font(SERIF_FONT)
+                    .size(36)
+                    .color(palette::INK_PRIMARY),
+                text(genre_line).size(12.5).color(palette::INK_SECONDARY),
+                text(bio_text).size(12.5).color(palette::INK_MUTED),
+                row![
+                    button(text("▶  Play Top Tracks").size(12.5))
+                        .on_press(Message::PlayArtistTopTracks)
+                        .padding(Padding::from([7, 14]))
+                        .style(theme::subtle_row_button(true)),
+                ]
+                .spacing(8),
+            ]
+            .spacing(5)
+            .width(Length::Fill),
+        ]
+        .spacing(18)
+        .align_y(Alignment::Center);
+
+        // Discography — Albums & Singles with artwork
+        let mut albums_section = column![
+            text("Albums & Releases")
+                .font(SERIF_FONT)
+                .size(23)
+                .color(palette::INK_PRIMARY)
+        ]
+        .spacing(10);
+
+        for chunk in detail.albums.chunks(3) {
+            let mut album_row = row![].spacing(14);
+            for alb in chunk {
+                let cover = container(
+                    image(
+                        self.artwork
+                            .hero_or_url(alb.cover_art_url.as_deref(), alb.artwork_theme),
+                    )
+                    .width(Length::Fixed(128.0))
+                    .height(Length::Fixed(128.0)),
+                )
+                .style(theme::album_art_shadow_card);
+
+                let card = button(
+                    column![
+                        cover,
+                        vertical_space().height(Length::Fixed(4.0)),
+                        text(&alb.title).size(13.5).color(palette::INK_PRIMARY),
+                        text(format!(
+                            "{} • {} ({} tracks)",
+                            alb.release_year, alb.album_type, alb.track_count
+                        ))
+                        .size(11.5)
+                        .color(palette::INK_SECONDARY),
+                    ]
+                    .spacing(3)
+                    .align_x(Alignment::Start),
+                )
+                .on_press(Message::PlayAlbum(alb.spotify_uri.clone()))
+                .width(Length::FillPortion(1))
+                .padding(Padding::from([10, 10]))
+                .style(theme::subtle_row_button(false));
+
+                album_row = album_row.push(card);
+            }
+            for _ in chunk.len()..3 {
+                album_row = album_row.push(horizontal_space().width(Length::FillPortion(1)));
+            }
+            albums_section = albums_section.push(album_row);
+        }
+
+        // Popular Tracks section
+        let mut top_tracks_col = column![
+            text("Popular Tracks")
+                .font(SERIF_FONT)
+                .size(23)
+                .color(palette::INK_PRIMARY)
+        ]
+        .spacing(6);
+
+        for (idx, track) in detail.top_tracks.iter().enumerate() {
+            let is_current = track.id == self.state.current_track.id;
+            let track_btn = button(
+                row![
+                    text(format!("{:02}", idx + 1))
+                        .size(12)
+                        .color(palette::INK_MUTED)
+                        .width(Length::Fixed(22.0)),
+                    image(
+                        self.artwork
+                            .thumb_or_url(track.cover_art_url.as_deref(), track.artwork_theme)
+                    )
+                    .width(Length::Fixed(40.0))
+                    .height(Length::Fixed(40.0)),
+                    column![
+                        text(&track.title).size(14).color(palette::INK_PRIMARY),
+                        text(&track.album).size(12).color(palette::INK_SECONDARY),
                     ]
                     .spacing(2)
                     .width(Length::Fill),
                     text(track.formatted_duration())
-                        .size(12.5)
+                        .size(12)
                         .color(palette::INK_MUTED),
                 ]
-                .spacing(12)
+                .spacing(10)
                 .align_y(Alignment::Center),
             )
-            .on_press(Message::SelectQueueTrack(track.id.clone()))
+            .on_press(Message::PlaySpecificTrack(track.clone()))
             .width(Length::Fill)
-            .padding(Padding::from([8, 10]))
+            .padding(Padding::from([6, 10]))
             .style(theme::subtle_row_button(is_current));
 
-            results_col = results_col.push(row_item);
+            top_tracks_col = top_tracks_col.push(track_btn);
         }
+
+        let body_scroll = scrollable(
+            column![
+                hero_header,
+                horizontal_rule(1),
+                albums_section,
+                horizontal_rule(1),
+                top_tracks_col,
+            ]
+            .spacing(18),
+        )
+        .height(Length::Fill);
 
         container(
             column![
-                vertical_space().height(Length::Fixed(20.0)),
-                header,
-                input,
-                scrollable(results_col).height(Length::Fill),
+                vertical_space().height(Length::Fixed(16.0)),
+                nav_bar,
+                body_scroll,
             ]
-            .spacing(18)
-            .padding(Padding::from([28, 36])),
+            .spacing(14)
+            .padding(Padding::from([24, 34])),
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -810,7 +1443,54 @@ impl GrooveApp {
         ]
         .align_y(Alignment::Center);
 
-        let mut playlist_cards = column![].spacing(10);
+        let mut featured_artists_row = row![].spacing(10);
+        for artist in self.search_artists.iter().take(3) {
+            let portrait = image(
+                self.artwork
+                    .thumb_or_url(artist.portrait_url.as_deref(), artist.artwork_theme),
+            )
+            .width(Length::Fixed(48.0))
+            .height(Length::Fixed(48.0));
+
+            let artist_btn = button(
+                row![
+                    portrait,
+                    column![
+                        text(&artist.name)
+                            .font(SERIF_FONT)
+                            .size(17)
+                            .color(palette::INK_PRIMARY),
+                        text("View Albums ›")
+                            .size(11.5)
+                            .color(palette::INK_SECONDARY),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::OpenArtist(artist.spotify_uri.clone()))
+            .width(Length::FillPortion(1))
+            .padding(Padding::from([8, 10]))
+            .style(theme::subtle_row_button(false));
+
+            featured_artists_row = featured_artists_row.push(artist_btn);
+        }
+
+        let mut playlist_cards = column![
+            text("Featured Artists")
+                .font(SERIF_FONT)
+                .size(22)
+                .color(palette::INK_PRIMARY),
+            featured_artists_row,
+            vertical_space().height(Length::Fixed(4.0)),
+            text("Playlists")
+                .font(SERIF_FONT)
+                .size(22)
+                .color(palette::INK_PRIMARY),
+        ]
+        .spacing(10);
         for playlist in &self.state.playlists {
             let card = button(
                 row![
@@ -842,12 +1522,13 @@ impl GrooveApp {
 
         container(
             column![
-                vertical_space().height(Length::Fixed(20.0)),
+                vertical_space().height(Length::Fixed(16.0)),
                 header,
+                self.view_spotify_auth_banner(),
                 scrollable(playlist_cards).height(Length::Fill),
             ]
-            .spacing(18)
-            .padding(Padding::from([28, 36])),
+            .spacing(14)
+            .padding(Padding::from([24, 34])),
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -875,9 +1556,12 @@ impl GrooveApp {
                 horizontal_space().width(Length::Fixed(14.0)).into()
             };
 
-            let cover = image(self.artwork.thumb_handle(track.artwork_theme))
-                .width(Length::Fixed(46.0))
-                .height(Length::Fixed(46.0));
+            let cover = image(
+                self.artwork
+                    .thumb_or_url(track.cover_art_url.as_deref(), track.artwork_theme),
+            )
+            .width(Length::Fixed(46.0))
+            .height(Length::Fixed(46.0));
 
             let meta = column![
                 text(&track.title).size(14).color(palette::INK_PRIMARY),

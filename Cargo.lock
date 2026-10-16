@@ -1867,12 +1867,14 @@ name = "groove-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs 5.0.1",
  "flume",
  "groove-audio",
  "groove-core",
  "groove-spotify",
  "iced",
  "image 0.25.10",
+ "reqwest",
  "tokio",
  "tracing",
  "tracing-subscriber",

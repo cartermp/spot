@@ -100,6 +100,69 @@ pub struct Playlist {
     pub artwork_theme: ArtworkTheme,
 }
 
+/// Summary card for an artist in Search or Artist view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtistSummary {
+    pub id: String,
+    pub spotify_uri: String,
+    pub name: String,
+    pub genres: Vec<String>,
+    pub followers: Option<u64>,
+    pub portrait_url: Option<String>,
+    pub artwork_theme: ArtworkTheme,
+}
+
+impl ArtistSummary {
+    pub fn subtitle(&self) -> String {
+        if !self.genres.is_empty() {
+            self.genres
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" · ")
+        } else if let Some(followers) = self.followers {
+            format!("{} followers", format_compact_count(followers))
+        } else {
+            "Artist".to_string()
+        }
+    }
+}
+
+/// Summary card for an album or single belonging to an artist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlbumSummary {
+    pub id: String,
+    pub spotify_uri: String,
+    pub title: String,
+    pub artist_name: String,
+    pub release_year: String,
+    pub album_type: String,
+    pub track_count: usize,
+    pub cover_art_url: Option<String>,
+    pub artwork_theme: ArtworkTheme,
+}
+
+/// Full artist profile including portrait, bio, top tracks, and discography albums.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtistDetail {
+    pub artist: ArtistSummary,
+    pub biography: Option<String>,
+    pub top_tracks: Vec<Track>,
+    pub albums: Vec<AlbumSummary>,
+}
+
+/// Formats follower counts compactly (e.g. `1.4M`, `284K`).
+pub fn format_compact_count(count: u64) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}K", count as f64 / 1_000.0)
+    } else {
+        count.to_string()
+    }
+}
+
 /// Local CoreAudio output device or Spotify Connect remote target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioDevice {
@@ -133,17 +196,38 @@ pub enum ConnectionStatus {
 impl ConnectionStatus {
     pub fn display_label(&self) -> String {
         match self {
-            ConnectionStatus::Connected { username, .. } => format!("Connected as {username}"),
+            ConnectionStatus::Connected {
+                username,
+                live_session: true,
+                ..
+            } => format!("Connected as {username}"),
+            ConnectionStatus::Connected {
+                username,
+                live_session: false,
+                ..
+            } => format!("Preview ({username}) · Click to login"),
             ConnectionStatus::Connecting { status } => status.clone(),
             ConnectionStatus::Disconnected {
                 reason: Some(reason),
-            } => format!("Offline ({reason})"),
-            ConnectionStatus::Disconnected { reason: None } => "Click to connect Premium".to_string(),
+            } => format!("Login failed ({reason})"),
+            ConnectionStatus::Disconnected { reason: None } => {
+                "Sign in with Spotify Premium".to_string()
+            }
         }
     }
 
     pub fn is_connected(&self) -> bool {
         matches!(self, ConnectionStatus::Connected { .. })
+    }
+
+    pub fn is_live_session(&self) -> bool {
+        matches!(
+            self,
+            ConnectionStatus::Connected {
+                live_session: true,
+                ..
+            }
+        )
     }
 }
 
@@ -387,9 +471,16 @@ pub enum PlayerCommand {
     CycleRepeat,
     ToggleLikeCurrent,
     SelectQueueTrack(String),
+    PlayTrack(Track),
     SelectPlaylist(String),
+    SelectArtist(String),
+    PlayAlbum(String),
     SelectOutputDevice(AudioDevice),
-    AuthenticateSpotify { client_id: Option<String> },
+    AuthenticateSpotify {
+        client_id: Option<String>,
+        force_reauth: bool,
+    },
+    LogoutSpotify,
     SearchCatalog(String),
     RefreshDevices,
 }
@@ -405,7 +496,13 @@ pub enum EngineEvent {
     PlaylistsLoaded(Vec<Playlist>),
     DevicesUpdated(Vec<AudioDevice>),
     ConnectionUpdated(ConnectionStatus),
-    SearchResults { query: String, tracks: Vec<Track> },
+    SearchResults {
+        query: String,
+        artists: Vec<ArtistSummary>,
+        albums: Vec<AlbumSummary>,
+        tracks: Vec<Track>,
+    },
+    ArtistDetailLoaded(Box<ArtistDetail>),
 }
 
 /// Formats seconds as `M:SS` (e.g., `2:17`, `4:28`).

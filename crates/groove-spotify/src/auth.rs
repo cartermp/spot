@@ -1,5 +1,8 @@
 use std::fs;
+use std::io::Write;
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use librespot_core::{
     authentication::Credentials,
@@ -8,6 +11,7 @@ use librespot_core::{
     session::Session,
 };
 use librespot_oauth::OAuthClientBuilder;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -55,22 +59,71 @@ pub struct AppCachePaths {
     pub root_dir: PathBuf,
     pub credentials_dir: PathBuf,
     pub audio_cache_dir: PathBuf,
+    pub image_cache_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedOAuthToken {
+    access_token: String,
+    refresh_token: String,
+    expires_in_secs: u64,
+    saved_at_unix_secs: u64,
 }
 
 impl AppCachePaths {
     /// Returns the Groove application data directories:
     /// `dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("Groove")`
-    /// with `credentials` and `audio_cache` subdirectories.
+    /// with `credentials`, `audio_cache`, and `image_cache` subdirectories.
     pub fn resolve() -> Self {
         let root_dir = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("Groove");
         let credentials_dir = root_dir.join("credentials");
         let audio_cache_dir = root_dir.join("audio_cache");
+        let image_cache_dir = root_dir.join("image_cache");
         Self {
             root_dir,
             credentials_dir,
             audio_cache_dir,
+            image_cache_dir,
+        }
+    }
+
+    pub fn oauth_token_path(&self) -> PathBuf {
+        self.credentials_dir.join("oauth_token.json")
+    }
+
+    pub fn save_oauth_token(&self, access_token: &str, refresh_token: &str, expires_at: Instant) {
+        let expires_in_secs = expires_at
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::from_secs(3600))
+            .as_secs();
+        let saved_at_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let payload = PersistedOAuthToken {
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.to_string(),
+            expires_in_secs,
+            saved_at_unix_secs,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&payload) {
+            let _ = fs::write(self.oauth_token_path(), json);
+        }
+    }
+
+    pub fn load_valid_oauth_token(&self) -> Option<String> {
+        let raw = fs::read_to_string(self.oauth_token_path()).ok()?;
+        let parsed: PersistedOAuthToken = serde_json::from_str(&raw).ok()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now + 90 < parsed.saved_at_unix_secs + parsed.expires_in_secs {
+            Some(parsed.access_token)
+        } else {
+            None
         }
     }
 }
@@ -89,6 +142,7 @@ pub fn open_cache() -> Result<(Cache, AppCachePaths), SpotifyAuthError> {
     let paths = AppCachePaths::resolve();
     let _ = fs::create_dir_all(&paths.credentials_dir);
     let _ = fs::create_dir_all(&paths.audio_cache_dir);
+    let _ = fs::create_dir_all(&paths.image_cache_dir);
 
     let creds_dir = paths.credentials_dir.clone();
     let audio_cache_dir = paths.audio_cache_dir.clone();
@@ -108,6 +162,42 @@ pub fn open_cache() -> Result<(Cache, AppCachePaths), SpotifyAuthError> {
 pub fn cached_credentials() -> Option<Credentials> {
     let (cache, _) = open_cache().ok()?;
     cache.credentials()
+}
+
+/// Clears stored credentials and OAuth tokens on disk so the user can sign out or switch accounts.
+pub fn clear_cached_credentials() {
+    let paths = AppCachePaths::resolve();
+    let _ = fs::remove_file(paths.credentials_dir.join("credentials.json"));
+    let _ = fs::remove_file(paths.oauth_token_path());
+}
+
+/// Obtains a fresh Spotify Web API Bearer token from an active `Session` via `login5`,
+/// falling back to any valid persisted OAuth token on disk.
+pub async fn obtain_session_access_token(
+    session: &Session,
+    paths: &AppCachePaths,
+) -> Option<String> {
+    match session.login5().auth_token().await {
+        Ok(token) if !token.access_token.is_empty() => {
+            info!("Obtained fresh Spotify Web API token via login5");
+            return Some(token.access_token);
+        }
+        Ok(_) => {}
+        Err(err) => {
+            warn!("login5 token lookup returned: {err}; checking persisted OAuth token");
+        }
+    }
+    paths.load_valid_oauth_token()
+}
+
+/// Releases any previous unfinished loopback listener on `127.0.0.1:8898` before starting a new OAuth dance.
+fn release_stale_loopback_listener() {
+    let addr: SocketAddr = "127.0.0.1:8898".parse().expect("valid socket addr");
+    if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(80)) {
+        let _ = stream.write_all(b"GET /cancel HTTP/1.1\r\nHost: 127.0.0.1:8898\r\n\r\n");
+        let _ = stream.flush();
+        std::thread::sleep(Duration::from_millis(40));
+    }
 }
 
 /// Builds a `SessionConfig` using Groove's app data directory and optional custom client ID.
@@ -156,50 +246,56 @@ pub async fn try_connect_cached(
         }
     };
 
+    let access_token = obtain_session_access_token(&session, &paths).await;
+
     Ok(Some(AuthenticatedSession {
         session,
         username,
-        access_token: None,
+        access_token,
     }))
 }
 
 /// Authenticates with Spotify Premium and connects a live `librespot_core::Session`.
 ///
-/// 1. First checks `cache.credentials()` for reusable cached credentials and tries connecting.
-/// 2. If no cached credentials exist (or cached connection fails), runs the interactive OAuth 2.0
+/// 1. When `force_reauth` is false, checks `cache.credentials()` for reusable cached credentials and tries connecting.
+/// 2. Otherwise (or if cached connection fails), runs the interactive OAuth 2.0
 ///    PKCE browser login on `tokio::task::spawn_blocking`, exchanges the code for an access token,
 ///    constructs `Credentials::with_access_token`, and connects & persists the `Session`.
 pub async fn authenticate_and_connect(
     client_id: Option<&str>,
+    force_reauth: bool,
 ) -> Result<AuthenticatedSession, SpotifyAuthError> {
     let (cache, paths) = open_cache()?;
     let session_config = build_session_config(&paths, client_id);
 
-    // 1. Try cached credentials first if present.
-    if let Some(cached_creds) = cache.credentials() {
-        info!("Attempting Spotify connection using cached credentials");
-        let cached_session = Session::new(session_config.clone(), Some(cache.clone()));
-        match cached_session.connect(cached_creds.clone(), false).await {
-            Ok(()) => {
-                let username = {
-                    let u = cached_session.username();
-                    if !u.is_empty() && u != "UNKNOWN" {
-                        u
-                    } else {
-                        cached_creds
-                            .username
-                            .unwrap_or_else(|| "Spotify Premium".to_string())
-                    }
-                };
-                info!("Connected to Spotify Premium from cache as '{username}'");
-                return Ok(AuthenticatedSession {
-                    session: cached_session,
-                    username,
-                    access_token: None,
-                });
-            }
-            Err(err) => {
-                warn!("Cached Spotify credentials failed ({err}); falling back to OAuth PKCE flow");
+    // 1. Try cached credentials first if present and not forcing browser re-auth.
+    if !force_reauth {
+        if let Some(cached_creds) = cache.credentials() {
+            info!("Attempting Spotify connection using cached credentials");
+            let cached_session = Session::new(session_config.clone(), Some(cache.clone()));
+            match cached_session.connect(cached_creds.clone(), false).await {
+                Ok(()) => {
+                    let username = {
+                        let u = cached_session.username();
+                        if !u.is_empty() && u != "UNKNOWN" {
+                            u
+                        } else {
+                            cached_creds
+                                .username
+                                .unwrap_or_else(|| "Spotify Premium".to_string())
+                        }
+                    };
+                    let access_token = obtain_session_access_token(&cached_session, &paths).await;
+                    info!("Connected to Spotify Premium from cache as '{username}'");
+                    return Ok(AuthenticatedSession {
+                        session: cached_session,
+                        username,
+                        access_token,
+                    });
+                }
+                Err(err) => {
+                    warn!("Cached Spotify credentials failed ({err}); falling back to OAuth PKCE flow");
+                }
             }
         }
     }
@@ -210,11 +306,12 @@ pub async fn authenticate_and_connect(
 
     info!("Starting Spotify OAuth PKCE login (redirect_uri={redirect_uri})");
     let token = tokio::task::spawn_blocking(move || {
+        release_stale_loopback_listener();
         let scopes: Vec<&str> = SPOTIFY_OAUTH_SCOPES.to_vec();
         let oauth_client = OAuthClientBuilder::new(&resolved_client_id, &redirect_uri, scopes)
             .open_in_browser()
             .with_custom_message(
-                "<html><body style=\"background:#12131a;color:#f5f5f7;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;\"><div><h2>Connected to Groove</h2><p>You can close this browser tab and return to Groove.</p></div></body></html>",
+                "<!doctype html><html><body style=\"background:#F4F2EE;color:#191918;font-family:-apple-system,BlinkMacSystemFont,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;\"><div style=\"background:#FBF9F6;padding:40px 48px;border-radius:20px;box-shadow:0 12px 32px rgba(0,0,0,0.06);text-align:center;max-width:420px;\"><h2 style=\"margin:0 0 12px;font-size:24px;\"><span style=\"display:inline-block;width:11px;height:11px;border-radius:50%;background:#48A868;margin-right:8px;\"></span>Connected to Groove</h2><p style=\"color:#7C7A75;margin:0;line-height:1.5;\">Your Spotify Premium session is active. You can close this browser tab and return to Groove.</p></div></body></html>",
             )
             .build()
             .map_err(|e| SpotifyAuthError::OAuth(e.to_string()))?;
@@ -226,6 +323,7 @@ pub async fn authenticate_and_connect(
     .await
     .map_err(|e| SpotifyAuthError::TaskJoin(e.to_string()))??;
 
+    paths.save_oauth_token(&token.access_token, &token.refresh_token, token.expires_at);
     let access_token = token.access_token.clone();
     let credentials = Credentials::with_access_token(token.access_token);
 
@@ -244,10 +342,14 @@ pub async fn authenticate_and_connect(
         }
     };
 
+    let resolved_token = obtain_session_access_token(&session, &paths)
+        .await
+        .or(Some(access_token));
+
     info!("Connected to Spotify Premium via OAuth PKCE as '{username}'");
     Ok(AuthenticatedSession {
         session,
         username,
-        access_token: Some(access_token),
+        access_token: resolved_token,
     })
 }

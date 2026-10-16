@@ -1,12 +1,17 @@
 use groove_core::ArtworkTheme;
 use iced::widget::image;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 
-/// Caches procedurally rendered, anti-aliased rounded album art handles so they are computed once
-/// at startup and rendered as GPU textures at 120 FPS with zero runtime overhead.
+/// Caches procedurally rendered and remotely fetched rounded album/artist artwork handles
+/// so they are rendered as GPU textures at 120 FPS with zero runtime overhead.
 pub struct ArtworkCache {
     hero: HashMap<ArtworkTheme, image::Handle>,
     thumb: HashMap<ArtworkTheme, image::Handle>,
+    remote: HashMap<String, image::Handle>,
+    in_flight: HashSet<String>,
 }
 
 impl Default for ArtworkCache {
@@ -39,7 +44,12 @@ impl ArtworkCache {
             thumb.insert(theme, render_artwork(theme, 72, 12.0));
         }
 
-        Self { hero, thumb }
+        Self {
+            hero,
+            thumb,
+            remote: HashMap::new(),
+            in_flight: HashSet::new(),
+        }
     }
 
     pub fn hero_handle(&self, theme: ArtworkTheme) -> image::Handle {
@@ -55,6 +65,114 @@ impl ArtworkCache {
             .cloned()
             .unwrap_or_else(|| render_artwork(theme, 72, 12.0))
     }
+
+    /// Returns a downloaded remote cover/portrait handle if cached, or falls back to the hero theme.
+    pub fn hero_or_url(&self, url: Option<&str>, theme: ArtworkTheme) -> image::Handle {
+        if let Some(u) = url {
+            if let Some(handle) = self.remote.get(u) {
+                return handle.clone();
+            }
+        }
+        self.hero_handle(theme)
+    }
+
+    /// Returns a downloaded remote cover/portrait handle if cached, or falls back to the thumbnail theme.
+    pub fn thumb_or_url(&self, url: Option<&str>, theme: ArtworkTheme) -> image::Handle {
+        if let Some(u) = url {
+            if let Some(handle) = self.remote.get(u) {
+                return handle.clone();
+            }
+        }
+        self.thumb_handle(theme)
+    }
+
+    /// Marks a remote artwork URL as in-flight if not already cached or downloading.
+    /// Returns `true` if a new download task should be spawned.
+    pub fn mark_in_flight(&mut self, url: &str) -> bool {
+        let trimmed = url.trim();
+        if trimmed.is_empty() || self.remote.contains_key(trimmed) {
+            return false;
+        }
+        self.in_flight.insert(trimmed.to_string())
+    }
+
+    /// Inserts a decoded remote artwork handle into the cache.
+    pub fn insert_remote(&mut self, url: String, handle: image::Handle) {
+        self.in_flight.remove(&url);
+        self.remote.insert(url, handle);
+    }
+}
+
+/// Downloads an album cover or artist portrait from `url` (using an on-disk cache under
+/// `~/Library/Application Support/Groove/image_cache`), decodes it, and applies anti-aliased
+/// rounded corners.
+pub async fn download_and_decode_artwork(url: String) -> Option<(String, image::Handle)> {
+    let trimmed = url.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let disk_path = disk_cache_path_for_url(&trimmed);
+    let raw_bytes = if let Some(existing) = disk_path
+        .as_ref()
+        .and_then(|p| fs::read(p).ok())
+        .filter(|b| !b.is_empty())
+    {
+        existing
+    } else {
+        let resp = reqwest::get(&trimmed).await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let bytes = resp.bytes().await.ok()?.to_vec();
+        if let Some(path) = &disk_path {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(path, &bytes);
+        }
+        bytes
+    };
+
+    let url_clone = trimmed.clone();
+    let handle = tokio::task::spawn_blocking(move || decode_rounded_rgba(&raw_bytes, 300, 16.0))
+        .await
+        .ok()??;
+
+    Some((url_clone, handle))
+}
+
+fn disk_cache_path_for_url(url: &str) -> Option<PathBuf> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut hasher);
+    let hash = hasher.finish();
+    let base = dirs::data_dir()?.join("Groove").join("image_cache");
+    Some(base.join(format!("art_{hash:016x}.img")))
+}
+
+fn decode_rounded_rgba(bytes: &[u8], target_size: u32, corner_radius: f32) -> Option<image::Handle> {
+    let dyn_img = ::image::load_from_memory(bytes).ok()?;
+    let resized = dyn_img.resize_to_fill(
+        target_size,
+        target_size,
+        ::image::imageops::FilterType::Triangle,
+    );
+    let mut rgba = resized.to_rgba8().into_raw();
+    let s = target_size as f32;
+    let half = s * 0.5;
+
+    for py in 0..target_size {
+        for px in 0..target_size {
+            let dx = (px as f32 + 0.5 - half).abs() - (half - corner_radius);
+            let dy = (py as f32 + 0.5 - half).abs() - (half - corner_radius);
+            let dist = (dx.max(0.0).hypot(dy.max(0.0)) + dx.min(dy).min(0.0)) - corner_radius;
+            let alpha = (0.5 - dist).clamp(0.0, 1.0);
+            let idx = ((py * target_size + px) * 4 + 3) as usize;
+            rgba[idx] = ((rgba[idx] as f32 / 255.0) * alpha * 255.0) as u8;
+        }
+    }
+
+    Some(image::Handle::from_rgba(target_size, target_size, rgba))
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
