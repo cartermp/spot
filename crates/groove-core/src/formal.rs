@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArtworkTheme, AudioDevice, PlaybackState, PodcastEpisode, PodcastShowDetail, RepeatMode,
-    SpectrumFrame, Track,
+    AlbumPlaybackQueue, ArtworkTheme, AudioDevice, PlaybackContext, PlaybackState, PodcastEpisode,
+    PodcastShowDetail, RepeatMode, SpectrumFrame, Track,
 };
 
 /// Detailed error returned when a formal state invariant is violated.
@@ -142,12 +142,139 @@ pub fn sanitize_pcm_sample(sample: f32) -> f32 {
 /// Formal Guarantees:
 /// - **INV-P2 / INV-P3**: Resets `position_secs` to `0.0`.
 /// - **INV-P4**: When `!state.queue.is_empty()`, `state.current_track` is always a member of `state.queue`.
+/// - **INV-P5**: Advancing never activates a playlist when `state.context` is not `PlaybackContext::Playlist`.
 /// - **INV-P8**: Under `shuffle == true`, forward and backward steps are exact modular inverses and form a single full cycle of length `queue.len()`.
-/// - **INV-P9**: When `auto_ended == true`, `repeat == RepeatMode::Off`, and `!shuffle` on the final track of the queue, playback stops cleanly (`is_playing = false`) at the start of the queue instead of looping infinitely.
+/// - **INV-P9**: In `Playlist` / `PodcastShow` / `None` contexts, when `auto_ended == true`, `repeat == RepeatMode::Off`, and `!shuffle` on the final track of the queue, playback stops cleanly (`is_playing = false`) at the start of the queue.
+/// - **INV-P10 / INV-P11 / INV-P12**: In `PlaybackContext::Album`:
+///   1. While tracks remain in the active album (`current_idx + 1 < queue.len()`), advancing moves to the next track in that same album (`Up Next` stays that album).
+///   2. When the active album finishes (`current_idx + 1 >= queue.len()`), if another album by that artist exists (`current_album_index + 1 < artist_albums.len()`), advancing moves to Track 0 of the next album by that artist and updates `Up Next` (`state.queue`) to that next album's tracks.
+///   3. Once all albums by that artist have been played through (`current_album_index + 1 >= artist_albums.len()`), advancing with `RepeatMode::Off` and `!shuffle` marks `exhausted = true` and sets `is_playing = false` (plays nothing).
 pub fn advance_queue_verified(state: &mut PlaybackState, forward: bool, auto_ended: bool) {
     state.position_secs = 0.0;
     // Natural track completion (`auto_ended == true`) always progresses forward.
     let forward = forward || auto_ended;
+
+    if let PlaybackContext::Album {
+        ref mut artist_albums,
+        ref mut current_album_index,
+        ref mut exhausted,
+        ..
+    } = state.context
+    {
+        if artist_albums.is_empty() || state.queue.is_empty() {
+            *exhausted = true;
+            state.is_playing = false;
+            return;
+        }
+
+        if *current_album_index >= artist_albums.len() {
+            *current_album_index = artist_albums.len() - 1;
+        }
+        let k = *current_album_index;
+        let album_count = artist_albums.len();
+        let len = state.queue.len();
+        let current_idx = state
+            .queue
+            .iter()
+            .position(|t| t.id == state.current_track.id)
+            .unwrap_or(0);
+
+        if auto_ended && state.repeat == RepeatMode::Track {
+            *exhausted = false;
+            state.current_track = state.queue[current_idx].clone();
+            state.is_playing = true;
+            return;
+        }
+
+        if state.shuffle && len > 1 {
+            *exhausted = false;
+            let step = coprime_shuffle_step(len);
+            let next_idx = if forward {
+                (current_idx + step) % len
+            } else {
+                (current_idx + len - step) % len
+            };
+            state.current_track = state.queue[next_idx].clone();
+            if auto_ended {
+                state.is_playing = true;
+            }
+            return;
+        }
+
+        if forward {
+            if *exhausted {
+                if state.repeat == RepeatMode::Context {
+                    *current_album_index = 0;
+                    state.queue = artist_albums[0].tracks.clone();
+                    state.current_track = state.queue[0].clone();
+                    *exhausted = false;
+                    if auto_ended {
+                        state.is_playing = true;
+                    }
+                } else {
+                    // Already went through all albums by this artist: play nothing.
+                    state.is_playing = false;
+                }
+                return;
+            }
+
+            if current_idx + 1 < len {
+                // Next track within the current album
+                state.current_track = state.queue[current_idx + 1].clone();
+                if auto_ended {
+                    state.is_playing = true;
+                }
+            } else if k + 1 < album_count {
+                // Current album is over -> move to the next album by this artist
+                let next_album_idx = k + 1;
+                *current_album_index = next_album_idx;
+                state.queue = artist_albums[next_album_idx].tracks.clone();
+                state.current_track = state.queue[0].clone();
+                *exhausted = false;
+                if auto_ended {
+                    state.is_playing = true;
+                }
+            } else if state.repeat == RepeatMode::Context {
+                // Explicit Repeat::Context wraps around to the artist's first album
+                *current_album_index = 0;
+                state.queue = artist_albums[0].tracks.clone();
+                state.current_track = state.queue[0].clone();
+                *exhausted = false;
+                if auto_ended {
+                    state.is_playing = true;
+                }
+            } else {
+                // Gone through all albums by this artist -> stop and play nothing
+                if let Some(last_track) = state.queue.last().cloned() {
+                    state.current_track = last_track;
+                }
+                *exhausted = true;
+                state.is_playing = false;
+            }
+        } else {
+            // Backward (`PreviousTrack`)
+            if *exhausted {
+                *exhausted = false;
+                if let Some(last_track) = state.queue.last().cloned() {
+                    state.current_track = last_track;
+                }
+                return;
+            }
+            if current_idx > 0 {
+                state.current_track = state.queue[current_idx - 1].clone();
+            } else if k > 0 {
+                let prev_album_idx = k - 1;
+                *current_album_index = prev_album_idx;
+                state.queue = artist_albums[prev_album_idx].tracks.clone();
+                if let Some(last_track) = state.queue.last().cloned() {
+                    state.current_track = last_track;
+                }
+            } else {
+                state.current_track = state.queue[0].clone();
+            }
+        }
+        return;
+    }
 
     if state.queue.is_empty() {
         if auto_ended && state.repeat == RepeatMode::Off {
@@ -196,6 +323,68 @@ pub fn advance_queue_verified(state: &mut PlaybackState, forward: bool, auto_end
     if auto_ended {
         state.is_playing = true;
     }
+}
+
+fn albums_match_identity(a: &AlbumPlaybackQueue, b: &AlbumPlaybackQueue) -> bool {
+    (!a.album_uri.trim().is_empty()
+        && !b.album_uri.trim().is_empty()
+        && a.album_uri.trim().eq_ignore_ascii_case(b.album_uri.trim()))
+        || (!a.album_title.trim().is_empty()
+            && !b.album_title.trim().is_empty()
+            && a.album_title
+                .trim()
+                .eq_ignore_ascii_case(b.album_title.trim()))
+}
+
+/// Normalizes an `AlbumPlaybackQueue` so every track has a non-empty unique ID within the album
+/// and the album metadata is non-empty. Returns `None` if the album has no valid tracks.
+pub fn normalize_album_playback_queue(mut album: AlbumPlaybackQueue) -> Option<AlbumPlaybackQueue> {
+    let mut dedup_tracks: Vec<Track> = Vec::with_capacity(album.tracks.len());
+    for (idx, mut t) in album.tracks.into_iter().enumerate() {
+        if t.id.trim().is_empty() {
+            if !t.spotify_uri.trim().is_empty() {
+                t.id = t.spotify_uri.trim().to_string();
+            } else if !t.title.trim().is_empty() {
+                t.id = format!("album-track-{idx}-{}", t.title.trim());
+            } else {
+                continue;
+            }
+        }
+        if !dedup_tracks.iter().any(|existing| existing.id == t.id) {
+            dedup_tracks.push(t);
+        }
+    }
+    if dedup_tracks.is_empty() {
+        return None;
+    }
+
+    album.album_title = album.album_title.trim().to_string();
+    if album.album_title.is_empty() {
+        let from_track = dedup_tracks[0].album.trim();
+        album.album_title = if from_track.is_empty() {
+            "Album".to_string()
+        } else {
+            from_track.to_string()
+        };
+    }
+
+    album.album_uri = album.album_uri.trim().to_string();
+    if album.album_uri.is_empty() {
+        album.album_uri = format!("spotify:album:{}", album.album_title);
+    }
+
+    album.artist_name = album.artist_name.trim().to_string();
+    if album.artist_name.is_empty() {
+        let from_track = dedup_tracks[0].artist.trim();
+        album.artist_name = if from_track.is_empty() {
+            "Artist".to_string()
+        } else {
+            from_track.to_string()
+        };
+    }
+
+    album.tracks = dedup_tracks;
+    Some(album)
 }
 
 /// Pure, verified device list merger that guarantees `INV-P6` (`!devices.is_empty()`,
@@ -287,7 +476,7 @@ pub fn select_device_verified(state: &mut PlaybackState, mut device: AudioDevice
     }
 }
 
-/// Applies a pure synchronous state transition on `PlaybackState` and preserves all invariants `INV-P1..INV-P9`.
+/// Applies a pure synchronous state transition on `PlaybackState` and preserves all invariants `INV-P1..INV-P12`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VerifiedTransportAction {
     Play,
@@ -309,26 +498,79 @@ pub enum VerifiedTransportAction {
         tracks: Vec<Track>,
         auto_play: bool,
     },
+    ActivateAlbum {
+        album: AlbumPlaybackQueue,
+        artist_uri: Option<String>,
+        artist_albums: Vec<AlbumPlaybackQueue>,
+        start_track_index: usize,
+        auto_play: bool,
+    },
+    SetArtistDiscography {
+        artist_name: String,
+        artist_uri: Option<String>,
+        albums: Vec<AlbumPlaybackQueue>,
+    },
+    ActivatePodcastShow {
+        show_uri: String,
+        show_title: String,
+        episodes: Vec<Track>,
+        start_episode_index: usize,
+        auto_play: bool,
+    },
     SelectDevice(AudioDevice),
 }
 
 impl PlaybackState {
+    fn clear_playlist_context(&mut self) {
+        for playlist in &mut self.playlists {
+            playlist.is_playing_context = false;
+        }
+        self.active_playlist_id = None;
+    }
+
+    fn resume_if_album_exhausted(&mut self) {
+        if let PlaybackContext::Album {
+            ref artist_albums,
+            ref mut current_album_index,
+            ref mut exhausted,
+            ..
+        } = self.context
+        {
+            if *exhausted {
+                *exhausted = false;
+                if !artist_albums.is_empty() {
+                    *current_album_index = 0;
+                    self.queue = artist_albums[0].tracks.clone();
+                    if let Some(first) = self.queue.first().cloned() {
+                        self.current_track = first;
+                    }
+                }
+                self.position_secs = 0.0;
+            }
+        }
+    }
+
     /// Executes a verified transport action on `self`, guaranteeing that `self.check_invariants()`
     /// holds after the transition whenever it held beforehand.
     pub fn apply_verified_action(&mut self, action: VerifiedTransportAction) {
         match action {
             VerifiedTransportAction::Play => {
+                self.resume_if_album_exhausted();
                 self.is_playing = true;
             }
             VerifiedTransportAction::Pause => {
                 self.is_playing = false;
             }
             VerifiedTransportAction::TogglePlayPause { has_loaded_track } => {
-                if !has_loaded_track && !self.is_playing {
-                    self.is_playing = true;
+                let target_playing = if !has_loaded_track && !self.is_playing {
+                    true
                 } else {
-                    self.is_playing = !self.is_playing;
+                    !self.is_playing
+                };
+                if target_playing {
+                    self.resume_if_album_exhausted();
                 }
+                self.is_playing = target_playing;
             }
             VerifiedTransportAction::NextTrack => {
                 advance_queue_verified(self, true, false);
@@ -340,9 +582,20 @@ impl PlaybackState {
                 advance_queue_verified(self, true, true);
             }
             VerifiedTransportAction::PositionTick(pos) => {
-                self.position_secs = sanitize_position_secs(pos, self.current_track.duration_secs);
+                if self.is_discography_exhausted() {
+                    self.position_secs = 0.0;
+                } else {
+                    self.position_secs =
+                        sanitize_position_secs(pos, self.current_track.duration_secs);
+                }
             }
             VerifiedTransportAction::SeekSeconds(pos) => {
+                if let PlaybackContext::Album {
+                    ref mut exhausted, ..
+                } = self.context
+                {
+                    *exhausted = false;
+                }
                 self.position_secs = sanitize_position_secs(pos, self.current_track.duration_secs);
             }
             VerifiedTransportAction::SetVolume(vol) => {
@@ -363,33 +616,119 @@ impl PlaybackState {
                         track.liked = liked;
                     }
                 }
+                if let PlaybackContext::Album {
+                    ref mut artist_albums,
+                    current_album_index,
+                    ..
+                } = self.context
+                {
+                    if let Some(active_album) = artist_albums.get_mut(current_album_index) {
+                        for track in &mut active_album.tracks {
+                            if track.id == current_id {
+                                track.liked = liked;
+                            }
+                        }
+                    }
+                }
             }
             VerifiedTransportAction::SelectQueueTrack(track_id) => {
                 if let Some(selected) = self
                     .queue
                     .iter()
-                    .find(|t| t.id == track_id || (!track_id.is_empty() && t.spotify_uri == track_id))
+                    .find(|t| {
+                        t.id == track_id || (!track_id.is_empty() && t.spotify_uri == track_id)
+                    })
                     .cloned()
                 {
+                    if let PlaybackContext::Album {
+                        ref mut exhausted, ..
+                    } = self.context
+                    {
+                        *exhausted = false;
+                    }
                     self.current_track = selected;
                     self.position_secs = 0.0;
                     self.is_playing = true;
                 }
             }
             VerifiedTransportAction::PlayTrack(mut track) => {
-                if let Some(existing) = self
-                    .queue
-                    .iter_mut()
-                    .find(|t| t.id == track.id || (!track.spotify_uri.is_empty() && t.spotify_uri == track.spotify_uri))
-                {
-                    track.liked = existing.liked;
-                    *existing = track.clone();
-                } else {
-                    self.queue.insert(0, track.clone());
+                if track.id.trim().is_empty() {
+                    track.id = if !track.spotify_uri.trim().is_empty() {
+                        track.spotify_uri.trim().to_string()
+                    } else {
+                        "standalone-track".to_string()
+                    };
                 }
-                self.current_track = track;
-                self.position_secs = 0.0;
-                self.is_playing = true;
+                let in_current_context = matches!(
+                    self.context,
+                    PlaybackContext::Album { .. }
+                        | PlaybackContext::Playlist { .. }
+                        | PlaybackContext::PodcastShow { .. }
+                ) && self.queue.iter().any(|t| {
+                    t.id == track.id
+                        || (!track.spotify_uri.is_empty() && t.spotify_uri == track.spotify_uri)
+                });
+
+                if in_current_context {
+                    if let Some(existing) = self.queue.iter().find(|t| {
+                        t.id == track.id
+                            || (!track.spotify_uri.is_empty() && t.spotify_uri == track.spotify_uri)
+                    }) {
+                        track = existing.clone();
+                    }
+                    if let PlaybackContext::Album {
+                        ref mut exhausted, ..
+                    } = self.context
+                    {
+                        *exhausted = false;
+                    }
+                    self.current_track = track;
+                    self.position_secs = 0.0;
+                    self.is_playing = true;
+                } else {
+                    // Playing an individual track outside a playlist clears playlist context
+                    // and isolates `Up Next` to that track's album context.
+                    self.clear_playlist_context();
+                    let album_title = if track.album.trim().is_empty() {
+                        track.title.clone()
+                    } else {
+                        track.album.trim().to_string()
+                    };
+                    let artist_name = if track.artist.trim().is_empty() {
+                        "Artist".to_string()
+                    } else {
+                        track.artist.trim().to_string()
+                    };
+                    if track.spotify_uri.starts_with("spotify:episode:") {
+                        self.context = PlaybackContext::PodcastShow {
+                            show_uri: format!("spotify:show:{album_title}"),
+                            show_title: album_title,
+                        };
+                        self.queue = vec![track.clone()];
+                        self.current_track = track;
+                        self.position_secs = 0.0;
+                        self.is_playing = true;
+                    } else if let Some(single_album) =
+                        normalize_album_playback_queue(AlbumPlaybackQueue {
+                            album_uri: format!("spotify:album:{album_title}"),
+                            album_title,
+                            artist_name: artist_name.clone(),
+                            tracks: vec![track.clone()],
+                        })
+                    {
+                        self.queue = single_album.tracks.clone();
+                        self.current_track = single_album.tracks[0].clone();
+                        self.position_secs = 0.0;
+                        self.is_playing = true;
+                        self.context = PlaybackContext::Album {
+                            artist_name,
+                            artist_uri: None,
+                            artist_albums: vec![single_album],
+                            current_album_index: 0,
+                            exhausted: false,
+                        };
+                    }
+                }
             }
             VerifiedTransportAction::ActivatePlaylist {
                 playlist_id,
@@ -408,8 +747,13 @@ impl PlaybackState {
                         matched_id = Some(playlist.id.clone());
                     }
                 }
-                self.active_playlist_id =
-                    matched_id.or_else(|| (!playlist_id.trim().is_empty()).then_some(playlist_id));
+                let resolved_id = matched_id
+                    .or_else(|| (!playlist_id.trim().is_empty()).then_some(playlist_id));
+                self.active_playlist_id = resolved_id.clone();
+                self.context = match resolved_id {
+                    Some(id) => PlaybackContext::Playlist { playlist_id: id },
+                    None => PlaybackContext::None,
+                };
 
                 if !tracks.is_empty() {
                     self.current_track = tracks[0].clone();
@@ -417,6 +761,153 @@ impl PlaybackState {
                     self.position_secs = 0.0;
                     self.is_playing = auto_play;
                 }
+            }
+            VerifiedTransportAction::ActivateAlbum {
+                album,
+                artist_uri,
+                artist_albums,
+                start_track_index,
+                auto_play,
+            } => {
+                let primary_opt = normalize_album_playback_queue(album);
+                let mut norm_albums: Vec<AlbumPlaybackQueue> = Vec::new();
+                for candidate in artist_albums {
+                    if let Some(norm) = normalize_album_playback_queue(candidate) {
+                        if !norm_albums
+                            .iter()
+                            .any(|existing| albums_match_identity(existing, &norm))
+                        {
+                            norm_albums.push(norm);
+                        }
+                    }
+                }
+
+                let current_album_index = if let Some(primary) = primary_opt {
+                    if let Some(pos) = norm_albums
+                        .iter()
+                        .position(|existing| albums_match_identity(existing, &primary))
+                    {
+                        norm_albums[pos] = primary;
+                        pos
+                    } else {
+                        norm_albums.insert(0, primary);
+                        0
+                    }
+                } else {
+                    0
+                };
+
+                if norm_albums.is_empty() {
+                    return;
+                }
+
+                self.clear_playlist_context();
+                let active_album = &norm_albums[current_album_index];
+                let track_idx = start_track_index.min(active_album.tracks.len() - 1);
+                let chosen_track = active_album.tracks[track_idx].clone();
+                let artist_name = active_album.artist_name.clone();
+
+                self.queue = active_album.tracks.clone();
+                self.current_track = chosen_track;
+                self.position_secs = 0.0;
+                self.is_playing = auto_play;
+                self.context = PlaybackContext::Album {
+                    artist_name,
+                    artist_uri,
+                    artist_albums: norm_albums,
+                    current_album_index,
+                    exhausted: false,
+                };
+            }
+            VerifiedTransportAction::SetArtistDiscography {
+                artist_name,
+                artist_uri,
+                albums,
+            } => {
+                if let PlaybackContext::Album {
+                    artist_name: ref mut cur_artist_name,
+                    artist_uri: ref mut cur_artist_uri,
+                    ref mut artist_albums,
+                    ref mut current_album_index,
+                    ref mut exhausted,
+                } = self.context
+                {
+                    if !artist_name.trim().is_empty()
+                        && !cur_artist_name.trim().is_empty()
+                        && !cur_artist_name
+                            .trim()
+                            .eq_ignore_ascii_case(artist_name.trim())
+                    {
+                        return;
+                    }
+                    let Some(current_active) = artist_albums.get(*current_album_index).cloned()
+                    else {
+                        return;
+                    };
+                    // Preserve the exact active album queue (including any liked flags)
+                    let active_preserved = AlbumPlaybackQueue {
+                        album_uri: current_active.album_uri,
+                        album_title: current_active.album_title,
+                        artist_name: current_active.artist_name,
+                        tracks: self.queue.clone(),
+                    };
+
+                    let mut norm_albums: Vec<AlbumPlaybackQueue> = Vec::new();
+                    for candidate in albums {
+                        if let Some(norm) = normalize_album_playback_queue(candidate) {
+                            if !norm_albums
+                                .iter()
+                                .any(|existing| albums_match_identity(existing, &norm))
+                            {
+                                norm_albums.push(norm);
+                            }
+                        }
+                    }
+
+                    let new_idx = if let Some(pos) = norm_albums
+                        .iter()
+                        .position(|existing| albums_match_identity(existing, &active_preserved))
+                    {
+                        norm_albums[pos] = active_preserved;
+                        pos
+                    } else {
+                        norm_albums.insert(0, active_preserved);
+                        0
+                    };
+
+                    if !artist_name.trim().is_empty() {
+                        *cur_artist_name = artist_name.trim().to_string();
+                    }
+                    if artist_uri.is_some() {
+                        *cur_artist_uri = artist_uri;
+                    }
+                    *artist_albums = norm_albums;
+                    *current_album_index = new_idx;
+                    if *exhausted && new_idx + 1 < artist_albums.len() {
+                        *exhausted = false;
+                    }
+                }
+            }
+            VerifiedTransportAction::ActivatePodcastShow {
+                show_uri,
+                show_title,
+                episodes,
+                start_episode_index,
+                auto_play,
+            } => {
+                if episodes.is_empty() {
+                    return;
+                }
+                self.clear_playlist_context();
+                let ep_idx = start_episode_index.min(episodes.len() - 1);
+                self.current_track = episodes[ep_idx].clone();
+                self.queue = episodes;
+                self.position_secs = 0.0;
+                self.is_playing = auto_play;
+                self.context = PlaybackContext::PodcastShow {
+                    show_uri,
+                    show_title,
+                };
             }
             VerifiedTransportAction::SelectDevice(device) => {
                 select_device_verified(self, device);
@@ -491,6 +982,7 @@ impl FormalInvariant for PlaybackState {
         }
 
         // INV-P5: At most one playlist has `is_playing_context == true`, and it matches `active_playlist_id`.
+        // Moreover, a playlist may only be active when `context == PlaybackContext::Playlist`.
         let active_contexts: Vec<&str> = self
             .playlists
             .iter()
@@ -517,6 +1009,117 @@ impl FormalInvariant for PlaybackState {
                         active_id, self.active_playlist_id
                     ),
                 });
+            }
+        }
+        match &self.context {
+            PlaybackContext::Playlist { playlist_id } => {
+                if self.active_playlist_id.as_deref() != Some(playlist_id.as_str()) {
+                    return Err(InvariantViolation {
+                        code: "INV-P5",
+                        subsystem: "PlaybackState",
+                        details: format!(
+                            "context is Playlist('{playlist_id}') but active_playlist_id={:?}",
+                            self.active_playlist_id
+                        ),
+                    });
+                }
+            }
+            PlaybackContext::Album { .. } | PlaybackContext::PodcastShow { .. } => {
+                if self.active_playlist_id.is_some() || !active_contexts.is_empty() {
+                    return Err(InvariantViolation {
+                        code: "INV-P5",
+                        subsystem: "PlaybackState",
+                        details: format!(
+                            "non-playlist context {:?} must not have active_playlist_id={:?} or active_contexts={:?}",
+                            self.context, self.active_playlist_id, active_contexts
+                        ),
+                    });
+                }
+            }
+            PlaybackContext::None => {}
+        }
+
+        // INV-P10: Album `Up Next` queue isolation (`state.queue == artist_albums[current_album_index].tracks`).
+        // INV-P11: Discography exhaustion silence (`exhausted ==> current_album_index + 1 == len && !is_playing && position_secs == 0.0`).
+        if let PlaybackContext::Album {
+            ref artist_albums,
+            current_album_index,
+            exhausted,
+            ..
+        } = self.context
+        {
+            if artist_albums.is_empty() {
+                return Err(InvariantViolation {
+                    code: "INV-P10",
+                    subsystem: "PlaybackState",
+                    details: "PlaybackContext::Album must contain at least one album in artist_albums"
+                        .to_string(),
+                });
+            }
+            if current_album_index >= artist_albums.len() {
+                return Err(InvariantViolation {
+                    code: "INV-P10",
+                    subsystem: "PlaybackState",
+                    details: format!(
+                        "current_album_index {current_album_index} is out of bounds for artist_albums len {}",
+                        artist_albums.len()
+                    ),
+                });
+            }
+            for (idx, alb) in artist_albums.iter().enumerate() {
+                if alb.tracks.is_empty() {
+                    return Err(InvariantViolation {
+                        code: "INV-P10",
+                        subsystem: "PlaybackState",
+                        details: format!("artist_albums[{idx}] ('{}') has empty tracks", alb.album_title),
+                    });
+                }
+            }
+            let active_album = &artist_albums[current_album_index];
+            if self.queue != active_album.tracks {
+                return Err(InvariantViolation {
+                    code: "INV-P10",
+                    subsystem: "PlaybackState",
+                    details: format!(
+                        "Up Next queue (len={}) does not match active album '{}' tracks (len={})",
+                        self.queue.len(),
+                        active_album.album_title,
+                        active_album.tracks.len()
+                    ),
+                });
+            }
+
+            if exhausted {
+                if current_album_index + 1 != artist_albums.len() {
+                    return Err(InvariantViolation {
+                        code: "INV-P11",
+                        subsystem: "PlaybackState",
+                        details: format!(
+                            "discography marked exhausted at album {} of {} before final album",
+                            current_album_index,
+                            artist_albums.len()
+                        ),
+                    });
+                }
+                if self.is_playing {
+                    return Err(InvariantViolation {
+                        code: "INV-P11",
+                        subsystem: "PlaybackState",
+                        details:
+                            "discography is exhausted (all albums finished) but is_playing == true"
+                                .to_string(),
+                    });
+                }
+                if self.position_secs != 0.0 {
+                    return Err(InvariantViolation {
+                        code: "INV-P11",
+                        subsystem: "PlaybackState",
+                        details: format!(
+                            "discography is exhausted but position_secs={} (expected 0.0)",
+                            self.position_secs
+                        ),
+                    });
+                }
             }
         }
 

@@ -21,11 +21,11 @@ use groove_core::{
     is_opaque_spotify_user_id, merge_devices_verified, normalize_spotify_episode_uri,
     normalize_spotify_show_uri, resolve_playable_track_candidate, sanitize_pcm_sample,
     sanitize_position_secs, sanitize_spotify_biography, sanitize_unit_float, summarize_artist_bio,
-    ArtworkTheme, AudioDevice, FormalInvariant, NavHistoryMachine, NavRouteTarget, PlaybackState,
-    Playlist, PodcastEpisode, PodcastShowDetail, PodcastShowSummary, RecentListenedItem,
-    RecentListenedKind, RecentListenedStore, RecentSearchEntry, RecentSearchKind,
-    RecentSearchStore, RepeatMode, SpectrumFrame, Track, TrayMenuSnapshot,
-    VerifiedTransportAction, RECENTLY_LISTENED_TOP_LIMIT, SPECTRUM_BANDS,
+    AlbumPlaybackQueue, ArtworkTheme, AudioDevice, FormalInvariant, NavHistoryMachine,
+    NavRouteTarget, PlaybackContext, PlaybackState, Playlist, PodcastEpisode, PodcastShowDetail,
+    PodcastShowSummary, RecentListenedItem, RecentListenedKind, RecentListenedStore,
+    RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode, SpectrumFrame, Track,
+    TrayMenuSnapshot, VerifiedTransportAction, RECENTLY_LISTENED_TOP_LIMIT, SPECTRUM_BANDS,
 };
 use groove_spotify::sink::AtomicVolumeScaler;
 use stateright::{Checker, Model, Property};
@@ -132,6 +132,12 @@ impl PlaybackTransportModel {
             })
             .collect();
         state.active_playlist_id = s.active_playlist.map(|idx| format!("pl-{idx}"));
+        state.context = match &state.active_playlist_id {
+            Some(id) => PlaybackContext::Playlist {
+                playlist_id: id.clone(),
+            },
+            None => PlaybackContext::None,
+        };
 
         let mut queue = Vec::with_capacity(s.queue_len as usize);
         for idx in 0..s.queue_len {
@@ -1846,6 +1852,495 @@ pub fn prove_recently_listened_store_invariants_proptest() -> ProofCertificate {
     }
 }
 
+// ============================================================================
+// 4. ALBUM QUEUE ISOLATION & ARTIST DISCOGRAPHY PROGRESSION (STATERIGHT + EXHAUSTIVE)
+// ============================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ContextKindModel {
+    Playlist,
+    Album {
+        album_idx: u8,
+        total_albums: u8,
+        exhausted: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DiscographyModelState {
+    pub context: ContextKindModel,
+    pub track_idx: u8,
+    pub queue_album_tag: String,
+    pub active_playlist_id: Option<String>,
+    pub is_playing: bool,
+    pub invariants_ok: bool,
+    pub queue_isolated_ok: bool,
+    pub exhaustion_silence_ok: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DiscographyModelAction {
+    ActivatePlaylist,
+    ActivateAlbum { start_album: u8, start_track: u8 },
+    PlayAlbumTrack(u8),
+    NextTrack,
+    PreviousTrack,
+    EndOfTrack,
+    TogglePlayPause,
+}
+
+pub struct AlbumDiscographyModel;
+
+impl AlbumDiscographyModel {
+    fn sample_artist_albums() -> Vec<AlbumPlaybackQueue> {
+        (0..3u8)
+            .map(|alb_idx| {
+                let tracks: Vec<Track> = (0..2u8)
+                    .map(|trk_idx| Track {
+                        id: format!("rtj-alb{alb_idx}-trk{trk_idx}"),
+                        spotify_uri: format!("spotify:track:rtj{alb_idx}{trk_idx}"),
+                        title: format!("Album {alb_idx} Track {trk_idx}"),
+                        artist: "Run The Jewels".into(),
+                        album: format!("Run The Jewels {}", alb_idx + 1),
+                        duration_secs: 200,
+                        liked: false,
+                        cover_art_url: None,
+                        artwork_theme: ArtworkTheme::SunriseMountainLake,
+                    })
+                    .collect();
+                AlbumPlaybackQueue {
+                    album_uri: format!("spotify:album:rtj{}", alb_idx + 1),
+                    album_title: format!("Run The Jewels {}", alb_idx + 1),
+                    artist_name: "Run The Jewels".into(),
+                    tracks,
+                }
+            })
+            .collect()
+    }
+
+    fn sample_playlist_tracks() -> Vec<Track> {
+        (0..3u8)
+            .map(|i| Track {
+                id: format!("pl-trk-{i}"),
+                spotify_uri: format!("spotify:track:pl{i}"),
+                title: format!("Playlist Song {i}"),
+                artist: "Various".into(),
+                album: "Playlist Compilation".into(),
+                duration_secs: 180,
+                liked: false,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::TwilightHorizon,
+            })
+            .collect()
+    }
+
+    fn materialize(s: &DiscographyModelState) -> PlaybackState {
+        let mut state = PlaybackState::mockup_default();
+        state.playlists = vec![Playlist {
+            id: "pl-jarvis".into(),
+            spotify_uri: "spotify:playlist:jarvis".into(),
+            name: "Jarvis Vibes".into(),
+            subtitle: "Mix".into(),
+            track_count: 3,
+            is_playing_context: s.active_playlist_id.as_deref() == Some("pl-jarvis"),
+            artwork_theme: ArtworkTheme::TwilightHorizon,
+        }];
+        state.active_playlist_id = s.active_playlist_id.clone();
+
+        match s.context {
+            ContextKindModel::Playlist => {
+                let pl_tracks = Self::sample_playlist_tracks();
+                let idx = (s.track_idx as usize).min(pl_tracks.len() - 1);
+                state.current_track = pl_tracks[idx].clone();
+                state.queue = pl_tracks;
+                state.is_playing = s.is_playing;
+                state.context = PlaybackContext::Playlist {
+                    playlist_id: "pl-jarvis".into(),
+                };
+            }
+            ContextKindModel::Album {
+                album_idx,
+                exhausted,
+                ..
+            } => {
+                let albums = Self::sample_artist_albums();
+                let a_idx = (album_idx as usize).min(albums.len() - 1);
+                let active_tracks = albums[a_idx].tracks.clone();
+                let t_idx = (s.track_idx as usize).min(active_tracks.len() - 1);
+                state.current_track = active_tracks[t_idx].clone();
+                state.queue = active_tracks;
+                state.is_playing = s.is_playing;
+                state.position_secs = 0.0;
+                state.context = PlaybackContext::Album {
+                    artist_name: "Run The Jewels".into(),
+                    artist_uri: Some("spotify:artist:rtj".into()),
+                    artist_albums: albums,
+                    current_album_index: a_idx,
+                    exhausted,
+                };
+            }
+        }
+        state
+    }
+
+    fn project(state: &PlaybackState) -> DiscographyModelState {
+        let invariants_ok = state.check_invariants().is_ok();
+        let track_idx = state
+            .queue
+            .iter()
+            .position(|t| t.id == state.current_track.id)
+            .unwrap_or(0) as u8;
+        let queue_album_tag = state
+            .queue
+            .first()
+            .map(|t| t.album.clone())
+            .unwrap_or_default();
+
+        let (context, queue_isolated_ok, exhaustion_silence_ok) = match &state.context {
+            PlaybackContext::Playlist { .. } => {
+                let isolated = state.active_playlist_id.as_deref() == Some("pl-jarvis")
+                    && state.queue.iter().all(|t| t.id.starts_with("pl-trk-"));
+                (ContextKindModel::Playlist, isolated, true)
+            }
+            PlaybackContext::Album {
+                artist_albums,
+                current_album_index,
+                exhausted,
+                ..
+            } => {
+                let expected_album = &artist_albums[*current_album_index];
+                let isolated = state.active_playlist_id.is_none()
+                    && !state.playlists.iter().any(|p| p.is_playing_context)
+                    && state.queue == expected_album.tracks
+                    && state.queue.iter().all(|t| !t.id.starts_with("pl-trk-"));
+                let silence_ok =
+                    !*exhausted || (!state.is_playing && *current_album_index + 1 == artist_albums.len());
+                (
+                    ContextKindModel::Album {
+                        album_idx: *current_album_index as u8,
+                        total_albums: artist_albums.len() as u8,
+                        exhausted: *exhausted,
+                    },
+                    isolated,
+                    silence_ok,
+                )
+            }
+            _ => (ContextKindModel::Playlist, false, false),
+        };
+
+        DiscographyModelState {
+            context,
+            track_idx,
+            queue_album_tag,
+            active_playlist_id: state.active_playlist_id.clone(),
+            is_playing: state.is_playing,
+            invariants_ok,
+            queue_isolated_ok,
+            exhaustion_silence_ok,
+        }
+    }
+}
+
+impl Model for AlbumDiscographyModel {
+    type State = DiscographyModelState;
+    type Action = DiscographyModelAction;
+
+    fn init_states(&self) -> Vec<Self::State> {
+        // Start in a playlist ("Jarvis Vibes") to verify that switching to an album
+        // completely replaces `Up Next` with the album's tracks and clears playlist context.
+        let mut init = PlaybackState::mockup_default();
+        init.playlists = vec![Playlist {
+            id: "pl-jarvis".into(),
+            spotify_uri: "spotify:playlist:jarvis".into(),
+            name: "Jarvis Vibes".into(),
+            subtitle: "Mix".into(),
+            track_count: 3,
+            is_playing_context: false,
+            artwork_theme: ArtworkTheme::TwilightHorizon,
+        }];
+        init.apply_verified_action(VerifiedTransportAction::ActivatePlaylist {
+            playlist_id: "pl-jarvis".into(),
+            tracks: Self::sample_playlist_tracks(),
+            auto_play: true,
+        });
+        vec![Self::project(&init)]
+    }
+
+    fn actions(&self, _state: &Self::State, actions: &mut Vec<Self::Action>) {
+        actions.push(DiscographyModelAction::ActivatePlaylist);
+        for start_album in 0..3u8 {
+            for start_track in 0..2u8 {
+                actions.push(DiscographyModelAction::ActivateAlbum {
+                    start_album,
+                    start_track,
+                });
+            }
+        }
+        actions.push(DiscographyModelAction::PlayAlbumTrack(0));
+        actions.push(DiscographyModelAction::PlayAlbumTrack(1));
+        actions.push(DiscographyModelAction::NextTrack);
+        actions.push(DiscographyModelAction::PreviousTrack);
+        actions.push(DiscographyModelAction::EndOfTrack);
+        actions.push(DiscographyModelAction::TogglePlayPause);
+    }
+
+    fn next_state(&self, last: &Self::State, action: Self::Action) -> Option<Self::State> {
+        let mut state = Self::materialize(last);
+        match action {
+            DiscographyModelAction::ActivatePlaylist => {
+                state.apply_verified_action(VerifiedTransportAction::ActivatePlaylist {
+                    playlist_id: "pl-jarvis".into(),
+                    tracks: Self::sample_playlist_tracks(),
+                    auto_play: true,
+                });
+            }
+            DiscographyModelAction::ActivateAlbum {
+                start_album,
+                start_track,
+            } => {
+                let all_albums = Self::sample_artist_albums();
+                let chosen_album = all_albums[start_album as usize].clone();
+                state.apply_verified_action(VerifiedTransportAction::ActivateAlbum {
+                    album: chosen_album,
+                    artist_uri: Some("spotify:artist:rtj".into()),
+                    artist_albums: all_albums,
+                    start_track_index: start_track as usize,
+                    auto_play: true,
+                });
+            }
+            DiscographyModelAction::PlayAlbumTrack(trk_idx) => {
+                let all_albums = Self::sample_artist_albums();
+                let active_alb_idx = match last.context {
+                    ContextKindModel::Album { album_idx, .. } => {
+                        (album_idx as usize).min(all_albums.len() - 1)
+                    }
+                    ContextKindModel::Playlist => 0,
+                };
+                if let Some(trk) = all_albums[active_alb_idx]
+                    .tracks
+                    .get(trk_idx as usize)
+                    .cloned()
+                {
+                    state.apply_verified_action(VerifiedTransportAction::PlayTrack(trk));
+                    state.apply_verified_action(VerifiedTransportAction::SetArtistDiscography {
+                        artist_name: "Run The Jewels".into(),
+                        artist_uri: Some("spotify:artist:rtj".into()),
+                        albums: all_albums,
+                    });
+                }
+            }
+            DiscographyModelAction::NextTrack => {
+                state.apply_verified_action(VerifiedTransportAction::NextTrack);
+            }
+            DiscographyModelAction::PreviousTrack => {
+                state.apply_verified_action(VerifiedTransportAction::PreviousTrack);
+            }
+            DiscographyModelAction::EndOfTrack => {
+                state.apply_verified_action(VerifiedTransportAction::EndOfTrack);
+            }
+            DiscographyModelAction::TogglePlayPause => {
+                state.apply_verified_action(VerifiedTransportAction::TogglePlayPause {
+                    has_loaded_track: true,
+                });
+            }
+        }
+        Some(Self::project(&state))
+    }
+
+    fn properties(&self) -> Vec<Property<Self>> {
+        vec![
+            Property::<Self>::always("INV-P5/P10: Album Up Next queue is strictly isolated from playlists", |_, s| {
+                s.invariants_ok && s.queue_isolated_ok
+            }),
+            Property::<Self>::always("INV-P11: Exhausted artist discography never plays anything", |_, s| {
+                s.exhaustion_silence_ok
+            }),
+            Property::<Self>::sometimes("Liveness: Artist discography reaches Album 2 (inter-album transition)", |_, s| {
+                matches!(
+                    s.context,
+                    ContextKindModel::Album {
+                        album_idx: 2,
+                        exhausted: false,
+                        ..
+                    }
+                )
+            }),
+            Property::<Self>::sometimes("Liveness: Artist discography reaches terminal exhaustion silence", |_, s| {
+                matches!(
+                    s.context,
+                    ContextKindModel::Album {
+                        album_idx: 2,
+                        exhausted: true,
+                        ..
+                    }
+                ) && !s.is_playing
+            }),
+        ]
+    }
+}
+
+/// Proof 16 (`MC-ALBUM-DISCOGRAPHY-16`): TLA+-style `stateright` explicit-state model checking
+/// AND exhaustive multi-album trajectory verification proving:
+/// - **INV-P5 & INV-P10 (Up Next Album Isolation)**: When playing an album, `Up Next` (`state.queue`)
+///   contains strictly that album's tracks (`artist_albums[current_album_index].tracks`), and never
+///   leaks playlist tracks. Only when in `PlaybackContext::Playlist` does playback move through a playlist.
+/// - **INV-P12 (Intra-Album & Inter-Album Artist Progression)**: Moving to the next track advances
+///   within the current album until the album ends, then automatically transitions to Track 0 of the
+///   next album by that artist and updates `Up Next` to that next album's tracks.
+/// - **INV-P11 (Discography Exhaustion Silence)**: Once all albums by that artist have been played
+///   through, advancing stops playback (`is_playing == false`, `exhausted == true`, `position_secs == 0.0`)
+///   and plays nothing.
+pub fn prove_album_discography_and_playlist_isolation_stateright() -> ProofCertificate {
+    let t0 = Instant::now();
+
+    // 1. Stateright explicit-state BFS model check across Playlist <-> Album transitions,
+    //    intra-album tracks, inter-album progression, and terminal exhaustion.
+    let checker = AlbumDiscographyModel.checker().spawn_bfs().join();
+    checker.assert_properties();
+    let mut explored = checker.unique_state_count();
+
+    // 2. Exhaustive trajectory proof across all discography shapes:
+    //    M in 1..=3 albums, each album having len in 1..=3 tracks, starting at any (k0, i0),
+    //    for both manual NextTrack and automatic EndOfTrack.
+    let mut shape_configs: Vec<Vec<usize>> = Vec::new();
+    for l0 in 1..=3usize {
+        shape_configs.push(vec![l0]);
+        for l1 in 1..=3usize {
+            shape_configs.push(vec![l0, l1]);
+            for l2 in 1..=3usize {
+                shape_configs.push(vec![l0, l1, l2]);
+            }
+        }
+    }
+
+    for track_counts in &shape_configs {
+        let albums: Vec<AlbumPlaybackQueue> = track_counts
+            .iter()
+            .enumerate()
+            .map(|(alb_idx, &trk_count)| {
+                let tracks: Vec<Track> = (0..trk_count)
+                    .map(|trk_idx| Track {
+                        id: format!("a{alb_idx}-t{trk_idx}"),
+                        spotify_uri: format!("spotify:track:a{alb_idx}t{trk_idx}"),
+                        title: format!("Album {alb_idx} Song {trk_idx}"),
+                        artist: "Artist".into(),
+                        album: format!("Album {alb_idx}"),
+                        duration_secs: 180,
+                        liked: false,
+                        cover_art_url: None,
+                        artwork_theme: ArtworkTheme::SunriseMountainLake,
+                    })
+                    .collect();
+                AlbumPlaybackQueue {
+                    album_uri: format!("spotify:album:{alb_idx}"),
+                    album_title: format!("Album {alb_idx}"),
+                    artist_name: "Artist".into(),
+                    tracks,
+                }
+            })
+            .collect();
+
+        for start_album in 0..albums.len() {
+            for start_track in 0..albums[start_album].tracks.len() {
+                for use_end_of_track in [false, true] {
+                    let mut state = PlaybackState::mockup_default();
+                    // Pre-populate a playlist first to prove ActivateAlbum purges playlist context
+                    state.playlists = vec![Playlist {
+                        id: "pl-1".into(),
+                        spotify_uri: "spotify:playlist:1".into(),
+                        name: "Playlist 1".into(),
+                        subtitle: "Sub".into(),
+                        track_count: 2,
+                        is_playing_context: false,
+                        artwork_theme: ArtworkTheme::SunriseMountainLake,
+                    }];
+                    state.apply_verified_action(VerifiedTransportAction::ActivatePlaylist {
+                        playlist_id: "pl-1".into(),
+                        tracks: AlbumDiscographyModel::sample_playlist_tracks(),
+                        auto_play: true,
+                    });
+                    assert_eq!(state.active_playlist_id.as_deref(), Some("pl-1"));
+
+                    // Activate album at (start_album, start_track)
+                    state.apply_verified_action(VerifiedTransportAction::ActivateAlbum {
+                        album: albums[start_album].clone(),
+                        artist_uri: Some("spotify:artist:test".into()),
+                        artist_albums: albums.clone(),
+                        start_track_index: start_track,
+                        auto_play: true,
+                    });
+                    state.assert_invariants();
+                    assert!(state.active_playlist_id.is_none());
+
+                    // Build expected flat sequence of (album_idx, track_idx) from (start_album, start_track)
+                    let mut expected_sequence: Vec<(usize, usize)> = Vec::new();
+                    for t_idx in start_track..albums[start_album].tracks.len() {
+                        expected_sequence.push((start_album, t_idx));
+                    }
+                    for (a_idx, album) in albums.iter().enumerate().skip(start_album + 1) {
+                        for t_idx in 0..album.tracks.len() {
+                            expected_sequence.push((a_idx, t_idx));
+                        }
+                    }
+
+                    // Step through every remaining track across the current album and subsequent albums by the artist
+                    for (step_idx, &(exp_alb, exp_trk)) in expected_sequence.iter().enumerate() {
+                        assert!(state.is_playing, "must be playing at step {step_idx}");
+                        assert!(!state.is_discography_exhausted());
+                        assert_eq!(
+                            state.queue, albums[exp_alb].tracks,
+                            "Up Next queue must equal active album {exp_alb}'s tracks"
+                        );
+                        assert_eq!(
+                            state.current_track.id,
+                            albums[exp_alb].tracks[exp_trk].id,
+                            "current_track must match expected (album={exp_alb}, track={exp_trk})"
+                        );
+
+                        if use_end_of_track {
+                            state.apply_verified_action(VerifiedTransportAction::EndOfTrack);
+                        } else {
+                            state.apply_verified_action(VerifiedTransportAction::NextTrack);
+                        }
+                        state.assert_invariants();
+                        explored += 1;
+                    }
+
+                    // Now we have gone through all albums by this artist:
+                    // Playback MUST have stopped (`!state.is_playing`) and `is_discography_exhausted()` MUST be true!
+                    assert!(state.is_discography_exhausted());
+                    assert!(!state.is_playing);
+                    assert_eq!(state.position_secs, 0.0);
+
+                    // Further NextTrack / EndOfTrack steps must remain silent and never play anything
+                    for _ in 0..3 {
+                        if use_end_of_track {
+                            state.apply_verified_action(VerifiedTransportAction::EndOfTrack);
+                        } else {
+                            state.apply_verified_action(VerifiedTransportAction::NextTrack);
+                        }
+                        state.assert_invariants();
+                        assert!(state.is_discography_exhausted());
+                        assert!(!state.is_playing);
+                        assert_eq!(state.position_secs, 0.0);
+                        explored += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    ProofCertificate {
+        id: "MC-ALBUM-DISCOGRAPHY-16",
+        subsystem: "groove-core::formal (Album Queue & Artist Discography)",
+        method: "Stateright BFS + Exhaustive Multi-Album Trajectory Proof",
+        theorem: "INV-P5/P10 (UpNextAlbumIsolation) & INV-P12 (NextArtistAlbum) & INV-P11 (ExhaustedSilence)",
+        states_or_cases_explored: explored,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        verified: true,
+    }
+}
+
 /// Runs the complete Groove formal verification suite and returns a structured [`VerificationSuiteReport`].
 pub fn run_all_formal_proofs() -> VerificationSuiteReport {
     let suite_start = Instant::now();
@@ -1865,6 +2360,7 @@ pub fn run_all_formal_proofs() -> VerificationSuiteReport {
         prove_word_deletion_account_and_tray_snapshot_proptest(),
         prove_podcast_uri_and_episode_track_invariants_proptest(),
         prove_recently_listened_store_invariants_proptest(),
+        prove_album_discography_and_playlist_isolation_stateright(),
     ];
 
     let total_states_or_cases = certificates
@@ -1888,6 +2384,6 @@ mod tests {
     fn formal_verification_suite_proves_all_theorems() {
         let report = run_all_formal_proofs();
         assert!(report.all_verified());
-        assert_eq!(report.certificates.len(), 15);
+        assert_eq!(report.certificates.len(), 16);
     }
 }

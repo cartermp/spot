@@ -10,12 +10,12 @@ use groove_audio::SpectrumAnalyzer;
 use groove_core::{
     delete_last_word_verified, format_compact_count, format_seconds, merge_devices_verified,
     sanitize_position_secs, sanitize_unit_float, select_device_verified, summarize_artist_bio,
-    AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, AudioDevice, ConnectionStatus,
-    EngineEvent, FormalInvariant, InvariantViolation, NavHistoryMachine, NavRouteTarget,
-    NavSection, PlaybackState, PlayerCommand, PodcastEpisode, PodcastShowDetail,
-    PodcastShowSummary, RecentListenedItem, RecentListenedKind, RecentListenedStore,
-    RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode, SpectrumFrame, Track,
-    VerifiedTransportAction, RECENTLY_LISTENED_TOP_LIMIT,
+    AlbumDetail, AlbumPlaybackQueue, AlbumSummary, ArtistDetail, ArtistSummary, AudioDevice,
+    ConnectionStatus, EngineEvent, FormalInvariant, InvariantViolation, NavHistoryMachine,
+    NavRouteTarget, NavSection, PlaybackContext, PlaybackState, PlayerCommand, PodcastEpisode,
+    PodcastShowDetail, PodcastShowSummary, RecentListenedItem, RecentListenedKind,
+    RecentListenedStore, RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode,
+    SpectrumFrame, Track, VerifiedTransportAction, RECENTLY_LISTENED_TOP_LIMIT,
 };
 use groove_spotify::{spawn_engine, EngineHandle};
 use iced::alignment::{Horizontal, Vertical};
@@ -734,9 +734,19 @@ impl GrooveApp {
                             let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
                         }
                         TrayAction::NextTrack => {
+                            self.state
+                                .apply_verified_action(VerifiedTransportAction::NextTrack);
+                            self.record_recently_listened_from_track(
+                                &self.state.current_track.clone(),
+                            );
                             let _ = self.engine.command_tx.send(PlayerCommand::NextTrack);
                         }
                         TrayAction::PreviousTrack => {
+                            self.state
+                                .apply_verified_action(VerifiedTransportAction::PreviousTrack);
+                            self.record_recently_listened_from_track(
+                                &self.state.current_track.clone(),
+                            );
                             let _ = self.engine.command_tx.send(PlayerCommand::PreviousTrack);
                         }
                         TrayAction::ToggleLike => {
@@ -813,10 +823,16 @@ impl GrooveApp {
             }
             Message::NextTrack => {
                 tracing::info!("[UI] NextTrack clicked");
+                self.state
+                    .apply_verified_action(VerifiedTransportAction::NextTrack);
+                self.record_recently_listened_from_track(&self.state.current_track.clone());
                 let _ = self.engine.command_tx.send(PlayerCommand::NextTrack);
             }
             Message::PreviousTrack => {
                 tracing::info!("[UI] PreviousTrack clicked");
+                self.state
+                    .apply_verified_action(VerifiedTransportAction::PreviousTrack);
+                self.record_recently_listened_from_track(&self.state.current_track.clone());
                 let _ = self.engine.command_tx.send(PlayerCommand::PreviousTrack);
             }
             Message::SeekChanged(val) => {
@@ -1112,6 +1128,27 @@ impl GrooveApp {
                         },
                     });
                 }
+                if let Some(detail) = self.selected_album.clone().filter(|d| {
+                    !d.tracks.is_empty()
+                        && (d.album.spotify_uri.eq_ignore_ascii_case(&album_uri)
+                            || d.album.id.eq_ignore_ascii_case(&album_uri)
+                            || d.album.title.eq_ignore_ascii_case(&album_uri))
+                }) {
+                    let active_album = AlbumPlaybackQueue {
+                        album_uri: detail.album.spotify_uri.clone(),
+                        album_title: detail.album.title.clone(),
+                        artist_name: detail.album.artist_name.clone(),
+                        tracks: detail.tracks,
+                    };
+                    self.state
+                        .apply_verified_action(VerifiedTransportAction::ActivateAlbum {
+                            album: active_album.clone(),
+                            artist_uri: detail.artist_uri,
+                            artist_albums: vec![active_album],
+                            start_track_index: 0,
+                            auto_play: true,
+                        });
+                }
                 let _ = self
                     .engine
                     .command_tx
@@ -1139,15 +1176,28 @@ impl GrooveApp {
                                 artist_name: detail.album.artist_name.clone(),
                             },
                         });
-                        self.state.queue = detail.tracks;
+                        let active_album = AlbumPlaybackQueue {
+                            album_uri: detail.album.spotify_uri.clone(),
+                            album_title: detail.album.title.clone(),
+                            artist_name: detail.album.artist_name.clone(),
+                            tracks: detail.tracks.clone(),
+                        };
                         self.state
-                            .apply_verified_action(VerifiedTransportAction::PlayTrack(
-                                chosen.clone(),
-                            ));
-                        let _ = self
-                            .engine
-                            .command_tx
-                            .send(PlayerCommand::PlayTrack(chosen));
+                            .apply_verified_action(VerifiedTransportAction::ActivateAlbum {
+                                album: active_album.clone(),
+                                artist_uri: detail.artist_uri.clone(),
+                                artist_albums: vec![active_album],
+                                start_track_index: track_idx,
+                                auto_play: true,
+                            });
+                        let _ =
+                            self.engine
+                                .command_tx
+                                .send(PlayerCommand::PlayAlbumAtTrack {
+                                    album_uri: detail.album.spotify_uri.clone(),
+                                    track_index: track_idx,
+                                    preloaded_album: Some(detail),
+                                });
                         self.push_route(StageRoute::Section(NavSection::NowPlaying));
                     }
                 }
@@ -1271,19 +1321,28 @@ impl GrooveApp {
                                 publisher: detail.show.publisher.clone(),
                             },
                         });
-                        self.state.queue = detail
+                        let episodes: Vec<Track> = detail
                             .episodes
                             .iter()
                             .map(PodcastEpisode::into_playable_track)
                             .collect();
-                        self.state
-                            .apply_verified_action(VerifiedTransportAction::PlayTrack(
-                                chosen_track.clone(),
-                            ));
-                        let _ = self
-                            .engine
-                            .command_tx
-                            .send(PlayerCommand::PlayTrack(chosen_track));
+                        self.state.apply_verified_action(
+                            VerifiedTransportAction::ActivatePodcastShow {
+                                show_uri: detail.show.spotify_uri.clone(),
+                                show_title: detail.show.title.clone(),
+                                episodes,
+                                start_episode_index: ep_idx,
+                                auto_play: true,
+                            },
+                        );
+                        let _ =
+                            self.engine
+                                .command_tx
+                                .send(PlayerCommand::PlayShowAtEpisode {
+                                    show_uri: detail.show.spotify_uri.clone(),
+                                    episode_index: ep_idx,
+                                    preloaded_show: Some(detail),
+                                });
                         self.push_route(StageRoute::Section(NavSection::NowPlaying));
                     }
                 }
@@ -4147,6 +4206,52 @@ impl GrooveApp {
             .size(25)
             .color(palette::INK_PRIMARY);
 
+        let context_subtitle: Option<String> = match &self.state.context {
+            PlaybackContext::Album {
+                artist_name,
+                artist_albums,
+                current_album_index,
+                exhausted,
+                ..
+            } => {
+                if let Some(active_album) = artist_albums.get(*current_album_index) {
+                    if *exhausted {
+                        Some(format!("Finished all albums by {artist_name}"))
+                    } else if artist_albums.len() > 1 {
+                        Some(format!(
+                            "Album {} of {} · {}",
+                            current_album_index + 1,
+                            artist_albums.len(),
+                            active_album.album_title
+                        ))
+                    } else {
+                        Some(format!("From {}", active_album.album_title))
+                    }
+                } else {
+                    None
+                }
+            }
+            PlaybackContext::Playlist { playlist_id } => {
+                let pl_name = self
+                    .state
+                    .playlists
+                    .iter()
+                    .find(|p| p.id == *playlist_id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| playlist_id.clone());
+                Some(format!("Playlist · {pl_name}"))
+            }
+            PlaybackContext::PodcastShow { show_title, .. } => {
+                Some(format!("Podcast · {show_title}"))
+            }
+            PlaybackContext::None => None,
+        };
+
+        let mut header_col = column![header].spacing(2);
+        if let Some(sub) = context_subtitle {
+            header_col = header_col.push(text(sub).size(12.5).color(palette::INK_SECONDARY));
+        }
+
         let mut list = column![].spacing(10);
         if self.state.queue.is_empty() {
             list = list.push(
@@ -4201,9 +4306,35 @@ impl GrooveApp {
             list = list.push(row_btn);
         }
 
+        if let Some(next_album) = self.state.next_artist_album_queue() {
+            list = list.push(
+                container(
+                    column![
+                        text("NEXT ALBUM BY ARTIST")
+                            .size(10.5)
+                            .color(palette::INK_MUTED),
+                        text(&next_album.album_title)
+                            .size(13)
+                            .color(palette::INK_SECONDARY),
+                    ]
+                    .spacing(2),
+                )
+                .padding(Padding::from([10, 22])),
+            );
+        } else if self.state.is_discography_exhausted() {
+            list = list.push(
+                container(
+                    text("All albums by this artist have finished playing.")
+                        .size(12)
+                        .color(palette::INK_MUTED),
+                )
+                .padding(Padding::from([10, 22])),
+            );
+        }
+
         let content = column![
             vertical_space().height(Length::Fixed(34.0)),
-            container(header).padding(Padding {
+            container(header_col).padding(Padding {
                 top: 0.0,
                 right: 0.0,
                 bottom: 8.0,
@@ -4545,5 +4676,157 @@ mod tests {
             RECENTLY_LISTENED_TOP_LIMIT
         );
         app.assert_invariants();
+    }
+
+    #[test]
+    fn album_up_next_isolation_and_artist_discography_progression() {
+        use groove_core::ArtworkTheme;
+        let (mut app, _) = GrooveApp::new();
+
+        // 1. Start with an active playlist ("Jarvis Vibes") containing playlist tracks.
+        let playlist_tracks = vec![
+            Track {
+                id: "pl-1".into(),
+                spotify_uri: "spotify:track:pl1".into(),
+                title: "King Of The Dancehall".into(),
+                artist: "Beenie Man".into(),
+                album: "Jarvis Vibes".into(),
+                duration_secs: 213,
+                liked: false,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::SunriseMountainLake,
+            },
+            Track {
+                id: "pl-2".into(),
+                spotify_uri: "spotify:track:pl2".into(),
+                title: "King".into(),
+                artist: "Years & Years".into(),
+                album: "Jarvis Vibes".into(),
+                duration_secs: 215,
+                liked: false,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::EmeraldRing,
+            },
+        ];
+        app.state.playlists.push(groove_core::Playlist {
+            id: "pl-jarvis".into(),
+            spotify_uri: "spotify:playlist:jarvis".into(),
+            name: "Jarvis Vibes".into(),
+            subtitle: "Playlist".into(),
+            track_count: 2,
+            is_playing_context: false,
+            artwork_theme: ArtworkTheme::SunriseMountainLake,
+        });
+        app.state
+            .apply_verified_action(VerifiedTransportAction::ActivatePlaylist {
+                playlist_id: "pl-jarvis".into(),
+                tracks: playlist_tracks,
+                auto_play: true,
+            });
+        assert_eq!(app.state.active_playlist_id.as_deref(), Some("pl-jarvis"));
+        app.assert_invariants();
+
+        // 2. Load album "Run The Jewels 2" and click track 0 ("Jeopardy").
+        let rtj2_tracks = vec![
+            Track {
+                id: "rtj2-1".into(),
+                spotify_uri: "spotify:track:rtj2_1".into(),
+                title: "Jeopardy".into(),
+                artist: "Run The Jewels".into(),
+                album: "Run The Jewels 2".into(),
+                duration_secs: 201,
+                liked: false,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::VioletAura,
+            },
+            Track {
+                id: "rtj2-2".into(),
+                spotify_uri: "spotify:track:rtj2_2".into(),
+                title: "Oh My Darling Don't Cry".into(),
+                artist: "Run The Jewels".into(),
+                album: "Run The Jewels 2".into(),
+                duration_secs: 204,
+                liked: false,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::VioletAura,
+            },
+        ];
+        let rtj3_tracks = vec![Track {
+            id: "rtj3-1".into(),
+            spotify_uri: "spotify:track:rtj3_1".into(),
+            title: "Legend Has It".into(),
+            artist: "Run The Jewels".into(),
+            album: "Run The Jewels 3".into(),
+            duration_secs: 205,
+            liked: false,
+            cover_art_url: None,
+            artwork_theme: ArtworkTheme::TwilightHorizon,
+        }];
+        let rtj2_detail = groove_core::AlbumDetail {
+            album: groove_core::AlbumSummary {
+                id: "rtj2".into(),
+                spotify_uri: "spotify:album:rtj2".into(),
+                title: "Run The Jewels 2".into(),
+                artist_name: "Run The Jewels".into(),
+                release_year: "2014".into(),
+                album_type: "Album".into(),
+                track_count: 2,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::VioletAura,
+            },
+            artist_uri: Some("spotify:artist:rtj".into()),
+            tracks: rtj2_tracks.clone(),
+        };
+        app.apply_engine_event(EngineEvent::AlbumDetailLoaded(Box::new(rtj2_detail)));
+
+        let _ = app.update(Message::PlayAlbumTrack(0));
+
+        // Up Next must strictly contain "Run The Jewels 2" tracks, NOT "Jarvis Vibes" playlist tracks!
+        assert!(app.state.active_playlist_id.is_none());
+        assert_eq!(app.state.queue, rtj2_tracks);
+        assert_eq!(app.state.current_track.title, "Jeopardy");
+        app.assert_invariants();
+
+        // Hydrate the artist's discography (RTJ2 -> RTJ3)
+        app.state
+            .apply_verified_action(VerifiedTransportAction::SetArtistDiscography {
+                artist_name: "Run The Jewels".into(),
+                artist_uri: Some("spotify:artist:rtj".into()),
+                albums: vec![
+                    groove_core::AlbumPlaybackQueue {
+                        album_uri: "spotify:album:rtj2".into(),
+                        album_title: "Run The Jewels 2".into(),
+                        artist_name: "Run The Jewels".into(),
+                        tracks: rtj2_tracks,
+                    },
+                    groove_core::AlbumPlaybackQueue {
+                        album_uri: "spotify:album:rtj3".into(),
+                        album_title: "Run The Jewels 3".into(),
+                        artist_name: "Run The Jewels".into(),
+                        tracks: rtj3_tracks.clone(),
+                    },
+                ],
+            });
+        app.assert_invariants();
+
+        // NextTrack advances to track 2 of Run The Jewels 2
+        let _ = app.update(Message::NextTrack);
+        assert_eq!(app.state.current_track.title, "Oh My Darling Don't Cry");
+        assert!(app.state.is_playing);
+        app.assert_invariants();
+
+        // NextTrack at end of Run The Jewels 2 transitions to Run The Jewels 3!
+        let _ = app.update(Message::NextTrack);
+        assert_eq!(app.state.current_track.title, "Legend Has It");
+        assert_eq!(app.state.queue, rtj3_tracks);
+        assert!(app.state.is_playing);
+        app.assert_invariants();
+
+        // NextTrack at end of final album in artist discography stops playback completely!
+        let _ = app.update(Message::NextTrack);
+        assert!(!app.state.is_playing);
+        assert!(app.state.is_discography_exhausted());
+        app.assert_invariants();
+        let _ = app.view();
     }
 }

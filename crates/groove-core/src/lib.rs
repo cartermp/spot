@@ -4,9 +4,9 @@ pub mod formal;
 pub use formal::{
     advance_queue_verified, coprime_shuffle_step, delete_last_word_verified,
     episode_to_playable_track_verified, format_connected_account_label, gcd_usize,
-    is_opaque_spotify_user_id, merge_devices_verified, normalize_spotify_episode_uri,
-    normalize_spotify_show_uri, resolve_playable_track_candidate, sanitize_pcm_sample,
-    sanitize_position_secs, sanitize_spotify_biography, sanitize_unit_float,
+    is_opaque_spotify_user_id, merge_devices_verified, normalize_album_playback_queue,
+    normalize_spotify_episode_uri, normalize_spotify_show_uri, resolve_playable_track_candidate,
+    sanitize_pcm_sample, sanitize_position_secs, sanitize_spotify_biography, sanitize_unit_float,
     select_device_verified, summarize_artist_bio, FormalInvariant, InvariantViolation,
     NavHistoryMachine, NavRouteTarget, RecentListenedItem, RecentListenedKind,
     RecentListenedStore, RecentSearchEntry, RecentSearchKind, RecentSearchStore,
@@ -84,7 +84,7 @@ pub enum ArtworkTheme {
 }
 
 /// Metadata for a single playable track.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Track {
     pub id: String,
     pub spotify_uri: String,
@@ -373,6 +373,45 @@ impl SpectrumFrame {
     }
 }
 
+/// Ordered tracklist of a single album inside an artist's discography playback sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlbumPlaybackQueue {
+    pub album_uri: String,
+    pub album_title: String,
+    pub artist_name: String,
+    pub tracks: Vec<Track>,
+}
+
+/// Formal playback context governing `Up Next` (`state.queue`) and end-of-context progression.
+///
+/// - **Playlist**: Only when `context` is `PlaybackContext::Playlist` does `active_playlist_id`
+///   equal `Some(playlist_id)` and does advancing move through a playlist.
+/// - **Album**: `Up Next` (`state.queue`) consists exclusively of the tracks of
+///   `artist_albums[current_album_index]`. When that album finishes, advancing transitions to
+///   `artist_albums[current_album_index + 1]` (the next album by that artist). Once all albums
+///   in `artist_albums` have been played through, `exhausted` becomes `true` and `is_playing`
+///   becomes `false` (plays nothing).
+/// - **PodcastShow**: `Up Next` (`state.queue`) consists of the episodes of the active show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PlaybackContext {
+    #[default]
+    None,
+    Playlist {
+        playlist_id: String,
+    },
+    Album {
+        artist_name: String,
+        artist_uri: Option<String>,
+        artist_albums: Vec<AlbumPlaybackQueue>,
+        current_album_index: usize,
+        exhausted: bool,
+    },
+    PodcastShow {
+        show_uri: String,
+        show_title: String,
+    },
+}
+
 /// Complete observable state of the player.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackState {
@@ -380,6 +419,8 @@ pub struct PlaybackState {
     pub queue: Vec<Track>,
     pub playlists: Vec<Playlist>,
     pub active_playlist_id: Option<String>,
+    #[serde(default)]
+    pub context: PlaybackContext,
     pub is_playing: bool,
     pub position_secs: f32,
     pub volume: f32,
@@ -421,6 +462,7 @@ impl PlaybackState {
             queue: Vec::new(),
             playlists: Vec::new(),
             active_playlist_id: None,
+            context: PlaybackContext::None,
             is_playing: false,
             position_secs: 0.0,
             volume: 0.45,
@@ -429,6 +471,43 @@ impl PlaybackState {
             devices: vec![default_device.clone()],
             selected_device: default_device,
             connection: ConnectionStatus::Disconnected { reason: None },
+        }
+    }
+
+    /// Returns `true` if `context` is `PlaybackContext::Album` and all albums by the artist
+    /// have been played through (`exhausted == true`).
+    pub fn is_discography_exhausted(&self) -> bool {
+        matches!(
+            self.context,
+            PlaybackContext::Album {
+                exhausted: true,
+                ..
+            }
+        )
+    }
+
+    /// Returns the currently active `AlbumPlaybackQueue` when playing an album.
+    pub fn active_album_queue(&self) -> Option<&AlbumPlaybackQueue> {
+        match &self.context {
+            PlaybackContext::Album {
+                artist_albums,
+                current_album_index,
+                ..
+            } => artist_albums.get(*current_album_index),
+            _ => None,
+        }
+    }
+
+    /// Returns the next album by the current artist when playing an album, if one exists.
+    pub fn next_artist_album_queue(&self) -> Option<&AlbumPlaybackQueue> {
+        match &self.context {
+            PlaybackContext::Album {
+                artist_albums,
+                current_album_index,
+                exhausted: false,
+                ..
+            } => artist_albums.get(current_album_index + 1),
+            _ => None,
         }
     }
 }
@@ -452,8 +531,18 @@ pub enum PlayerCommand {
     SelectArtist(String),
     SelectAlbum(String),
     PlayAlbum(String),
+    PlayAlbumAtTrack {
+        album_uri: String,
+        track_index: usize,
+        preloaded_album: Option<AlbumDetail>,
+    },
     SelectShow(String),
     PlayShow(String),
+    PlayShowAtEpisode {
+        show_uri: String,
+        episode_index: usize,
+        preloaded_show: Option<PodcastShowDetail>,
+    },
     SelectOutputDevice(AudioDevice),
     AuthenticateSpotify {
         client_id: Option<String>,

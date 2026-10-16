@@ -8,9 +8,9 @@ use flume::{Receiver, Sender};
 use groove_audio::{enumerate_output_devices, AudioSampleProducer};
 use groove_core::{
     advance_queue_verified, merge_devices_verified, resolve_playable_track_candidate,
-    sanitize_position_secs, sanitize_unit_float, select_device_verified, AudioDevice,
-    ConnectionStatus, EngineEvent, FormalInvariant, PlaybackState, PlayerCommand,
-    Track, VerifiedTransportAction,
+    sanitize_position_secs, sanitize_unit_float, select_device_verified, AlbumPlaybackQueue,
+    AudioDevice, ConnectionStatus, EngineEvent, FormalInvariant, PlaybackContext, PlaybackState,
+    PlayerCommand, Track, VerifiedTransportAction,
 };
 use librespot_core::{session::Session, SpotifyUri};
 use librespot_playback::{
@@ -61,8 +61,10 @@ async fn run_engine_loop(
 ) {
     let mut state = PlaybackState::mockup_default();
 
-    // Merge real macOS CoreAudio output devices if available.
-    merge_output_devices(&mut state, enumerate_output_devices());
+    // Merge real macOS CoreAudio output devices if available (skipped in unit tests to avoid CoreAudio HAL lock contention).
+    if !cfg!(test) {
+        merge_output_devices(&mut state, enumerate_output_devices());
+    }
 
     // Reflect cached credentials if already stored on disk, and auto-connect in background
     // (disabled during unit tests so tests remain fast, offline, and deterministic).
@@ -174,16 +176,12 @@ async fn run_engine_loop(
                     let duration = state.current_track.duration_secs as f32;
                     if duration > 0.0 && state.position_secs >= duration {
                         advance_queue_track(&mut state, true, true);
-                        if let Some(active_player) = player.as_ref() {
-                            load_track_on_player(
-                                active_player,
-                                live_session.as_ref(),
-                                &state.current_track,
-                                state.is_playing,
-                                0.0,
-                            );
-                            player_has_loaded_track = true;
-                        }
+                        sync_player_after_advance(
+                            &state,
+                            &player,
+                            &live_session,
+                            &mut player_has_loaded_track,
+                        );
                         let _ = event_tx.send(EngineEvent::TrackChanged(state.current_track.clone()));
                         let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
                     } else {
@@ -247,16 +245,7 @@ fn handle_librespot_event(
         PlayerEvent::EndOfTrack { track_id, .. } => {
             info!("[LibrespotPlayer] Event: EndOfTrack ({track_id:?}) -> advancing queue");
             advance_queue_track(state, true, true);
-            if let Some(active_player) = player.as_ref() {
-                load_track_on_player(
-                    active_player,
-                    live_session.as_ref(),
-                    &state.current_track,
-                    state.is_playing,
-                    0.0,
-                );
-                *player_has_loaded_track = true;
-            }
+            sync_player_after_advance(state, player, live_session, player_has_loaded_track);
             let _ = event_tx.send(EngineEvent::TrackChanged(state.current_track.clone()));
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
@@ -307,28 +296,14 @@ async fn apply_auth_result(
                 .await;
             if !user_playlists.is_empty() {
                 state.playlists = user_playlists;
+                let active_pl_id = match &state.context {
+                    PlaybackContext::Playlist { playlist_id } => Some(playlist_id.clone()),
+                    _ => None,
+                };
                 for pl in &mut state.playlists {
-                    pl.is_playing_context = false;
+                    pl.is_playing_context = active_pl_id.as_deref() == Some(pl.id.as_str());
                 }
-                state.active_playlist_id = None;
-
-                // If the queue is currently empty, pre-load the user's first playlist tracks (paused at 0:00)
-                // so Now Playing and Up Next immediately display the user's real music.
-                if state.queue.is_empty() {
-                    if let Some(first_pl) = state.playlists.first().cloned() {
-                        let initial_tracks = web_client
-                            .fetch_playlist_tracks_with_session(
-                                Some(&auth_session.session),
-                                &first_pl.spotify_uri,
-                            )
-                            .await;
-                        state.apply_verified_action(VerifiedTransportAction::ActivatePlaylist {
-                            playlist_id: first_pl.id,
-                            tracks: initial_tracks,
-                            auto_play: false,
-                        });
-                    }
-                }
+                state.active_playlist_id = active_pl_id;
                 let _ = event_tx.send(EngineEvent::PlaylistsLoaded(state.playlists.clone()));
             }
 
@@ -417,18 +392,18 @@ async fn handle_command(
 ) {
     match cmd {
         PlayerCommand::TogglePlayPause => {
-            if player.is_some() && !*player_has_loaded_track {
-                state.is_playing = true;
-            } else {
-                state.is_playing = !state.is_playing;
-            }
+            let was_exhausted = state.is_discography_exhausted();
+            let has_loaded = player.is_some() && *player_has_loaded_track;
+            state.apply_verified_action(VerifiedTransportAction::TogglePlayPause {
+                has_loaded_track: has_loaded,
+            });
             info!(
-                "[Engine] Command: TogglePlayPause -> is_playing={} (track='{}', uri='{}')",
+                "[Engine] Command: TogglePlayPause -> is_playing={} (track='{}', uri='{}', was_exhausted={was_exhausted})",
                 state.is_playing, state.current_track.title, state.current_track.spotify_uri
             );
             if let Some(active_player) = player.as_ref() {
                 if state.is_playing {
-                    if !*player_has_loaded_track {
+                    if !*player_has_loaded_track || was_exhausted {
                         load_track_on_player(
                             active_player,
                             live_session.as_ref(),
@@ -445,16 +420,20 @@ async fn handle_command(
                 }
             }
             let _ = event_tx.send(EngineEvent::PlayStateChanged(state.is_playing));
+            if was_exhausted {
+                let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
+            }
         }
 
         PlayerCommand::Play => {
-            state.is_playing = true;
+            let was_exhausted = state.is_discography_exhausted();
+            state.apply_verified_action(VerifiedTransportAction::Play);
             info!(
-                "[Engine] Command: Play (track='{}', uri='{}')",
+                "[Engine] Command: Play (track='{}', uri='{}', was_exhausted={was_exhausted})",
                 state.current_track.title, state.current_track.spotify_uri
             );
             if let Some(active_player) = player.as_ref() {
-                if !*player_has_loaded_track {
+                if !*player_has_loaded_track || was_exhausted {
                     load_track_on_player(
                         active_player,
                         live_session.as_ref(),
@@ -468,10 +447,13 @@ async fn handle_command(
                 }
             }
             let _ = event_tx.send(EngineEvent::PlayStateChanged(true));
+            if was_exhausted {
+                let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
+            }
         }
 
         PlayerCommand::Pause => {
-            state.is_playing = false;
+            state.apply_verified_action(VerifiedTransportAction::Pause);
             info!("[Engine] Command: Pause");
             if let Some(active_player) = player.as_ref() {
                 if *player_has_loaded_track {
@@ -484,38 +466,27 @@ async fn handle_command(
         PlayerCommand::NextTrack => {
             advance_queue_track(state, true, false);
             info!(
-                "[Engine] Command: NextTrack -> '{}' by '{}' ({})",
-                state.current_track.title, state.current_track.artist, state.current_track.spotify_uri
+                "[Engine] Command: NextTrack -> '{}' by '{}' (uri={}, is_playing={}, exhausted={})",
+                state.current_track.title,
+                state.current_track.artist,
+                state.current_track.spotify_uri,
+                state.is_playing,
+                state.is_discography_exhausted()
             );
-            if let Some(active_player) = player.as_ref() {
-                load_track_on_player(
-                    active_player,
-                    live_session.as_ref(),
-                    &state.current_track,
-                    state.is_playing,
-                    0.0,
-                );
-                *player_has_loaded_track = true;
-            }
+            sync_player_after_advance(state, player, live_session, player_has_loaded_track);
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
         PlayerCommand::PreviousTrack => {
             advance_queue_track(state, false, false);
             info!(
-                "[Engine] Command: PreviousTrack -> '{}' by '{}' ({})",
-                state.current_track.title, state.current_track.artist, state.current_track.spotify_uri
+                "[Engine] Command: PreviousTrack -> '{}' by '{}' (uri={}, is_playing={})",
+                state.current_track.title,
+                state.current_track.artist,
+                state.current_track.spotify_uri,
+                state.is_playing
             );
-            if let Some(active_player) = player.as_ref() {
-                load_track_on_player(
-                    active_player,
-                    live_session.as_ref(),
-                    &state.current_track,
-                    state.is_playing,
-                    0.0,
-                );
-                *player_has_loaded_track = true;
-            }
+            sync_player_after_advance(state, player, live_session, player_has_loaded_track);
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
@@ -594,7 +565,17 @@ async fn handle_command(
                 "[Engine] Command: PlayTrack -> '{}' by '{}' (uri={}, cover={:?})",
                 track.title, track.artist, track.spotify_uri, track.cover_art_url
             );
-            state.apply_verified_action(VerifiedTransportAction::PlayTrack(track));
+            let was_in_active_context = matches!(
+                state.context,
+                PlaybackContext::Playlist { .. }
+                    | PlaybackContext::Album { .. }
+                    | PlaybackContext::PodcastShow { .. }
+            ) && state.queue.iter().any(|t| {
+                t.id == track.id
+                    || (!track.spotify_uri.is_empty() && t.spotify_uri == track.spotify_uri)
+            });
+
+            state.apply_verified_action(VerifiedTransportAction::PlayTrack(track.clone()));
             if let Some(active_player) = player.as_ref() {
                 load_track_on_player(
                     active_player,
@@ -606,6 +587,72 @@ async fn handle_command(
                 *player_has_loaded_track = true;
             }
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
+
+            // When playing a track from Search or Top Tracks on a live session outside the
+            // current context, hydrate its parent album into `Up Next` and load the artist's
+            // discography so advancing moves through the album and then the artist's albums.
+            if !was_in_active_context
+                && live_session.is_some()
+                && !track.spotify_uri.starts_with("spotify:episode:")
+            {
+                if let Some(parent_album_uri) = web_client
+                    .resolve_track_parent_album_uri(live_session.as_ref(), &track)
+                    .await
+                {
+                    let detail = web_client
+                        .fetch_album_detail(live_session.as_ref(), &parent_album_uri)
+                        .await;
+                    if !detail.tracks.is_empty() {
+                        let start_idx = detail
+                            .tracks
+                            .iter()
+                            .position(|t| {
+                                t.id == track.id
+                                    || (!track.spotify_uri.is_empty()
+                                        && t.spotify_uri == track.spotify_uri)
+                                    || t.title.eq_ignore_ascii_case(&track.title)
+                            })
+                            .unwrap_or(0);
+                        let active_album = AlbumPlaybackQueue {
+                            album_uri: detail.album.spotify_uri.clone(),
+                            album_title: detail.album.title.clone(),
+                            artist_name: detail.album.artist_name.clone(),
+                            tracks: detail.tracks.clone(),
+                        };
+                        state.apply_verified_action(VerifiedTransportAction::ActivateAlbum {
+                            album: active_album.clone(),
+                            artist_uri: detail.artist_uri.clone(),
+                            artist_albums: vec![active_album.clone()],
+                            start_track_index: start_idx,
+                            auto_play: true,
+                        });
+                        let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
+
+                        let artist_lookup = detail
+                            .artist_uri
+                            .as_deref()
+                            .unwrap_or(&detail.album.artist_name);
+                        let discography = web_client
+                            .fetch_artist_discography_queues(
+                                live_session.as_ref(),
+                                artist_lookup,
+                                &active_album,
+                            )
+                            .await;
+                        if !discography.is_empty() {
+                            state.apply_verified_action(
+                                VerifiedTransportAction::SetArtistDiscography {
+                                    artist_name: detail.album.artist_name.clone(),
+                                    artist_uri: detail.artist_uri.clone(),
+                                    albums: discography,
+                                },
+                            );
+                            let _ =
+                                event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
+                        }
+                    }
+                }
+            }
         }
 
         PlayerCommand::SelectPlaylist(playlist_id) => {
@@ -691,34 +738,41 @@ async fn handle_command(
 
         PlayerCommand::PlayAlbum(album_id_or_uri) => {
             info!("[Engine] Command: PlayAlbum('{album_id_or_uri}')");
-            ensure_fresh_web_token(web_client, live_session).await;
-            let detail = web_client
-                .fetch_album_detail(live_session.as_ref(), &album_id_or_uri)
-                .await;
-            let tracks = detail.tracks.clone();
-            let _ = event_tx.send(EngineEvent::AlbumDetailLoaded(Box::new(detail)));
-            if !tracks.is_empty() {
-                info!(
-                    "[Engine] PlayAlbum loaded {} tracks; starting with '{}'",
-                    tracks.len(),
-                    tracks[0].title
-                );
-                state.current_track = tracks[0].clone();
-                state.queue = tracks;
-                state.position_secs = 0.0;
-                state.is_playing = true;
-                if let Some(active_player) = player.as_ref() {
-                    load_track_on_player(
-                        active_player,
-                        live_session.as_ref(),
-                        &state.current_track,
-                        true,
-                        0.0,
-                    );
-                    *player_has_loaded_track = true;
-                }
-                let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
-            }
+            activate_album_playback(
+                &album_id_or_uri,
+                0,
+                None,
+                state,
+                event_tx,
+                web_client,
+                live_session,
+                player,
+                player_has_loaded_track,
+            )
+            .await;
+        }
+
+        PlayerCommand::PlayAlbumAtTrack {
+            album_uri,
+            track_index,
+            preloaded_album,
+        } => {
+            info!(
+                "[Engine] Command: PlayAlbumAtTrack(album='{}', track_index={})",
+                album_uri, track_index
+            );
+            activate_album_playback(
+                &album_uri,
+                track_index,
+                preloaded_album,
+                state,
+                event_tx,
+                web_client,
+                live_session,
+                player,
+                player_has_loaded_track,
+            )
+            .await;
         }
 
         PlayerCommand::SelectShow(show_id_or_uri) => {
@@ -742,37 +796,41 @@ async fn handle_command(
 
         PlayerCommand::PlayShow(show_id_or_uri) => {
             info!("[Engine] Command: PlayShow('{show_id_or_uri}')");
-            let detail = web_client
-                .fetch_show_detail(live_session.as_ref(), &show_id_or_uri)
-                .await;
-            let tracks: Vec<Track> = detail
-                .episodes
-                .iter()
-                .map(|ep| ep.into_playable_track())
-                .collect();
-            let _ = event_tx.send(EngineEvent::ShowDetailLoaded(Box::new(detail)));
-            if !tracks.is_empty() {
-                info!(
-                    "[Engine] PlayShow loaded {} episodes; starting with '{}'",
-                    tracks.len(),
-                    tracks[0].title
-                );
-                state.current_track = tracks[0].clone();
-                state.queue = tracks;
-                state.position_secs = 0.0;
-                state.is_playing = true;
-                if let Some(active_player) = player.as_ref() {
-                    load_track_on_player(
-                        active_player,
-                        live_session.as_ref(),
-                        &state.current_track,
-                        true,
-                        0.0,
-                    );
-                    *player_has_loaded_track = true;
-                }
-                let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
-            }
+            activate_show_playback(
+                &show_id_or_uri,
+                0,
+                None,
+                state,
+                event_tx,
+                web_client,
+                live_session,
+                player,
+                player_has_loaded_track,
+            )
+            .await;
+        }
+
+        PlayerCommand::PlayShowAtEpisode {
+            show_uri,
+            episode_index,
+            preloaded_show,
+        } => {
+            info!(
+                "[Engine] Command: PlayShowAtEpisode(show='{}', episode_index={})",
+                show_uri, episode_index
+            );
+            activate_show_playback(
+                &show_uri,
+                episode_index,
+                preloaded_show,
+                state,
+                event_tx,
+                web_client,
+                live_session,
+                player,
+                player_has_loaded_track,
+            )
+            .await;
         }
 
         PlayerCommand::SelectOutputDevice(device) => {
@@ -900,6 +958,199 @@ async fn handle_command(
             merge_output_devices(state, enumerate_output_devices());
             let _ = event_tx.send(EngineEvent::DevicesUpdated(state.devices.clone()));
         }
+    }
+}
+
+fn sync_player_after_advance(
+    state: &PlaybackState,
+    player: &Option<Arc<Player>>,
+    live_session: &Option<Session>,
+    player_has_loaded_track: &mut bool,
+) {
+    if let Some(active_player) = player.as_ref() {
+        if state.is_discography_exhausted() || (!state.is_playing && state.position_secs == 0.0) {
+            if state.is_discography_exhausted() {
+                info!(
+                    "[Engine] Artist discography exhausted -> stopping playback (playing nothing)"
+                );
+                active_player.stop();
+                *player_has_loaded_track = false;
+            } else {
+                load_track_on_player(
+                    active_player,
+                    live_session.as_ref(),
+                    &state.current_track,
+                    false,
+                    0.0,
+                );
+                *player_has_loaded_track = true;
+            }
+        } else {
+            load_track_on_player(
+                active_player,
+                live_session.as_ref(),
+                &state.current_track,
+                state.is_playing,
+                0.0,
+            );
+            *player_has_loaded_track = true;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn activate_album_playback(
+    album_id_or_uri: &str,
+    start_track_index: usize,
+    preloaded_album: Option<groove_core::AlbumDetail>,
+    state: &mut PlaybackState,
+    event_tx: &Sender<EngineEvent>,
+    web_client: &mut SpotifyWebClient,
+    live_session: &mut Option<Session>,
+    player: &mut Option<Arc<Player>>,
+    player_has_loaded_track: &mut bool,
+) {
+    let detail = match preloaded_album.filter(|d| !d.tracks.is_empty()) {
+        Some(preloaded) => preloaded,
+        None => {
+            ensure_fresh_web_token(web_client, live_session).await;
+            let fetched = web_client
+                .fetch_album_detail(live_session.as_ref(), album_id_or_uri)
+                .await;
+            let _ = event_tx.send(EngineEvent::AlbumDetailLoaded(Box::new(fetched.clone())));
+            fetched
+        }
+    };
+    let tracks = detail.tracks.clone();
+
+    if !tracks.is_empty() {
+        let clamped_idx = start_track_index.min(tracks.len() - 1);
+        let active_album = AlbumPlaybackQueue {
+            album_uri: detail.album.spotify_uri.clone(),
+            album_title: detail.album.title.clone(),
+            artist_name: detail.album.artist_name.clone(),
+            tracks: tracks.clone(),
+        };
+
+        state.apply_verified_action(VerifiedTransportAction::ActivateAlbum {
+            album: active_album.clone(),
+            artist_uri: detail.artist_uri.clone(),
+            artist_albums: vec![active_album.clone()],
+            start_track_index: clamped_idx,
+            auto_play: true,
+        });
+
+        info!(
+            "[Engine] Activated album '{}' by '{}' ({} tracks, starting at index {} '{}')",
+            detail.album.title,
+            detail.album.artist_name,
+            tracks.len(),
+            clamped_idx,
+            state.current_track.title
+        );
+
+        if let Some(active_player) = player.as_ref() {
+            load_track_on_player(
+                active_player,
+                live_session.as_ref(),
+                &state.current_track,
+                true,
+                0.0,
+            );
+            *player_has_loaded_track = true;
+        }
+        let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
+
+        // Fetch the artist's ordered discography so advancing past the end of this album
+        // automatically plays the next album by this artist, and stops once all albums finish.
+        if live_session.is_some() {
+            let artist_lookup = detail
+                .artist_uri
+                .as_deref()
+                .unwrap_or(&detail.album.artist_name);
+            let discography = web_client
+                .fetch_artist_discography_queues(
+                    live_session.as_ref(),
+                    artist_lookup,
+                    &active_album,
+                )
+                .await;
+            if !discography.is_empty() {
+                let total_albums = discography.len();
+                state.apply_verified_action(VerifiedTransportAction::SetArtistDiscography {
+                    artist_name: detail.album.artist_name.clone(),
+                    artist_uri: detail.artist_uri.clone(),
+                    albums: discography,
+                });
+                info!(
+                    "[Engine] Loaded artist discography for '{}' ({total_albums} albums queued for sequential progression)",
+                    detail.album.artist_name
+                );
+                let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn activate_show_playback(
+    show_id_or_uri: &str,
+    start_episode_index: usize,
+    preloaded_show: Option<groove_core::PodcastShowDetail>,
+    state: &mut PlaybackState,
+    event_tx: &Sender<EngineEvent>,
+    web_client: &mut SpotifyWebClient,
+    live_session: &mut Option<Session>,
+    player: &mut Option<Arc<Player>>,
+    player_has_loaded_track: &mut bool,
+) {
+    let detail = match preloaded_show.filter(|d| !d.episodes.is_empty()) {
+        Some(preloaded) => preloaded,
+        None => {
+            let fetched = web_client
+                .fetch_show_detail(live_session.as_ref(), show_id_or_uri)
+                .await;
+            let _ = event_tx.send(EngineEvent::ShowDetailLoaded(Box::new(fetched.clone())));
+            fetched
+        }
+    };
+    let tracks: Vec<Track> = detail
+        .episodes
+        .iter()
+        .map(|ep| ep.into_playable_track())
+        .collect();
+    let show_uri = detail.show.spotify_uri.clone();
+    let show_title = detail.show.title.clone();
+
+    if !tracks.is_empty() {
+        let clamped_idx = start_episode_index.min(tracks.len() - 1);
+        state.apply_verified_action(VerifiedTransportAction::ActivatePodcastShow {
+            show_uri,
+            show_title: show_title.clone(),
+            episodes: tracks.clone(),
+            start_episode_index: clamped_idx,
+            auto_play: true,
+        });
+
+        info!(
+            "[Engine] Activated podcast show '{}' ({} episodes, starting at index {} '{}')",
+            show_title,
+            tracks.len(),
+            clamped_idx,
+            state.current_track.title
+        );
+
+        if let Some(active_player) = player.as_ref() {
+            load_track_on_player(
+                active_player,
+                live_session.as_ref(),
+                &state.current_track,
+                true,
+                0.0,
+            );
+            *player_has_loaded_track = true;
+        }
+        let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
     }
 }
 
@@ -1119,42 +1370,78 @@ mod tests {
             _ => None,
         });
 
+        let album_one = groove_core::AlbumDetail {
+            album: groove_core::AlbumSummary {
+                id: "rtj2".into(),
+                spotify_uri: "spotify:album:rtj2".into(),
+                title: "Run The Jewels 2".into(),
+                artist_name: "Run The Jewels".into(),
+                release_year: "2014".into(),
+                album_type: "Album".into(),
+                track_count: 2,
+                cover_art_url: None,
+                artwork_theme: groove_core::ArtworkTheme::SunriseMountainLake,
+            },
+            artist_uri: Some("spotify:artist:rtj".into()),
+            tracks: vec![
+                sample_track("t1", "Jeopardy", 201),
+                sample_track("t2", "Oh My Darling Don't Cry", 204),
+            ],
+        };
+
         handle
             .command_tx
-            .send(PlayerCommand::PlayTrack(sample_track("t1", "Track One", 200)))
+            .send(PlayerCommand::PlayAlbumAtTrack {
+                album_uri: "spotify:album:rtj2".into(),
+                track_index: 0,
+                preloaded_album: Some(album_one),
+            })
             .unwrap();
-        let _ = recv_until(&handle.event_rx, |evt| match evt {
+        let after_start = recv_until(&handle.event_rx, |evt| match evt {
             EngineEvent::StateSynced(s) if s.current_track.id == "t1" => Some(*s),
             _ => None,
         });
+        assert_eq!(after_start.queue.len(), 2);
+        assert!(after_start.active_playlist_id.is_none());
+        assert!(after_start.check_invariants().is_ok());
 
-        handle
-            .command_tx
-            .send(PlayerCommand::PlayTrack(sample_track("t2", "Track Two", 180)))
-            .unwrap();
-        let _ = recv_until(&handle.event_rx, |evt| match evt {
+        // NextTrack moves to track 2 within the same album
+        handle.command_tx.send(PlayerCommand::NextTrack).unwrap();
+        let after_next = recv_until(&handle.event_rx, |evt| match evt {
             EngineEvent::StateSynced(s) if s.current_track.id == "t2" => Some(*s),
             _ => None,
         });
-
-        handle.command_tx.send(PlayerCommand::NextTrack).unwrap();
-        let after_next = recv_until(&handle.event_rx, |evt| match evt {
-            EngineEvent::StateSynced(s) => Some(*s),
-            _ => None,
-        });
-        assert_eq!(after_next.current_track.id, "t1");
+        assert_eq!(after_next.current_track.id, "t2");
         assert_eq!(after_next.position_secs, 0.0);
+        assert!(after_next.is_playing);
+        assert!(after_next.check_invariants().is_ok());
 
+        // PreviousTrack moves back to track 1 within the same album
         handle
             .command_tx
             .send(PlayerCommand::PreviousTrack)
             .unwrap();
         let after_prev = recv_until(&handle.event_rx, |evt| match evt {
-            EngineEvent::StateSynced(s) => Some(*s),
+            EngineEvent::StateSynced(s) if s.current_track.id == "t1" => Some(*s),
             _ => None,
         });
-        assert_eq!(after_prev.current_track.id, "t2");
+        assert_eq!(after_prev.current_track.id, "t1");
         assert_eq!(after_prev.position_secs, 0.0);
+
+        // Advance to end of album (t1 -> t2 -> exhausted silence when single album in discography)
+        handle.command_tx.send(PlayerCommand::NextTrack).unwrap();
+        let _ = recv_until(&handle.event_rx, |evt| match evt {
+            EngineEvent::StateSynced(s) if s.current_track.id == "t2" => Some(*s),
+            _ => None,
+        });
+        handle.command_tx.send(PlayerCommand::NextTrack).unwrap();
+        let after_exhausted = recv_until(&handle.event_rx, |evt| match evt {
+            EngineEvent::StateSynced(s) if !s.is_playing => Some(*s),
+            _ => None,
+        });
+        assert!(!after_exhausted.is_playing);
+        assert!(after_exhausted.is_discography_exhausted());
+        assert!(after_exhausted.check_invariants().is_ok());
     }
 
     #[test]

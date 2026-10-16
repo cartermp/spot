@@ -1,9 +1,10 @@
 use std::time::Duration;
 
 use groove_core::{
-    normalize_spotify_episode_uri, normalize_spotify_show_uri, AlbumDetail, AlbumSummary,
-    ArtistDetail, ArtistSummary, ArtworkTheme, PlaybackState, Playlist, PodcastEpisode,
-    PodcastShowDetail, PodcastShowSummary, RecentListenedItem, RecentListenedKind, Track,
+    normalize_album_playback_queue, normalize_spotify_episode_uri, normalize_spotify_show_uri,
+    AlbumDetail, AlbumPlaybackQueue, AlbumSummary, ArtistDetail, ArtistSummary, ArtworkTheme,
+    PlaybackState, Playlist, PodcastEpisode, PodcastShowDetail, PodcastShowSummary,
+    RecentListenedItem, RecentListenedKind, Track,
 };
 use librespot_core::{Session, SpotifyUri};
 use librespot_metadata::{
@@ -341,7 +342,7 @@ impl SpotifyWebClient {
                                             .tracks
                                             .map(|t| t.total)
                                             .unwrap_or(0),
-                                        is_playing_context: idx == 0,
+                                        is_playing_context: false,
                                         artwork_theme: playlist_theme_for_index(idx),
                                     }
                                 })
@@ -895,6 +896,116 @@ impl SpotifyWebClient {
         self.fetch_album_detail(session, album_id_or_uri)
             .await
             .tracks
+    }
+
+    /// Resolves a track's parent album URI (`spotify:album:...`) using `librespot_metadata::Track`
+    /// over `session.spclient()`, falling back to the track's `album` title.
+    pub async fn resolve_track_parent_album_uri(
+        &self,
+        session: Option<&Session>,
+        track: &Track,
+    ) -> Option<String> {
+        if let Some(sess) = session {
+            let candidate_uri = if track.spotify_uri.starts_with("spotify:track:") {
+                Some(track.spotify_uri.clone())
+            } else if track.id.len() == 22 && track.id.chars().all(|c| c.is_ascii_alphanumeric()) {
+                Some(format!("spotify:track:{}", track.id))
+            } else {
+                None
+            };
+            if let Some(uri_str) = candidate_uri {
+                if let Ok(t_uri) = SpotifyUri::from_uri(&uri_str) {
+                    if let Ok(meta_track) = LibrespotTrack::get(sess, &t_uri).await {
+                        if let Ok(alb_uri) = meta_track.album.id.to_uri() {
+                            return Some(alb_uri);
+                        }
+                    }
+                }
+            }
+        }
+        let trimmed = track.album.trim();
+        if !trimmed.is_empty() {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Fetches an ordered discography of playable `AlbumPlaybackQueue`s for `artist_id_or_uri`
+    /// so that when one album finishes, playback automatically transitions to the next album
+    /// by that artist, and stops once all albums by that artist have been played through.
+    pub async fn fetch_artist_discography_queues(
+        &self,
+        session: Option<&Session>,
+        artist_id_or_uri: &str,
+        active_album: &AlbumPlaybackQueue,
+    ) -> Vec<AlbumPlaybackQueue> {
+        let trimmed = artist_id_or_uri.trim();
+        if trimmed.is_empty() {
+            return normalize_album_playback_queue(active_album.clone())
+                .into_iter()
+                .collect();
+        }
+
+        let artist_detail = self.fetch_artist_detail(session, trimmed).await;
+        let candidate_summaries: Vec<AlbumSummary> =
+            artist_detail.albums.into_iter().take(6).collect();
+
+        if candidate_summaries.is_empty() {
+            return normalize_album_playback_queue(active_album.clone())
+                .into_iter()
+                .collect();
+        }
+
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, summary) in candidate_summaries.into_iter().enumerate() {
+            let active_uri = active_album.album_uri.clone();
+            let active_title = active_album.album_title.clone();
+            let active_clone = active_album.clone();
+            let client = self.clone();
+            let sess = session.cloned();
+            set.spawn(async move {
+                let is_active = (!summary.spotify_uri.is_empty()
+                    && summary.spotify_uri.eq_ignore_ascii_case(&active_uri))
+                    || summary.title.eq_ignore_ascii_case(&active_title);
+                if is_active {
+                    return normalize_album_playback_queue(active_clone).map(|q| (idx, q));
+                }
+                let lookup_key = if !summary.spotify_uri.trim().is_empty() {
+                    summary.spotify_uri.clone()
+                } else {
+                    summary.id.clone()
+                };
+                let detail = client.fetch_album_detail(sess.as_ref(), &lookup_key).await;
+                normalize_album_playback_queue(AlbumPlaybackQueue {
+                    album_uri: detail.album.spotify_uri,
+                    album_title: detail.album.title,
+                    artist_name: detail.album.artist_name,
+                    tracks: detail.tracks,
+                })
+                .map(|q| (idx, q))
+            });
+        }
+
+        let mut indexed: Vec<(usize, AlbumPlaybackQueue)> = Vec::new();
+        while let Some(Ok(Some((idx, q)))) = set.join_next().await {
+            indexed.push((idx, q));
+        }
+        indexed.sort_by_key(|(idx, _)| *idx);
+
+        let mut queues: Vec<AlbumPlaybackQueue> = indexed.into_iter().map(|(_, q)| q).collect();
+        if let Some(norm_active) = normalize_album_playback_queue(active_album.clone()) {
+            let has_active = queues.iter().any(|q| {
+                (!q.album_uri.is_empty()
+                    && q.album_uri.eq_ignore_ascii_case(&norm_active.album_uri))
+                    || q.album_title
+                        .eq_ignore_ascii_case(&norm_active.album_title)
+            });
+            if !has_active {
+                queues.insert(0, norm_active);
+            }
+        }
+        queues
     }
 
     /// Fetches a podcast show's full detail (metadata, sanitized description, cover art, and
@@ -1583,7 +1694,7 @@ async fn fetch_playlists_via_spclient(session: &Session) -> Option<Vec<Playlist>
                 name: pl.name().to_string(),
                 subtitle,
                 track_count,
-                is_playing_context: idx == 0,
+                is_playing_context: false,
                 artwork_theme: playlist_theme_for_index(idx),
             },
         ));
