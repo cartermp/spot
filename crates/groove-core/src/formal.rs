@@ -1136,6 +1136,269 @@ pub fn summarize_artist_bio(raw: &str, max_chars: usize) -> (String, String, boo
     (format!("{word_trimmed}…"), clean, true)
 }
 
+/// Formally verified `Cmd+Backspace` word-deletion operator on a search query.
+///
+/// Deletes any trailing whitespace followed by the last contiguous word (or punctuation token),
+/// returning the remaining prefix.
+///
+/// Formal Guarantees:
+/// - **INV-W1 (Prefix Preservation)**: `input.starts_with(&delete_last_word_verified(input))` for all UTF-8 strings.
+/// - **INV-W2 (Strict Contraction)**: If `!input.is_empty()`, `delete_last_word_verified(input).chars().count() < input.chars().count()`, and `delete_last_word_verified("") == ""`.
+/// - **INV-W3 (Single-Word Exactness)**: If `input.trim()` is a single alphanumeric word, `delete_last_word_verified(input) == ""`.
+/// - **INV-W4 (Multi-Word Boundary)**: `delete_last_word_verified("alpha beta") == "alpha "` and `delete_last_word_verified("alpha ") == ""`.
+pub fn delete_last_word_verified(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    let without_trailing_ws = input.trim_end_matches(char::is_whitespace);
+    if without_trailing_ws.is_empty() {
+        return String::new();
+    }
+
+    let last_ch = without_trailing_ws.chars().next_back().unwrap();
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_' || c == '\'';
+    let target_is_word = is_word_char(last_ch);
+
+    let mut cut_byte_idx = 0usize;
+    for (byte_idx, ch) in without_trailing_ws.char_indices().rev() {
+        if ch.is_whitespace() || is_word_char(ch) != target_is_word {
+            cut_byte_idx = byte_idx + ch.len_utf8();
+            break;
+        }
+    }
+
+    without_trailing_ws[..cut_byte_idx].to_string()
+}
+
+/// Detects whether a Spotify username string is an opaque machine-generated canonical ID
+/// (e.g. `"315okpb22i4itwoz3ccxlrvz7xci"`, 20+ base62 chars starting with `31`/`21`/`22`/`11`,
+/// or an all-numeric account ID).
+pub fn is_opaque_spotify_user_id(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("spotify") {
+        return true;
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+
+    let char_count = trimmed.chars().count();
+    let all_ascii_alnum = trimmed.chars().all(|c| c.is_ascii_alphanumeric());
+    let digit_count = trimmed.chars().filter(|c| c.is_ascii_digit()).count();
+
+    if trimmed.chars().all(|c| c.is_ascii_digit()) && char_count >= 8 {
+        return true;
+    }
+
+    if all_ascii_alnum
+        && char_count >= 20
+        && (trimmed.starts_with("31")
+            || trimmed.starts_with("21")
+            || trimmed.starts_with("22")
+            || trimmed.starts_with("11")
+            || digit_count >= 4)
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Formats the connected Spotify account status for the compact sidebar footer.
+///
+/// Formal Guarantees:
+/// - **INV-C1 (Opaque Hash Suppression)**: Machine-generated Spotify canonical IDs (such as `"315okpb22i4itwoz3ccxlrvz7xci"`)
+///   are never displayed raw; they render cleanly as `"Connected • Premium"` or `"Connected"`.
+/// - **INV-C2 (Single-Line Bounded Length)**: Output is always single-line (`!contains('\n')`) and at most 26 characters,
+///   preventing multi-line wrapping in the 246px sidebar.
+/// - **INV-C3 (Human Handle Preservation)**: Human display names (e.g. `"Carter"`) render as `"Connected as Carter"`.
+pub fn format_connected_account_label(username: &str, is_premium: bool) -> String {
+    let clean: String = username
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if is_opaque_spotify_user_id(&clean) {
+        return if is_premium {
+            "Connected • Premium".to_string()
+        } else {
+            "Connected".to_string()
+        };
+    }
+
+    let max_name_chars = 13usize;
+    let display_name = if clean.chars().count() <= max_name_chars {
+        clean
+    } else {
+        let mut truncated: String = clean.chars().take(max_name_chars - 1).collect();
+        truncated.push('…');
+        truncated
+    };
+
+    format!("Connected as {display_name}")
+}
+
+/// Formally verified snapshot of the macOS Menu Bar Tray state derived from `PlaybackState`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrayMenuSnapshot {
+    /// Compact single-line title shown next to the icon in the macOS menu bar (`<= 30` chars).
+    pub status_bar_title: String,
+    /// Hover tooltip for the macOS status item.
+    pub tooltip: String,
+    /// Primary headline inside the tray dropdown menu (`Title — Artist`).
+    pub now_playing_headline: String,
+    /// Secondary album/stream line inside the tray dropdown menu.
+    pub album_subtitle: String,
+    /// Action label for Play/Pause menu item (`"Pause Playback"` vs `"Play Track"`).
+    pub play_pause_label: String,
+    /// Action label for Like menu item (`"♥ Liked"` vs `"♡ Like Track"`).
+    pub like_label: String,
+    /// Whether playback is currently active.
+    pub is_playing: bool,
+    /// Whether `Next Track` and `Previous Track` are enabled.
+    pub can_skip_tracks: bool,
+}
+
+impl TrayMenuSnapshot {
+    pub fn from_playback_state(state: &PlaybackState) -> Self {
+        let has_track = !state.current_track.id.is_empty()
+            && !state.current_track.title.trim().is_empty()
+            && state.current_track.id != "no-track";
+
+        let clean_title: String = state
+            .current_track
+            .title
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let clean_artist: String = state
+            .current_track
+            .artist
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let clean_album: String = state
+            .current_track
+            .album
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let status_bar_title = if has_track {
+            let prefix = if state.is_playing { " ♫ " } else { " " };
+            let max_title_chars = 22usize;
+            let short_title = if clean_title.chars().count() <= max_title_chars {
+                clean_title.clone()
+            } else {
+                let mut s: String = clean_title.chars().take(max_title_chars - 1).collect();
+                s.push('…');
+                s
+            };
+            format!("{prefix}{short_title}")
+        } else {
+            " Groove".to_string()
+        };
+
+        let now_playing_headline = if has_track {
+            if clean_artist.is_empty() {
+                clean_title.clone()
+            } else {
+                format!("{clean_title} — {clean_artist}")
+            }
+        } else {
+            "Groove — Ready to Play".to_string()
+        };
+
+        let album_subtitle = if has_track && !clean_album.is_empty() {
+            format!("Album: {clean_album} • 320 kbps")
+        } else {
+            "Spotify Premium • 320 kbps Ogg Vorbis".to_string()
+        };
+
+        let tooltip = if has_track {
+            format!("Groove: {now_playing_headline} ({album_subtitle})")
+        } else {
+            "Groove — Spotify Premium Player".to_string()
+        };
+
+        let play_pause_label = if state.is_playing {
+            "Pause Playback".to_string()
+        } else {
+            "Play Track".to_string()
+        };
+
+        let like_label = if state.current_track.liked {
+            "♥ Liked in Library".to_string()
+        } else {
+            "♡ Like Current Track".to_string()
+        };
+
+        let can_skip_tracks = has_track || !state.queue.is_empty();
+
+        Self {
+            status_bar_title,
+            tooltip,
+            now_playing_headline,
+            album_subtitle,
+            play_pause_label,
+            like_label,
+            is_playing: state.is_playing,
+            can_skip_tracks,
+        }
+    }
+}
+
+impl FormalInvariant for TrayMenuSnapshot {
+    fn check_invariants(&self) -> Result<(), InvariantViolation> {
+        // INV-T1: Status bar title is bounded (`<= 30` chars) and single-line.
+        if self.status_bar_title.chars().count() > 30
+            || self.status_bar_title.contains('\n')
+            || self.status_bar_title.contains('\r')
+        {
+            return Err(InvariantViolation {
+                code: "INV-T1",
+                subsystem: "TrayMenuSnapshot",
+                details: format!(
+                    "status_bar_title '{}' exceeds 30 chars or contains newline",
+                    self.status_bar_title
+                ),
+            });
+        }
+
+        // INV-T2: Headline and subtitle are non-empty and single-line.
+        if self.now_playing_headline.trim().is_empty()
+            || self.now_playing_headline.contains('\n')
+            || self.album_subtitle.trim().is_empty()
+            || self.album_subtitle.contains('\n')
+        {
+            return Err(InvariantViolation {
+                code: "INV-T2",
+                subsystem: "TrayMenuSnapshot",
+                details: "headline or album_subtitle is empty or multi-line".to_string(),
+            });
+        }
+
+        // INV-T3: Play/Pause label coherence with `is_playing`.
+        let expected_label = if self.is_playing {
+            "Pause Playback"
+        } else {
+            "Play Track"
+        };
+        if self.play_pause_label != expected_label {
+            return Err(InvariantViolation {
+                code: "INV-T3",
+                subsystem: "TrayMenuSnapshot",
+                details: format!(
+                    "play_pause_label '{}' disagrees with is_playing={}",
+                    self.play_pause_label, self.is_playing
+                ),
+            });
+        }
+
+        Ok(())
+    }
+}
+
 #[allow(unexpected_cfgs)]
 #[cfg(kani)]
 mod kani_proofs {

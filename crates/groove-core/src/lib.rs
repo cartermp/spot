@@ -2,11 +2,12 @@ use serde::{Deserialize, Serialize};
 
 pub mod formal;
 pub use formal::{
-    advance_queue_verified, coprime_shuffle_step, gcd_usize, merge_devices_verified,
+    advance_queue_verified, coprime_shuffle_step, delete_last_word_verified,
+    format_connected_account_label, gcd_usize, is_opaque_spotify_user_id, merge_devices_verified,
     resolve_playable_track_candidate, sanitize_pcm_sample, sanitize_position_secs,
     sanitize_spotify_biography, sanitize_unit_float, select_device_verified, summarize_artist_bio,
     FormalInvariant, InvariantViolation, NavHistoryMachine, NavRouteTarget, RecentSearchEntry,
-    RecentSearchKind, RecentSearchStore, VerifiedTransportAction,
+    RecentSearchKind, RecentSearchStore, TrayMenuSnapshot, VerifiedTransportAction,
 };
 
 /// Number of logarithmically spaced frequency bands used by the ribbon visualizer.
@@ -215,14 +216,14 @@ impl ConnectionStatus {
         match self {
             ConnectionStatus::Connected {
                 username,
+                is_premium,
                 live_session: true,
-                ..
-            } => format!("Connected as {username}"),
+            } => format_connected_account_label(username, *is_premium),
             ConnectionStatus::Connected {
                 username,
+                is_premium,
                 live_session: false,
-                ..
-            } => format!("Preview ({username}) · Click to login"),
+            } => format_connected_account_label(username, *is_premium),
             ConnectionStatus::Connecting { status } => status.clone(),
             ConnectionStatus::Disconnected {
                 reason: Some(reason),

@@ -16,12 +16,13 @@ use std::time::Instant;
 
 use groove_audio::{verify_log_bin_edges_partition, SpectrumAnalyzer};
 use groove_core::{
-    advance_queue_verified, coprime_shuffle_step, gcd_usize, merge_devices_verified,
+    advance_queue_verified, coprime_shuffle_step, delete_last_word_verified,
+    format_connected_account_label, gcd_usize, is_opaque_spotify_user_id, merge_devices_verified,
     resolve_playable_track_candidate, sanitize_pcm_sample, sanitize_position_secs,
     sanitize_spotify_biography, sanitize_unit_float, summarize_artist_bio, ArtworkTheme,
-    AudioDevice, FormalInvariant, NavHistoryMachine, NavRouteTarget,
-    PlaybackState, Playlist, RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode,
-    SpectrumFrame, Track, VerifiedTransportAction, SPECTRUM_BANDS,
+    AudioDevice, FormalInvariant, NavHistoryMachine, NavRouteTarget, PlaybackState, Playlist,
+    RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode, SpectrumFrame, Track,
+    TrayMenuSnapshot, VerifiedTransportAction, SPECTRUM_BANDS,
 };
 use groove_spotify::sink::AtomicVolumeScaler;
 use stateright::{Checker, Model, Property};
@@ -1464,6 +1465,8 @@ pub fn prove_stateful_command_sequences_proptest() -> ProofCertificate {
                 }
 
                 prop_assert!(playback.check_invariants().is_ok());
+                let tray_snapshot = TrayMenuSnapshot::from_playback_state(&playback);
+                prop_assert!(tray_snapshot.check_invariants().is_ok());
                 prop_assert!(nav.check_invariants().is_ok());
                 prop_assert!(recent.check_invariants().is_ok());
                 total_steps.fetch_add(1, Ordering::Relaxed);
@@ -1475,10 +1478,132 @@ pub fn prove_stateful_command_sequences_proptest() -> ProofCertificate {
 
     ProofCertificate {
         id: "PROP-STATEFUL-12",
-        subsystem: "groove-core (Playback + Nav + RecentSearch)",
+        subsystem: "groove-core (Playback + Tray + Nav + RecentSearch)",
         method: "Proptest 100-Step Stateful Command Sequences",
-        theorem: "Inductive preservation of all 15 invariants under arbitrary interleavings",
+        theorem: "Inductive preservation of all 18 invariants under arbitrary interleavings",
         states_or_cases_explored: total_steps,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        verified: true,
+    }
+}
+
+/// Proof 13 (`PROP-UI-TRAY-WORD-13`): Formally verifies:
+/// 1. `delete_last_word_verified` (`Cmd+Backspace` word deletion): prefix preservation (`INV-W1`),
+///    strict contraction (`INV-W2`), finite termination to `""`, and boundary exactness (`INV-W3..W4`).
+/// 2. `is_opaque_spotify_user_id` & `format_connected_account_label`: suppression of opaque base62
+///    Spotify account IDs (`"315okpb22i4itwoz3ccxlrvz7xci"` -> `"Connected • Premium"`),
+///    single-line length bound `<= 26` chars (`INV-C1..C3`).
+/// 3. `TrayMenuSnapshot::from_playback_state`: universal satisfaction of `INV-T1..T3` across arbitrary
+///    Unicode track titles, artists, albums, and playback states.
+pub fn prove_word_deletion_account_and_tray_snapshot_proptest() -> ProofCertificate {
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
+
+    let t0 = Instant::now();
+
+    // 1. Deterministic algebraic checks for Cmd+Backspace word deletion
+    assert_eq!(delete_last_word_verified(""), "");
+    assert_eq!(delete_last_word_verified("   "), "");
+    assert_eq!(delete_last_word_verified("mastodon"), "");
+    assert_eq!(delete_last_word_verified("mastodon   "), "");
+    assert_eq!(delete_last_word_verified("mastodon leviathan"), "mastodon ");
+    assert_eq!(delete_last_word_verified("mastodon "), "");
+    assert_eq!(
+        delete_last_word_verified("opeth blackwater park"),
+        "opeth blackwater "
+    );
+
+    // 2. Deterministic checks for opaque Spotify canonical user IDs vs human names
+    assert!(is_opaque_spotify_user_id("315okpb22i4itwoz3ccxlrvz7xci"));
+    assert!(is_opaque_spotify_user_id("11123456789"));
+    assert!(!is_opaque_spotify_user_id("cartermp"));
+    assert!(!is_opaque_spotify_user_id("Carter Phillip"));
+    assert_eq!(
+        format_connected_account_label("315okpb22i4itwoz3ccxlrvz7xci", true),
+        "Connected • Premium"
+    );
+    assert_eq!(
+        format_connected_account_label("315okpb22i4itwoz3ccxlrvz7xci", false),
+        "Connected"
+    );
+    assert_eq!(
+        format_connected_account_label("cartermp", true),
+        "Connected as cartermp"
+    );
+
+    let mut runner = TestRunner::new(Config {
+        cases: 350,
+        failure_persistence: None,
+        .. Config::default()
+    });
+
+    let strategy = (
+        "\\PC{0,120}",
+        "\\PC{0,60}",
+        "\\PC{0,60}",
+        any::<bool>(),
+        any::<bool>(),
+    );
+
+    let total_cases = AtomicUsize::new(14);
+    runner
+        .run(
+            &strategy,
+            |(query_or_title, artist_or_user, album, is_playing, liked)| {
+                // Verify INV-W1 & INV-W2: prefix preservation, strict contraction, finite termination
+                let shortened = delete_last_word_verified(&query_or_title);
+                prop_assert!(
+                    query_or_title.starts_with(&shortened),
+                    "delete_last_word_verified must return a strict prefix"
+                );
+                if !query_or_title.is_empty() {
+                    prop_assert!(
+                        shortened.chars().count() < query_or_title.chars().count(),
+                        "non-empty input must strictly contract"
+                    );
+                }
+
+                // Repeated application must reach "" in <= char_count steps
+                let mut cur = query_or_title.clone();
+                let max_steps = cur.chars().count() + 1;
+                let mut steps = 0;
+                while !cur.is_empty() {
+                    let next = delete_last_word_verified(&cur);
+                    prop_assert!(next.len() < cur.len());
+                    cur = next;
+                    steps += 1;
+                    prop_assert!(steps <= max_steps);
+                }
+
+                // Verify INV-C1..C3: account label formatting
+                let acct_label = format_connected_account_label(&artist_or_user, is_playing);
+                prop_assert!(acct_label.chars().count() <= 26);
+                prop_assert!(!acct_label.contains('\n') && !acct_label.contains('\r'));
+
+                // Verify INV-T1..T3: TrayMenuSnapshot
+                let mut state = PlaybackState::mockup_default();
+                state.is_playing = is_playing;
+                state.current_track.id = "trk-1".into();
+                state.current_track.title = query_or_title;
+                state.current_track.artist = artist_or_user;
+                state.current_track.album = album;
+                state.current_track.liked = liked;
+
+                let snapshot = TrayMenuSnapshot::from_playback_state(&state);
+                prop_assert!(snapshot.check_invariants().is_ok());
+
+                total_cases.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .expect("Word deletion, account formatting, and tray snapshot proof must succeed");
+
+    ProofCertificate {
+        id: "PROP-UI-TRAY-WORD-13",
+        subsystem: "groove-core / groove-app (Search + Account + Tray)",
+        method: "Proptest Algebraic Prefix & Bounded Projection Proof",
+        theorem: "INV-W1..W4 (WordDeletePrefix) & INV-C1..C3 (OpaqueIdMask) & INV-T1..T3 (TraySnapshot)",
+        states_or_cases_explored: total_cases.load(Ordering::Relaxed),
         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
         verified: true,
     }
@@ -1500,6 +1625,7 @@ pub fn run_all_formal_proofs() -> VerificationSuiteReport {
         prove_dsp_spectrum_pipeline_proptest(),
         prove_biography_sanitizer_proptest(),
         prove_stateful_command_sequences_proptest(),
+        prove_word_deletion_account_and_tray_snapshot_proptest(),
     ];
 
     let total_states_or_cases = certificates
@@ -1523,6 +1649,6 @@ mod tests {
     fn formal_verification_suite_proves_all_theorems() {
         let report = run_all_formal_proofs();
         assert!(report.all_verified());
-        assert_eq!(report.certificates.len(), 12);
+        assert_eq!(report.certificates.len(), 13);
     }
 }

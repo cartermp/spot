@@ -1,17 +1,18 @@
 mod artwork;
 mod icons;
 mod theme;
+mod tray;
 mod visualizer;
 
-use artwork::{download_and_decode_artwork, ArtworkCache};
+use artwork::{download_and_decode_artwork, ArtworkCache, DecodedArtwork};
 use groove_audio::SpectrumAnalyzer;
 use groove_core::{
-    format_compact_count, format_seconds, merge_devices_verified, sanitize_position_secs,
-    sanitize_unit_float, select_device_verified, summarize_artist_bio, AlbumDetail, AlbumSummary,
-    ArtistDetail, ArtistSummary, AudioDevice, ConnectionStatus, EngineEvent, FormalInvariant,
-    InvariantViolation, NavHistoryMachine, NavRouteTarget, NavSection, PlaybackState,
-    PlayerCommand, RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode,
-    SpectrumFrame, Track, VerifiedTransportAction,
+    delete_last_word_verified, format_compact_count, format_seconds, merge_devices_verified,
+    sanitize_position_secs, sanitize_unit_float, select_device_verified, summarize_artist_bio,
+    AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, AudioDevice, ConnectionStatus,
+    EngineEvent, FormalInvariant, InvariantViolation, NavHistoryMachine, NavRouteTarget,
+    NavSection, PlaybackState, PlayerCommand, RecentSearchEntry, RecentSearchKind,
+    RecentSearchStore, RepeatMode, SpectrumFrame, Track, VerifiedTransportAction,
 };
 use groove_spotify::{spawn_engine, EngineHandle};
 use iced::alignment::{Horizontal, Vertical};
@@ -24,7 +25,12 @@ use iced::{Alignment, Element, Length, Padding, Size, Subscription, Task, Theme}
 use std::path::PathBuf;
 use std::time::Duration;
 use theme::{palette, INSTRUMENT_SERIF_BYTES, SERIF_FONT};
+use tray::{GrooveTray, TrayAction};
 use visualizer::RibbonVisualizer;
+
+fn search_input_id() -> text_input::Id {
+    text_input::Id::new("groove-search-input")
+}
 
 pub fn main() -> iced::Result {
     tracing_subscriber::fmt()
@@ -180,14 +186,16 @@ pub enum Message {
     SelectOutputDevice(AudioDevice),
     ConnectSpotifyClicked { force_reauth: bool },
     LogoutSpotifyClicked,
+    ModifiersChanged(iced::keyboard::Modifiers),
     SearchQueryChanged(String),
+    SearchDeleteWord,
     SubmitSearch,
     ClearSearchQuery,
     SelectRecentSearch(usize),
     RemoveRecentSearch(usize),
     ClearRecentSearches,
     ToggleTrackMenu,
-    ArtworkLoaded(Option<(String, image::Handle)>),
+    ArtworkLoaded(Option<(String, DecodedArtwork)>),
 }
 
 pub struct GrooveApp {
@@ -198,6 +206,11 @@ pub struct GrooveApp {
     spectrum: SpectrumFrame,
     engine: EngineHandle,
     artwork: ArtworkCache,
+    tray: Option<GrooveTray>,
+    tray_init_attempted: bool,
+    keyboard_modifiers: iced::keyboard::Modifiers,
+    pre_backspace_search_query: Option<String>,
+    last_cmd_backspace_applied: bool,
     scrubbing_position: Option<f32>,
     search_query: String,
     recent_searches: RecentSearchStore,
@@ -237,6 +250,9 @@ impl GrooveApp {
         );
 
         let recent_searches = load_recent_searches();
+        let artwork = ArtworkCache::new();
+        let tray = GrooveTray::try_new(&state, &artwork);
+        let tray_init_attempted = tray.is_some();
 
         let app = Self {
             state,
@@ -245,7 +261,12 @@ impl GrooveApp {
             analyzer,
             spectrum: SpectrumFrame::calm_preview(0.0),
             engine,
-            artwork: ArtworkCache::new(),
+            artwork,
+            tray,
+            tray_init_attempted,
+            keyboard_modifiers: iced::keyboard::Modifiers::empty(),
+            pre_backspace_search_query: None,
+            last_cmd_backspace_applied: false,
             scrubbing_position: None,
             search_query: String::new(),
             recent_searches,
@@ -465,13 +486,60 @@ impl GrooveApp {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        // 60 FPS frame ticker driving both the RealFFT ribbon visualizer and non-blocking EngineEvent drain
-        iced::time::every(Duration::from_millis(16)).map(|_| Message::AnimationTick)
+        // 60 FPS frame ticker + global keyboard listener for Cmd+Backspace whole-word deletion in Search
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(16)).map(|_| Message::AnimationTick),
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+                    Some(Message::ModifiersChanged(modifiers))
+                }
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Backspace),
+                    modifiers,
+                    ..
+                }) if modifiers.command() || modifiers.macos_command() => {
+                    Some(Message::SearchDeleteWord)
+                }
+                _ => None,
+            }),
+        ])
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::AnimationTick => {
+                if !self.tray_init_attempted {
+                    self.tray_init_attempted = true;
+                    self.tray = GrooveTray::try_new(&self.state, &self.artwork);
+                }
+
+                // Poll native macOS menu bar tray actions
+                for action in GrooveTray::poll_actions() {
+                    match action {
+                        TrayAction::OpenNowPlaying => {
+                            self.push_route(StageRoute::Section(NavSection::NowPlaying));
+                        }
+                        TrayAction::TogglePlayPause => {
+                            self.state.is_playing = !self.state.is_playing;
+                            let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
+                        }
+                        TrayAction::NextTrack => {
+                            let _ = self.engine.command_tx.send(PlayerCommand::NextTrack);
+                        }
+                        TrayAction::PreviousTrack => {
+                            let _ = self.engine.command_tx.send(PlayerCommand::PreviousTrack);
+                        }
+                        TrayAction::ToggleLike => {
+                            self.state
+                                .apply_verified_action(VerifiedTransportAction::ToggleLikeCurrent);
+                            let _ = self
+                                .engine
+                                .command_tx
+                                .send(PlayerCommand::ToggleLikeCurrent);
+                        }
+                    }
+                }
+
                 let mut needs_art_scan = false;
                 // Drain any pending events from the async Spotify + Audio engine
                 while let Ok(event) = self.engine.event_rx.try_recv() {
@@ -487,6 +555,10 @@ impl GrooveApp {
                         needs_art_scan = true;
                     }
                     self.apply_engine_event(event);
+                }
+
+                if let Some(tray) = &mut self.tray {
+                    tray.sync(&self.state, &self.artwork);
                 }
 
                 // Update 60 FPS spectrum frame from live lock-free audio ringbuffer (or harmonic fallback)
@@ -844,7 +916,47 @@ impl GrooveApp {
                 tracing::info!("[UI] LogoutSpotifyClicked");
                 let _ = self.engine.command_tx.send(PlayerCommand::LogoutSpotify);
             }
+            Message::ModifiersChanged(modifiers) => {
+                self.keyboard_modifiers = modifiers;
+            }
             Message::SearchQueryChanged(query) => {
+                let prev_query = self.search_query.clone();
+                let is_single_char_backspace =
+                    prev_query.chars().count() == query.chars().count() + 1
+                        && prev_query.starts_with(&query);
+
+                if is_single_char_backspace
+                    && (self.keyboard_modifiers.command()
+                        || self.keyboard_modifiers.macos_command())
+                {
+                    let shortened = delete_last_word_verified(&prev_query);
+                    tracing::info!(
+                        "[UI] Cmd+Backspace in Search: '{}' -> '{}'",
+                        prev_query,
+                        shortened
+                    );
+                    self.pre_backspace_search_query = None;
+                    self.last_cmd_backspace_applied = true;
+                    self.search_query = shortened.clone();
+                    if shortened.trim().is_empty() {
+                        self.search_artists.clear();
+                        self.search_albums.clear();
+                        self.search_results.clear();
+                    }
+                    let _ = self
+                        .engine
+                        .command_tx
+                        .send(PlayerCommand::SearchCatalog(shortened));
+                    return text_input::move_cursor_to_end(search_input_id());
+                }
+
+                if is_single_char_backspace {
+                    self.pre_backspace_search_query = Some(prev_query);
+                } else {
+                    self.pre_backspace_search_query = None;
+                }
+                self.last_cmd_backspace_applied = false;
+
                 tracing::info!("[UI] SearchQueryChanged -> '{}'", query);
                 self.search_query = query.clone();
                 if query.trim().is_empty() {
@@ -856,6 +968,37 @@ impl GrooveApp {
                     .engine
                     .command_tx
                     .send(PlayerCommand::SearchCatalog(query));
+            }
+            Message::SearchDeleteWord => {
+                if self.last_cmd_backspace_applied {
+                    self.last_cmd_backspace_applied = false;
+                    return Task::none();
+                }
+                if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
+                    && !self.search_query.is_empty()
+                {
+                    let base = self
+                        .pre_backspace_search_query
+                        .take()
+                        .unwrap_or_else(|| self.search_query.clone());
+                    let shortened = delete_last_word_verified(&base);
+                    tracing::info!(
+                        "[UI] SearchDeleteWord (Cmd+Backspace) -> '{}' -> '{}'",
+                        base,
+                        shortened
+                    );
+                    self.search_query = shortened.clone();
+                    if shortened.trim().is_empty() {
+                        self.search_artists.clear();
+                        self.search_albums.clear();
+                        self.search_results.clear();
+                    }
+                    let _ = self
+                        .engine
+                        .command_tx
+                        .send(PlayerCommand::SearchCatalog(shortened));
+                    return text_input::move_cursor_to_end(search_input_id());
+                }
             }
             Message::SubmitSearch => {
                 let trimmed = self.search_query.trim().to_string();
@@ -928,9 +1071,12 @@ impl GrooveApp {
             Message::ToggleTrackMenu => {
                 self.show_track_details_banner = !self.show_track_details_banner;
             }
-            Message::ArtworkLoaded(Some((url, handle))) => {
+            Message::ArtworkLoaded(Some((url, decoded))) => {
                 tracing::info!("[UI] ArtworkLoaded -> cached texture for {}", url);
-                self.artwork.insert_remote(url, handle);
+                self.artwork.insert_remote(url, decoded);
+                if let Some(tray) = &mut self.tray {
+                    tray.sync(&self.state, &self.artwork);
+                }
             }
             Message::ArtworkLoaded(None) => {}
         }
@@ -1750,109 +1896,79 @@ impl GrooveApp {
             .into()
     }
 
-    fn view_spotify_auth_banner(&self) -> Element<'_, Message> {
+    fn view_spotify_auth_banner(&self) -> Option<Element<'_, Message>> {
         match &self.state.connection {
             ConnectionStatus::Connected {
-                username,
-                live_session: true,
-                ..
-            } => container(
-                row![
-                    svg(icons::spotify_badge())
-                        .width(Length::Fixed(18.0))
-                        .height(Length::Fixed(18.0)),
-                    text(format!(
-                        "Spotify Premium active as {username} • 320 kbps Ogg Vorbis + live catalog"
-                    ))
-                    .size(12.0)
-                    .color(palette::INK_SECONDARY)
-                    .width(Length::Fill),
-                    button(text("Re-auth").size(11.5))
-                        .on_press(Message::ConnectSpotifyClicked { force_reauth: true })
-                        .padding(Padding::from([4, 10]))
-                        .style(theme::subtle_row_button(true)),
-                    button(text("Sign Out").size(11.5))
-                        .on_press(Message::LogoutSpotifyClicked)
-                        .padding(Padding::from([4, 10]))
-                        .style(theme::subtle_row_button(false)),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            )
-            .padding(Padding::from([8, 12]))
-            .style(|_| container::Style {
-                background: Some(iced::Background::Color(palette::SIDEBAR_ACTIVE_PILL)),
-                border: iced::Border {
-                    radius: 12.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .into(),
+                live_session: true, ..
+            } => None,
 
-            ConnectionStatus::Connecting { status } => container(
-                row![
-                    svg(icons::spotify_badge())
-                        .width(Length::Fixed(18.0))
-                        .height(Length::Fixed(18.0)),
-                    text(status)
-                        .size(12.5)
-                        .color(palette::INK_PRIMARY)
-                        .width(Length::Fill),
-                    button(text("Retry Browser Login").size(11.5))
-                        .on_press(Message::ConnectSpotifyClicked { force_reauth: true })
-                        .padding(Padding::from([5, 12]))
-                        .style(theme::subtle_row_button(true)),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center),
-            )
-            .padding(Padding::from([9, 12]))
-            .style(|_| container::Style {
-                background: Some(iced::Background::Color(palette::DEVICE_PILL_BG)),
-                border: iced::Border {
-                    radius: 12.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .into(),
-
-            _ => container(
-                row![
-                    svg(icons::spotify_badge())
-                        .width(Length::Fixed(18.0))
-                        .height(Length::Fixed(18.0)),
-                    column![
-                        text("Sign in with Spotify Premium")
-                            .size(13.0)
-                            .color(palette::INK_PRIMARY),
-                        text("Opens Spotify PKCE login in your browser for live 320 kbps streaming, artist albums, and cover art.")
-                            .size(11.5)
-                            .color(palette::INK_SECONDARY),
+            ConnectionStatus::Connecting { status } => Some(
+                container(
+                    row![
+                        svg(icons::spotify_badge())
+                            .width(Length::Fixed(18.0))
+                            .height(Length::Fixed(18.0)),
+                        text(status)
+                            .size(12.5)
+                            .color(palette::INK_PRIMARY)
+                            .width(Length::Fill),
+                        button(text("Retry Browser Login").size(11.5))
+                            .on_press(Message::ConnectSpotifyClicked { force_reauth: true })
+                            .padding(Padding::from([5, 12]))
+                            .style(theme::subtle_row_button(true)),
                     ]
-                    .spacing(1)
-                    .width(Length::Fill),
-                    button(text("Connect Spotify").size(12.0))
-                        .on_press(Message::ConnectSpotifyClicked {
-                            force_reauth: false
-                        })
-                        .padding(Padding::from([7, 14]))
-                        .style(theme::subtle_row_button(true)),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center),
-            )
-            .padding(Padding::from([10, 14]))
-            .style(|_| container::Style {
-                background: Some(iced::Background::Color(palette::SIDEBAR_ACTIVE_PILL)),
-                border: iced::Border {
-                    radius: 12.0.into(),
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .padding(Padding::from([9, 12]))
+                .style(|_| container::Style {
+                    background: Some(iced::Background::Color(palette::DEVICE_PILL_BG)),
+                    border: iced::Border {
+                        radius: 12.0.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            })
-            .into(),
+                })
+                .into(),
+            ),
+
+            _ => Some(
+                container(
+                    row![
+                        svg(icons::spotify_badge())
+                            .width(Length::Fixed(18.0))
+                            .height(Length::Fixed(18.0)),
+                        column![
+                            text("Sign in with Spotify Premium")
+                                .size(13.0)
+                                .color(palette::INK_PRIMARY),
+                            text("Opens Spotify PKCE login in your browser for live 320 kbps streaming, artist albums, and cover art.")
+                                .size(11.5)
+                                .color(palette::INK_SECONDARY),
+                        ]
+                        .spacing(1)
+                        .width(Length::Fill),
+                        button(text("Connect Spotify").size(12.0))
+                            .on_press(Message::ConnectSpotifyClicked {
+                                force_reauth: false
+                            })
+                            .padding(Padding::from([7, 14]))
+                            .style(theme::subtle_row_button(true)),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .padding(Padding::from([10, 14]))
+                .style(|_| container::Style {
+                    background: Some(iced::Background::Color(palette::SIDEBAR_ACTIVE_PILL)),
+                    border: iced::Border {
+                        radius: 12.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .into(),
+            ),
         }
     }
 
@@ -1870,6 +1986,7 @@ impl GrooveApp {
             "Search artists, albums, or tracks on Spotify...",
             &self.search_query,
         )
+        .id(search_input_id())
         .on_input(Message::SearchQueryChanged)
         .on_submit(Message::SubmitSearch)
         .padding(12)
@@ -2147,21 +2264,20 @@ impl GrooveApp {
             );
         }
 
-        container(
-            column![
-                vertical_space().height(Length::Fixed(10.0)),
-                header,
-                self.view_spotify_auth_banner(),
-                search_bar_row,
-                scrollable(content_col).height(Length::Fill),
-            ]
-            .spacing(12)
-            .padding(Padding::from([20, 34])),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(theme::center_stage_container)
-        .into()
+        let mut top_col = column![vertical_space().height(Length::Fixed(10.0)), header,].spacing(12);
+        if let Some(banner) = self.view_spotify_auth_banner() {
+            top_col = top_col.push(banner);
+        }
+        top_col = top_col
+            .push(search_bar_row)
+            .push(scrollable(content_col).height(Length::Fill))
+            .padding(Padding::from([20, 34]));
+
+        container(top_col)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::center_stage_container)
+            .into()
     }
 
     /// Dedicated Artist profile & album discography stage with real cover artwork.
@@ -2701,20 +2817,19 @@ impl GrooveApp {
             playlist_cards = playlist_cards.push(card);
         }
 
-        container(
-            column![
-                vertical_space().height(Length::Fixed(10.0)),
-                header,
-                self.view_spotify_auth_banner(),
-                scrollable(playlist_cards).height(Length::Fill),
-            ]
-            .spacing(12)
-            .padding(Padding::from([20, 34])),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(theme::center_stage_container)
-        .into()
+        let mut top_col = column![vertical_space().height(Length::Fixed(10.0)), header,].spacing(12);
+        if let Some(banner) = self.view_spotify_auth_banner() {
+            top_col = top_col.push(banner);
+        }
+        top_col = top_col
+            .push(scrollable(playlist_cards).height(Length::Fill))
+            .padding(Padding::from([20, 34]));
+
+        container(top_col)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::center_stage_container)
+            .into()
     }
 
     /// Column 3: Right "Up Next" queue pane matching the Groove mockup.
@@ -2929,5 +3044,36 @@ mod tests {
 
         let _ = app.update(Message::AnimationTick);
         app.assert_invariants();
+    }
+
+    #[test]
+    fn cmd_backspace_deletes_whole_word_and_connected_status_cleans_up_banner() {
+        let (mut app, _) = GrooveApp::new();
+        let _ = app.update(Message::SelectNav(NavSection::Search));
+        let _ = app.update(Message::SearchQueryChanged("mastodon leviathan".into()));
+        assert_eq!(app.search_query, "mastodon leviathan");
+
+        // Simulate Cmd+Backspace when ModifiersChanged(LOGO) is active and text_input emits 1-char backspace
+        let _ = app.update(Message::ModifiersChanged(iced::keyboard::Modifiers::LOGO));
+        let _ = app.update(Message::SearchQueryChanged("mastodon leviatha".into()));
+        assert_eq!(app.search_query, "mastodon ");
+        // Subsequent SearchDeleteWord in same frame is deduplicated
+        let _ = app.update(Message::SearchDeleteWord);
+        assert_eq!(app.search_query, "mastodon ");
+
+        // Second Cmd+Backspace deletes "mastodon " -> ""
+        let _ = app.update(Message::SearchDeleteWord);
+        assert_eq!(app.search_query, "");
+
+        // Verify connected account formatting & top banner removal
+        app.state.connection = ConnectionStatus::Connected {
+            username: "315okpb22i4itwoz3ccxlrvz7xci".into(),
+            is_premium: true,
+            live_session: true,
+        };
+        assert_eq!(app.state.connection.display_label(), "Connected • Premium");
+        assert!(app.view_spotify_auth_banner().is_none());
+
+        let _ = app.update(Message::LogoutSpotifyClicked);
     }
 }

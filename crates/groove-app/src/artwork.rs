@@ -5,12 +5,22 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
+/// Decoded artwork bundle containing both a `380x380` GPU texture handle and a `96x96`
+/// rounded-corner RGBA buffer for the macOS system tray & menu cover art.
+#[derive(Clone, Debug)]
+pub struct DecodedArtwork {
+    pub handle: image::Handle,
+    pub tray_rgba_96: Vec<u8>,
+}
+
 /// Caches procedurally rendered and remotely fetched rounded album/artist artwork handles
 /// so they are rendered as GPU textures at 120 FPS with zero runtime overhead.
 pub struct ArtworkCache {
     hero: HashMap<ArtworkTheme, image::Handle>,
     thumb: HashMap<ArtworkTheme, image::Handle>,
+    tray_theme_rgba: HashMap<ArtworkTheme, Vec<u8>>,
     remote: HashMap<String, image::Handle>,
+    remote_tray_rgba: HashMap<String, Vec<u8>>,
     in_flight: HashSet<String>,
 }
 
@@ -38,16 +48,20 @@ impl ArtworkCache {
 
         let mut hero = HashMap::new();
         let mut thumb = HashMap::new();
+        let mut tray_theme_rgba = HashMap::new();
 
         for theme in themes {
             hero.insert(theme, render_artwork(theme, 360, 18.0));
             thumb.insert(theme, render_artwork(theme, 72, 12.0));
+            tray_theme_rgba.insert(theme, render_artwork_rgba(theme, 96, 16.0));
         }
 
         Self {
             hero,
             thumb,
+            tray_theme_rgba,
             remote: HashMap::new(),
+            remote_tray_rgba: HashMap::new(),
             in_flight: HashSet::new(),
         }
     }
@@ -96,17 +110,43 @@ impl ArtworkCache {
         self.in_flight.insert(trimmed.to_string())
     }
 
-    /// Inserts a decoded remote artwork handle into the cache.
-    pub fn insert_remote(&mut self, url: String, handle: image::Handle) {
+    /// Returns `true` if the remote cover URL is already decoded in the cache.
+    pub fn has_remote_cached(&self, url: &str) -> bool {
+        self.remote_tray_rgba.contains_key(url.trim())
+    }
+
+    /// Inserts a decoded remote artwork bundle into the cache.
+    pub fn insert_remote(&mut self, url: String, decoded: DecodedArtwork) {
         self.in_flight.remove(&url);
-        self.remote.insert(url, handle);
+        self.remote_tray_rgba
+            .insert(url.clone(), decoded.tray_rgba_96);
+        self.remote.insert(url, decoded.handle);
+    }
+
+    /// Returns a `96x96` rounded RGBA byte buffer for the macOS tray icon and Now Playing menu card.
+    pub fn tray_cover_rgba(
+        &self,
+        url: Option<&str>,
+        theme: ArtworkTheme,
+    ) -> (u32, u32, Vec<u8>) {
+        if let Some(u) = url {
+            if let Some(rgba) = self.remote_tray_rgba.get(u.trim()) {
+                return (96, 96, rgba.clone());
+            }
+        }
+        let rgba = self
+            .tray_theme_rgba
+            .get(&theme)
+            .cloned()
+            .unwrap_or_else(|| render_artwork_rgba(theme, 96, 16.0));
+        (96, 96, rgba)
     }
 }
 
 /// Downloads an album cover or artist portrait from `url` (using an on-disk cache under
 /// `~/Library/Application Support/Groove/image_cache`), decodes it, and applies anti-aliased
 /// rounded corners.
-pub async fn download_and_decode_artwork(url: String) -> Option<(String, image::Handle)> {
+pub async fn download_and_decode_artwork(url: String) -> Option<(String, DecodedArtwork)> {
     let trimmed = url.trim().to_string();
     if trimmed.is_empty() {
         return None;
@@ -157,15 +197,15 @@ pub async fn download_and_decode_artwork(url: String) -> Option<(String, image::
     };
 
     let url_clone = trimmed.clone();
-    let handle = tokio::task::spawn_blocking(move || decode_rounded_rgba(&raw_bytes, 380, 20.0))
+    let decoded = tokio::task::spawn_blocking(move || decode_artwork_bundle(&raw_bytes))
         .await
         .ok()??;
 
     tracing::info!(
-        "[Artwork] Decoded GPU texture (380x380 rounded RGBA) for {}",
+        "[Artwork] Decoded GPU texture (380x380 + 96x96 tray cover) for {}",
         url_clone
     );
-    Some((url_clone, handle))
+    Some((url_clone, decoded))
 }
 
 fn disk_cache_path_for_url(url: &str) -> Option<PathBuf> {
@@ -176,8 +216,21 @@ fn disk_cache_path_for_url(url: &str) -> Option<PathBuf> {
     Some(base.join(format!("art_v2_{hash:016x}.img")))
 }
 
-fn decode_rounded_rgba(bytes: &[u8], target_size: u32, corner_radius: f32) -> Option<image::Handle> {
+fn decode_artwork_bundle(bytes: &[u8]) -> Option<DecodedArtwork> {
     let dyn_img = ::image::load_from_memory(bytes).ok()?;
+    let hero_rgba = resize_and_round_rgba(&dyn_img, 380, 20.0);
+    let tray_rgba_96 = resize_and_round_rgba(&dyn_img, 96, 16.0);
+    Some(DecodedArtwork {
+        handle: image::Handle::from_rgba(380, 380, hero_rgba),
+        tray_rgba_96,
+    })
+}
+
+fn resize_and_round_rgba(
+    dyn_img: &::image::DynamicImage,
+    target_size: u32,
+    corner_radius: f32,
+) -> Vec<u8> {
     let resized = dyn_img.resize_to_fill(
         target_size,
         target_size,
@@ -198,7 +251,7 @@ fn decode_rounded_rgba(bytes: &[u8], target_size: u32, corner_radius: f32) -> Op
         }
     }
 
-    Some(image::Handle::from_rgba(target_size, target_size, rgba))
+    rgba
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -220,6 +273,11 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 
 /// Renders the artwork theme with signed-distance rounded corners and landscapes matching the mockup.
 fn render_artwork(theme: ArtworkTheme, size: u32, corner_radius: f32) -> image::Handle {
+    let pixels = render_artwork_rgba(theme, size, corner_radius);
+    image::Handle::from_rgba(size, size, pixels)
+}
+
+fn render_artwork_rgba(theme: ArtworkTheme, size: u32, corner_radius: f32) -> Vec<u8> {
     let mut pixels = vec![0u8; (size * size * 4) as usize];
     let s = size as f32;
 
@@ -261,7 +319,7 @@ fn render_artwork(theme: ArtworkTheme, size: u32, corner_radius: f32) -> image::
         }
     }
 
-    image::Handle::from_rgba(size, size, pixels)
+    pixels
 }
 
 /// Paints the hero cover from the mockup ("Higher Ground — Lume"):
