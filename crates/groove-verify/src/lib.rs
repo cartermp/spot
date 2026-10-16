@@ -22,9 +22,10 @@ use groove_core::{
     normalize_spotify_show_uri, resolve_playable_track_candidate, sanitize_pcm_sample,
     sanitize_position_secs, sanitize_spotify_biography, sanitize_unit_float, summarize_artist_bio,
     ArtworkTheme, AudioDevice, FormalInvariant, NavHistoryMachine, NavRouteTarget, PlaybackState,
-    Playlist, PodcastEpisode, PodcastShowDetail, PodcastShowSummary, RecentSearchEntry,
-    RecentSearchKind, RecentSearchStore, RepeatMode, SpectrumFrame, Track, TrayMenuSnapshot,
-    VerifiedTransportAction, SPECTRUM_BANDS,
+    Playlist, PodcastEpisode, PodcastShowDetail, PodcastShowSummary, RecentListenedItem,
+    RecentListenedKind, RecentListenedStore, RecentSearchEntry, RecentSearchKind,
+    RecentSearchStore, RepeatMode, SpectrumFrame, Track, TrayMenuSnapshot,
+    VerifiedTransportAction, RECENTLY_LISTENED_TOP_LIMIT, SPECTRUM_BANDS,
 };
 use groove_spotify::sink::AtomicVolumeScaler;
 use stateright::{Checker, Model, Property};
@@ -1748,6 +1749,103 @@ pub fn prove_podcast_uri_and_episode_track_invariants_proptest() -> ProofCertifi
     }
 }
 
+/// Proof 15: Proptest verification of `RecentListenedStore` (`INV-L1..L4`) for Your Library:
+/// - **INV-L1**: Bounded capacity (`max_entries >= 10` and `len <= max_entries`).
+/// - **INV-L2**: Every entry has non-empty single-line title, subtitle, and target URI.
+/// - **INV-L3**: Strict pairwise entity deduplication (MRU promotion to index `0`).
+/// - **INV-L4**: Top-10 collapsed (`<= 10`) vs expanded (`> 10` when `len > 10`) view projection.
+pub fn prove_recently_listened_store_invariants_proptest() -> ProofCertificate {
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
+
+    let t0 = Instant::now();
+    let cases = 350u32;
+    let mut runner = TestRunner::new(Config::with_cases(cases));
+
+    let item_strategy = (
+        any::<bool>(),
+        "\\PC{0,32}",
+        "\\PC{0,32}",
+        "\\PC{0,32}",
+        prop_oneof![Just(None), "[a-zA-Z0-9:/._-]{1,40}".prop_map(Some)],
+    );
+    let seq_strategy = (
+        10usize..=24usize,
+        prop::collection::vec((any::<bool>(), item_strategy), 1..=35),
+    );
+
+    let total_cases = AtomicUsize::new(0);
+    runner
+        .run(&seq_strategy, |(capacity, ops)| {
+            let mut store = RecentListenedStore::new(capacity);
+            prop_assert!(store.check_invariants().is_ok());
+
+            for (use_append, (is_podcast, raw_title, raw_creator, raw_uri, cover_url)) in ops {
+                let kind = if is_podcast {
+                    RecentListenedKind::Podcast {
+                        show_uri: raw_uri,
+                        publisher: raw_creator.clone(),
+                    }
+                } else {
+                    RecentListenedKind::Album {
+                        album_uri: raw_uri,
+                        artist_name: raw_creator.clone(),
+                    }
+                };
+                let candidate = RecentListenedItem {
+                    title: raw_title.clone(),
+                    subtitle: raw_creator,
+                    cover_art_url: cover_url,
+                    artwork_theme: ArtworkTheme::SunriseMountainLake,
+                    kind,
+                };
+                if use_append {
+                    let _ = store.append_if_absent(candidate);
+                } else if store.record_item(candidate.clone()) {
+                    // Promoted item must sit at index 0 (MRU head)
+                    let head = &store.entries()[0];
+                    let expected_title: String =
+                        raw_title.split_whitespace().collect::<Vec<_>>().join(" ");
+                    prop_assert_eq!(&head.title, &expected_title);
+                }
+
+                prop_assert!(store.check_invariants().is_ok());
+                prop_assert!(store.visible_entries(false).len() <= RECENTLY_LISTENED_TOP_LIMIT);
+                prop_assert_eq!(store.visible_entries(true).len(), store.len());
+                if store.len() > RECENTLY_LISTENED_TOP_LIMIT {
+                    prop_assert!(store.has_more_than_top_ten());
+                    prop_assert_eq!(
+                        store.visible_entries(false).len(),
+                        RECENTLY_LISTENED_TOP_LIMIT
+                    );
+                    prop_assert!(
+                        store.visible_entries(true).len() > RECENTLY_LISTENED_TOP_LIMIT
+                    );
+                }
+            }
+
+            // Round-trip via from_loaded preserves exact order and all invariants
+            let reloaded =
+                RecentListenedStore::from_loaded(store.entries().to_vec(), store.max_entries());
+            prop_assert!(reloaded.check_invariants().is_ok());
+            prop_assert_eq!(reloaded.entries(), store.entries());
+
+            total_cases.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .expect("RecentListenedStore proof must succeed");
+
+    ProofCertificate {
+        id: "PROP-LIBRARY-15",
+        subsystem: "groove-core (Your Library Recently-Listened Store)",
+        method: "Proptest MRU Deduplication & Top-10 Expand/Collapse Proof",
+        theorem: "INV-L1..L4 (Capacity, Single-Line Metadata, Uniqueness & Top-10 Projection)",
+        states_or_cases_explored: total_cases.load(Ordering::Relaxed),
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        verified: true,
+    }
+}
+
 /// Runs the complete Groove formal verification suite and returns a structured [`VerificationSuiteReport`].
 pub fn run_all_formal_proofs() -> VerificationSuiteReport {
     let suite_start = Instant::now();
@@ -1766,6 +1864,7 @@ pub fn run_all_formal_proofs() -> VerificationSuiteReport {
         prove_stateful_command_sequences_proptest(),
         prove_word_deletion_account_and_tray_snapshot_proptest(),
         prove_podcast_uri_and_episode_track_invariants_proptest(),
+        prove_recently_listened_store_invariants_proptest(),
     ];
 
     let total_states_or_cases = certificates
@@ -1789,6 +1888,6 @@ mod tests {
     fn formal_verification_suite_proves_all_theorems() {
         let report = run_all_formal_proofs();
         assert!(report.all_verified());
-        assert_eq!(report.certificates.len(), 14);
+        assert_eq!(report.certificates.len(), 15);
     }
 }

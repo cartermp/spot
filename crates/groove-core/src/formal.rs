@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AudioDevice, PlaybackState, PodcastEpisode, PodcastShowDetail, RepeatMode, SpectrumFrame,
-    Track,
+    ArtworkTheme, AudioDevice, PlaybackState, PodcastEpisode, PodcastShowDetail, RepeatMode,
+    SpectrumFrame, Track,
 };
 
 /// Detailed error returned when a formal state invariant is violated.
@@ -1571,6 +1571,352 @@ impl FormalInvariant for PodcastShowDetail {
                     details: format!("episode[{idx}] playable track conversion violated INV-E2..E4"),
                 });
             }
+        }
+
+        Ok(())
+    }
+}
+
+/// Default collapsed item limit ("Top 10") for the "Recently-listened" section in Your Library.
+pub const RECENTLY_LISTENED_TOP_LIMIT: usize = 10;
+
+/// Kind of item stored in the "Recently-listened" section of Your Library.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RecentListenedKind {
+    Album {
+        album_uri: String,
+        artist_name: String,
+    },
+    Podcast {
+        show_uri: String,
+        publisher: String,
+    },
+}
+
+impl RecentListenedKind {
+    pub fn badge_label(&self) -> &'static str {
+        match self {
+            RecentListenedKind::Album { .. } => "ALBUM",
+            RecentListenedKind::Podcast { .. } => "PODCAST",
+        }
+    }
+
+    pub fn target_uri(&self) -> &str {
+        match self {
+            RecentListenedKind::Album { album_uri, .. } => album_uri,
+            RecentListenedKind::Podcast { show_uri, .. } => show_uri,
+        }
+    }
+
+    pub fn creator_name(&self) -> &str {
+        match self {
+            RecentListenedKind::Album { artist_name, .. } => artist_name,
+            RecentListenedKind::Podcast { publisher, .. } => publisher,
+        }
+    }
+}
+
+/// Persisted entry in the "Recently-listened" library store (Album or Podcast).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RecentListenedItem {
+    pub title: String,
+    pub subtitle: String,
+    pub cover_art_url: Option<String>,
+    pub artwork_theme: ArtworkTheme,
+    pub kind: RecentListenedKind,
+}
+
+impl RecentListenedItem {
+    /// Returns `true` if `self` and `other` refer to the same Album or Podcast entity.
+    pub fn matches_same_entity(&self, other: &Self) -> bool {
+        if self.kind.badge_label() != other.kind.badge_label() {
+            return false;
+        }
+        let a_uri = self.kind.target_uri().trim();
+        let b_uri = other.kind.target_uri().trim();
+        if !a_uri.is_empty() && !b_uri.is_empty() && a_uri.eq_ignore_ascii_case(b_uri) {
+            return true;
+        }
+        !self.title.trim().is_empty()
+            && self.title.trim().eq_ignore_ascii_case(other.title.trim())
+            && self
+                .kind
+                .creator_name()
+                .trim()
+                .eq_ignore_ascii_case(other.kind.creator_name().trim())
+    }
+}
+
+/// Formally verified MRU store for "Recently-listened" Albums & Podcasts in Your Library.
+///
+/// Formal Guarantees:
+/// - **INV-L1 (Bounded Capacity)**: `max_entries >= 10` and `entries.len() <= max_entries`.
+/// - **INV-L2 (Non-Empty Single-Line Metadata)**: Every item has non-empty single-line `title`,
+///   `subtitle`, and `target_uri()`.
+/// - **INV-L3 (Strict Pairwise Deduplication)**: No two items in `entries` match via `matches_same_entity`.
+/// - **INV-L4 (Top-10 Collapse / Expand Projection)**:
+///   - `visible_entries(false)` returns `&entries[..entries.len().min(10)]` (never more than 10).
+///   - `visible_entries(true)` returns all `entries` (showing `> 10` when `entries.len() > 10`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentListenedStore {
+    entries: Vec<RecentListenedItem>,
+    max_entries: usize,
+}
+
+impl Default for RecentListenedStore {
+    fn default() -> Self {
+        Self::new(30)
+    }
+}
+
+impl RecentListenedStore {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            max_entries: max_entries.max(RECENTLY_LISTENED_TOP_LIMIT),
+        }
+    }
+
+    pub fn from_loaded(raw: Vec<RecentListenedItem>, max_entries: usize) -> Self {
+        let mut store = Self::new(max_entries);
+        for item in raw.into_iter().rev() {
+            store.record_item(item);
+        }
+        store
+    }
+
+    #[inline]
+    pub fn entries(&self) -> &[RecentListenedItem] {
+        &self.entries
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[inline]
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    /// Returns the slice of items to display in "Recently-listened":
+    /// - When `expanded == false`, returns at most the Top 10 items (`RECENTLY_LISTENED_TOP_LIMIT`).
+    /// - When `expanded == true`, returns all items (`> 10` when available).
+    #[inline]
+    pub fn visible_entries(&self, expanded: bool) -> &[RecentListenedItem] {
+        if expanded {
+            &self.entries
+        } else {
+            let limit = self.entries.len().min(RECENTLY_LISTENED_TOP_LIMIT);
+            &self.entries[..limit]
+        }
+    }
+
+    /// Returns `true` when there are more than 10 recently-listened items so the UI can show
+    /// the expand/collapse control.
+    #[inline]
+    pub fn has_more_than_top_ten(&self) -> bool {
+        self.entries.len() > RECENTLY_LISTENED_TOP_LIMIT
+    }
+
+    /// Number of additional items beyond the Top 10 when collapsed.
+    #[inline]
+    pub fn extra_count_beyond_top_ten(&self) -> usize {
+        self.entries.len().saturating_sub(RECENTLY_LISTENED_TOP_LIMIT)
+    }
+
+    fn sanitize_item(mut item: RecentListenedItem) -> Option<RecentListenedItem> {
+        let clean_title: String = item.title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if clean_title.is_empty() {
+            return None;
+        }
+        item.title = clean_title;
+
+        match &mut item.kind {
+            RecentListenedKind::Album {
+                album_uri,
+                artist_name,
+            } => {
+                let clean_artist: String = artist_name
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                *artist_name = if clean_artist.is_empty() {
+                    "Artist".to_string()
+                } else {
+                    clean_artist
+                };
+                let clean_uri = album_uri.trim().to_string();
+                *album_uri = if clean_uri.is_empty() {
+                    item.title.clone()
+                } else {
+                    clean_uri
+                };
+            }
+            RecentListenedKind::Podcast {
+                show_uri,
+                publisher,
+            } => {
+                let clean_pub: String = publisher
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                *publisher = if clean_pub.is_empty() {
+                    "Podcast".to_string()
+                } else {
+                    clean_pub
+                };
+                let clean_uri = normalize_spotify_show_uri(show_uri).unwrap_or_else(|| {
+                    let trimmed = show_uri.trim();
+                    if trimmed.is_empty() {
+                        format!("spotify:show:{}", item.title)
+                    } else {
+                        trimmed.to_string()
+                    }
+                });
+                *show_uri = clean_uri;
+            }
+        }
+
+        let clean_sub: String = item
+            .subtitle
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        item.subtitle = if clean_sub.is_empty() {
+            item.kind.creator_name().to_string()
+        } else {
+            clean_sub
+        };
+
+        item.cover_art_url = item
+            .cover_art_url
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty());
+
+        Some(item)
+    }
+
+    /// Records a newly listened Album or Podcast at index `0` (Most Recently Listened),
+    /// deduplicating any existing matching entry while preserving existing cover art if the new
+    /// event did not carry a cover URL.
+    pub fn record_item(&mut self, raw_item: RecentListenedItem) -> bool {
+        let Some(mut item) = Self::sanitize_item(raw_item) else {
+            return false;
+        };
+
+        if item.cover_art_url.is_none() {
+            if let Some(prev_cover) = self
+                .entries
+                .iter()
+                .find(|existing| existing.matches_same_entity(&item))
+                .and_then(|existing| existing.cover_art_url.clone())
+            {
+                item.cover_art_url = Some(prev_cover);
+            }
+        }
+
+        self.entries
+            .retain(|existing| !existing.matches_same_entity(&item));
+        self.entries.insert(0, item);
+        self.entries.truncate(self.max_entries);
+        true
+    }
+
+    /// Appends a fallback/catalog item to the tail of the store only if it is not already present
+    /// and capacity remains, preserving the user's MRU items at the front.
+    pub fn append_if_absent(&mut self, raw_item: RecentListenedItem) -> bool {
+        if self.entries.len() >= self.max_entries {
+            return false;
+        }
+        let Some(item) = Self::sanitize_item(raw_item) else {
+            return false;
+        };
+        if self
+            .entries
+            .iter()
+            .any(|existing| existing.matches_same_entity(&item))
+        {
+            return false;
+        }
+        self.entries.push(item);
+        true
+    }
+}
+
+impl FormalInvariant for RecentListenedStore {
+    fn check_invariants(&self) -> Result<(), InvariantViolation> {
+        // INV-L1: Capacity bound and minimum Top-10 capacity.
+        if self.max_entries < RECENTLY_LISTENED_TOP_LIMIT || self.entries.len() > self.max_entries {
+            return Err(InvariantViolation {
+                code: "INV-L1",
+                subsystem: "RecentListenedStore",
+                details: format!(
+                    "len={} exceeds max_entries={} (min={})",
+                    self.entries.len(),
+                    self.max_entries,
+                    RECENTLY_LISTENED_TOP_LIMIT
+                ),
+            });
+        }
+
+        // INV-L2: Every entry has non-empty single-line title, subtitle, and target URI.
+        for (idx, item) in self.entries.iter().enumerate() {
+            if item.title.trim().is_empty()
+                || item.title.contains('\n')
+                || item.subtitle.trim().is_empty()
+                || item.subtitle.contains('\n')
+                || item.kind.target_uri().trim().is_empty()
+                || item.kind.creator_name().trim().is_empty()
+            {
+                return Err(InvariantViolation {
+                    code: "INV-L2",
+                    subsystem: "RecentListenedStore",
+                    details: format!("entry[{idx}] has blank or multiline metadata: {item:?}"),
+                });
+            }
+        }
+
+        // INV-L3: Strict pairwise entity uniqueness.
+        for i in 0..self.entries.len() {
+            for j in (i + 1)..self.entries.len() {
+                if self.entries[i].matches_same_entity(&self.entries[j]) {
+                    return Err(InvariantViolation {
+                        code: "INV-L3",
+                        subsystem: "RecentListenedStore",
+                        details: format!(
+                            "duplicate recently-listened entities at {i} and {j}: {:?} vs {:?}",
+                            self.entries[i], self.entries[j]
+                        ),
+                    });
+                }
+            }
+        }
+
+        // INV-L4: Top-10 collapsed vs expanded view projection exactness.
+        let collapsed = self.visible_entries(false);
+        let expanded = self.visible_entries(true);
+        if collapsed.len() != self.entries.len().min(RECENTLY_LISTENED_TOP_LIMIT)
+            || collapsed.len() > RECENTLY_LISTENED_TOP_LIMIT
+            || expanded.len() != self.entries.len()
+            || self.has_more_than_top_ten() != (self.entries.len() > RECENTLY_LISTENED_TOP_LIMIT)
+        {
+            return Err(InvariantViolation {
+                code: "INV-L4",
+                subsystem: "RecentListenedStore",
+                details: format!(
+                    "projection mismatch: collapsed={}, expanded={}, total={}",
+                    collapsed.len(),
+                    expanded.len(),
+                    self.entries.len()
+                ),
+            });
         }
 
         Ok(())

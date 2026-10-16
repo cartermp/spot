@@ -8,8 +8,9 @@ pub use formal::{
     normalize_spotify_show_uri, resolve_playable_track_candidate, sanitize_pcm_sample,
     sanitize_position_secs, sanitize_spotify_biography, sanitize_unit_float,
     select_device_verified, summarize_artist_bio, FormalInvariant, InvariantViolation,
-    NavHistoryMachine, NavRouteTarget, RecentSearchEntry, RecentSearchKind, RecentSearchStore,
-    TrayMenuSnapshot, VerifiedTransportAction,
+    NavHistoryMachine, NavRouteTarget, RecentListenedItem, RecentListenedKind,
+    RecentListenedStore, RecentSearchEntry, RecentSearchKind, RecentSearchStore,
+    TrayMenuSnapshot, VerifiedTransportAction, RECENTLY_LISTENED_TOP_LIMIT,
 };
 
 /// Number of logarithmically spaced frequency bands used by the ribbon visualizer.

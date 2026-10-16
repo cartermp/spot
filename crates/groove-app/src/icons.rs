@@ -5,6 +5,7 @@ fn handle(svg_str: &'static str) -> svg::Handle {
 }
 
 /// Groove 5-bar rounded green waveform mark in the top-left of the sidebar.
+#[allow(dead_code)]
 pub fn groove_logo() -> svg::Handle {
     handle(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28" fill="none">

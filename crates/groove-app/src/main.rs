@@ -1,3 +1,4 @@
+mod app_icon;
 mod artwork;
 mod icons;
 mod theme;
@@ -12,8 +13,9 @@ use groove_core::{
     AlbumDetail, AlbumSummary, ArtistDetail, ArtistSummary, AudioDevice, ConnectionStatus,
     EngineEvent, FormalInvariant, InvariantViolation, NavHistoryMachine, NavRouteTarget,
     NavSection, PlaybackState, PlayerCommand, PodcastEpisode, PodcastShowDetail,
-    PodcastShowSummary, RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode,
-    SpectrumFrame, Track, VerifiedTransportAction,
+    PodcastShowSummary, RecentListenedItem, RecentListenedKind, RecentListenedStore,
+    RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode, SpectrumFrame, Track,
+    VerifiedTransportAction, RECENTLY_LISTENED_TOP_LIMIT,
 };
 use groove_spotify::{spawn_engine, EngineHandle};
 use iced::alignment::{Horizontal, Vertical};
@@ -59,9 +61,12 @@ pub fn main() -> iced::Result {
         min_size: Some(Size::new(940.0, 640.0)),
         resizable: true,
         decorations: true,
+        icon: app_icon::window_icon(),
         platform_specific,
         ..Default::default()
     };
+
+    let _ = app_icon::install_macos_dock_icon();
 
     iced::application("Groove", GrooveApp::update, GrooveApp::view)
         .window(window_settings)
@@ -209,6 +214,7 @@ pub enum Message {
     ToggleShowBio,
     PodcastFilterChanged(String),
     ClearPodcastFilter,
+    ToggleRecentlyListenedExpanded,
     CreateNewPlaylist,
     SelectOutputDevice(AudioDevice),
     ConnectSpotifyClicked { force_reauth: bool },
@@ -233,6 +239,8 @@ pub struct GrooveApp {
     spectrum: SpectrumFrame,
     engine: EngineHandle,
     artwork: ArtworkCache,
+    sidebar_app_icon: image::Handle,
+    dock_icon_installed: bool,
     tray: Option<GrooveTray>,
     tray_init_attempted: bool,
     keyboard_modifiers: iced::keyboard::Modifiers,
@@ -241,6 +249,8 @@ pub struct GrooveApp {
     scrubbing_position: Option<f32>,
     search_query: String,
     recent_searches: RecentSearchStore,
+    recently_listened: RecentListenedStore,
+    recently_listened_expanded: bool,
     search_artists: Vec<ArtistSummary>,
     search_albums: Vec<AlbumSummary>,
     search_shows: Vec<PodcastShowSummary>,
@@ -262,6 +272,7 @@ impl FormalInvariant for GrooveApp {
         self.state.check_invariants()?;
         self.nav_history.check_invariants()?;
         self.recent_searches.check_invariants()?;
+        self.recently_listened.check_invariants()?;
         self.spectrum.check_invariants()?;
         if let Some(show) = &self.selected_show {
             show.check_invariants()?;
@@ -291,7 +302,10 @@ impl GrooveApp {
         );
 
         let recent_searches = load_recent_searches();
+        let recently_listened = load_recently_listened();
         let artwork = ArtworkCache::new();
+        let sidebar_app_icon = app_icon::sidebar_badge_handle();
+        let dock_icon_installed = app_icon::install_macos_dock_icon();
         let tray = GrooveTray::try_new(&state, &artwork);
         let tray_init_attempted = tray.is_some();
         let podcast_directory = groove_spotify::web_api::featured_podcast_shows();
@@ -304,6 +318,8 @@ impl GrooveApp {
             spectrum: SpectrumFrame::calm_preview(0.0),
             engine,
             artwork,
+            sidebar_app_icon,
+            dock_icon_installed,
             tray,
             tray_init_attempted,
             keyboard_modifiers: iced::keyboard::Modifiers::empty(),
@@ -312,6 +328,8 @@ impl GrooveApp {
             scrubbing_position: None,
             search_query: String::new(),
             recent_searches,
+            recently_listened,
+            recently_listened_expanded: false,
             search_artists: Vec::new(),
             search_albums: Vec::new(),
             search_shows: Vec::new(),
@@ -557,6 +575,17 @@ impl GrooveApp {
                 );
             }
         }
+        if let Some(item) = self.recently_listened.entries().iter().find(|it| {
+            matches!(&it.kind, RecentListenedKind::Album { album_uri, .. }
+                if album_uri.eq_ignore_ascii_case(album_id_or_uri)
+                    || it.title.eq_ignore_ascii_case(album_id_or_uri))
+        }) {
+            return (
+                item.title.clone(),
+                Some(item.kind.creator_name().to_string()),
+                None,
+            );
+        }
         if album_id_or_uri.starts_with("spotify:album:") {
             ("Album".to_string(), None, None)
         } else {
@@ -565,6 +594,87 @@ impl GrooveApp {
                 Some(self.state.current_track.artist.clone()),
                 None,
             )
+        }
+    }
+
+    fn record_recently_listened(&mut self, item: RecentListenedItem) {
+        if self.recently_listened.record_item(item) {
+            debug_assert!(self.recently_listened.check_invariants().is_ok());
+            save_recently_listened(self.recently_listened.entries());
+        }
+    }
+
+    fn record_recently_listened_from_track(&mut self, track: &Track) {
+        if track.title.trim().is_empty() || track.title == "Ready to Play" {
+            return;
+        }
+        if track.spotify_uri.starts_with("spotify:episode:") {
+            let (show_title, publisher, show_opt) = self.resolve_show_meta(&track.album);
+            let show_uri = show_opt
+                .as_ref()
+                .map(|s| s.spotify_uri.clone())
+                .unwrap_or_else(|| format!("spotify:show:{show_title}"));
+            let cover = track
+                .cover_art_url
+                .clone()
+                .or_else(|| show_opt.and_then(|s| s.cover_art_url));
+            self.record_recently_listened(RecentListenedItem {
+                title: show_title,
+                subtitle: format!("Podcast · {publisher}"),
+                cover_art_url: cover,
+                artwork_theme: track.artwork_theme,
+                kind: RecentListenedKind::Podcast {
+                    show_uri,
+                    publisher,
+                },
+            });
+        } else if !track.album.trim().is_empty() {
+            let mut album_uri = track.album.clone();
+            let mut cover = track.cover_art_url.clone();
+            if let Some(detail) = &self.selected_album {
+                if detail.album.title.eq_ignore_ascii_case(&track.album) {
+                    album_uri = detail.album.spotify_uri.clone();
+                    if cover.is_none() {
+                        cover = detail.album.cover_art_url.clone();
+                    }
+                }
+            }
+            if !album_uri.starts_with("spotify:album:") {
+                if let Some(artist_detail) = &self.selected_artist {
+                    if let Some(alb) = artist_detail
+                        .albums
+                        .iter()
+                        .find(|a| a.title.eq_ignore_ascii_case(&track.album))
+                    {
+                        album_uri = alb.spotify_uri.clone();
+                        if cover.is_none() {
+                            cover = alb.cover_art_url.clone();
+                        }
+                    }
+                }
+            }
+            if !album_uri.starts_with("spotify:album:") {
+                if let Some(alb) = self
+                    .search_albums
+                    .iter()
+                    .find(|a| a.title.eq_ignore_ascii_case(&track.album))
+                {
+                    album_uri = alb.spotify_uri.clone();
+                    if cover.is_none() {
+                        cover = alb.cover_art_url.clone();
+                    }
+                }
+            }
+            self.record_recently_listened(RecentListenedItem {
+                title: track.album.clone(),
+                subtitle: format!("Album · {}", track.artist),
+                cover_art_url: cover,
+                artwork_theme: track.artwork_theme,
+                kind: RecentListenedKind::Album {
+                    album_uri,
+                    artist_name: track.artist.clone(),
+                },
+            });
         }
     }
 
@@ -605,6 +715,9 @@ impl GrooveApp {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::AnimationTick => {
+                if !self.dock_icon_installed {
+                    self.dock_icon_installed = app_icon::install_macos_dock_icon();
+                }
                 if !self.tray_init_attempted {
                     self.tray_init_attempted = true;
                     self.tray = GrooveTray::try_new(&self.state, &self.artwork);
@@ -772,6 +885,7 @@ impl GrooveApp {
                         },
                     });
                 }
+                self.record_recently_listened_from_track(&track);
                 let _ = self
                     .engine
                     .command_tx
@@ -896,6 +1010,33 @@ impl GrooveApp {
                         }
                     }
                     if self.selected_album.is_none() {
+                        if let Some(item) = self.recently_listened.entries().iter().find(|it| {
+                            matches!(&it.kind, RecentListenedKind::Album { album_uri: u, .. }
+                                if u.eq_ignore_ascii_case(&album_uri)
+                                    || it.title.eq_ignore_ascii_case(&album_uri))
+                        }) {
+                            let id = album_uri
+                                .strip_prefix("spotify:album:")
+                                .unwrap_or(&album_uri)
+                                .to_string();
+                            self.selected_album = Some(AlbumDetail {
+                                album: AlbumSummary {
+                                    id,
+                                    spotify_uri: item.kind.target_uri().to_string(),
+                                    title: item.title.clone(),
+                                    artist_name: item.kind.creator_name().to_string(),
+                                    release_year: "2024".to_string(),
+                                    album_type: "Album".to_string(),
+                                    track_count: 0,
+                                    cover_art_url: item.cover_art_url.clone(),
+                                    artwork_theme: item.artwork_theme,
+                                },
+                                artist_uri: artist_uri.clone(),
+                                tracks: Vec::new(),
+                            });
+                        }
+                    }
+                    if self.selected_album.is_none() {
                         self.selected_album = Some(groove_spotify::web_api::fallback_album_detail(
                             &album_uri, None,
                         ));
@@ -915,16 +1056,58 @@ impl GrooveApp {
             Message::PlayAlbum(album_uri) => {
                 let (label, artist_name, _) = self.resolve_album_meta(&album_uri);
                 tracing::info!("[UI] PlayAlbum('{album_uri}') -> label='{label}'");
+                let artist_str = artist_name
+                    .clone()
+                    .unwrap_or_else(|| "Album".to_string());
                 if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
                     && label != "Album"
                 {
-                    let artist_str = artist_name.unwrap_or_else(|| "Album".to_string());
                     self.record_recent_search_entry(RecentSearchEntry {
                         label: label.clone(),
                         subtitle: format!("Album · {artist_str}"),
-                        query: label,
+                        query: label.clone(),
                         kind: RecentSearchKind::Album {
                             uri: album_uri.clone(),
+                            artist_name: artist_str.clone(),
+                        },
+                    });
+                }
+                if label != "Album" {
+                    let cover = self
+                        .selected_album
+                        .as_ref()
+                        .filter(|d| {
+                            d.album.spotify_uri.eq_ignore_ascii_case(&album_uri)
+                                || d.album.title.eq_ignore_ascii_case(&label)
+                        })
+                        .and_then(|d| d.album.cover_art_url.clone())
+                        .or_else(|| {
+                            self.selected_artist.as_ref().and_then(|ad| {
+                                ad.albums
+                                    .iter()
+                                    .find(|a| {
+                                        a.spotify_uri.eq_ignore_ascii_case(&album_uri)
+                                            || a.title.eq_ignore_ascii_case(&label)
+                                    })
+                                    .and_then(|a| a.cover_art_url.clone())
+                            })
+                        })
+                        .or_else(|| {
+                            self.search_albums
+                                .iter()
+                                .find(|a| {
+                                    a.spotify_uri.eq_ignore_ascii_case(&album_uri)
+                                        || a.title.eq_ignore_ascii_case(&label)
+                                })
+                                .and_then(|a| a.cover_art_url.clone())
+                        });
+                    self.record_recently_listened(RecentListenedItem {
+                        title: label,
+                        subtitle: format!("Album · {artist_str}"),
+                        cover_art_url: cover,
+                        artwork_theme: groove_core::ArtworkTheme::SunriseMountainLake,
+                        kind: RecentListenedKind::Album {
+                            album_uri: album_uri.clone(),
                             artist_name: artist_str,
                         },
                     });
@@ -936,14 +1119,27 @@ impl GrooveApp {
                 self.push_route(StageRoute::Section(NavSection::NowPlaying));
             }
             Message::PlayAlbumTrack(track_idx) => {
-                if let Some(detail) = &self.selected_album {
+                if let Some(detail) = self.selected_album.clone() {
                     if let Some(chosen) = detail.tracks.get(track_idx).cloned() {
                         tracing::info!(
                             "[UI] PlayAlbumTrack({track_idx}) -> '{}' from album '{}'",
                             chosen.title,
                             detail.album.title
                         );
-                        self.state.queue = detail.tracks.clone();
+                        self.record_recently_listened(RecentListenedItem {
+                            title: detail.album.title.clone(),
+                            subtitle: format!(
+                                "Album · {} · {}",
+                                detail.album.artist_name, detail.album.release_year
+                            ),
+                            cover_art_url: detail.album.cover_art_url.clone(),
+                            artwork_theme: detail.album.artwork_theme,
+                            kind: RecentListenedKind::Album {
+                                album_uri: detail.album.spotify_uri.clone(),
+                                artist_name: detail.album.artist_name.clone(),
+                            },
+                        });
+                        self.state.queue = detail.tracks;
                         self.state
                             .apply_verified_action(VerifiedTransportAction::PlayTrack(
                                 chosen.clone(),
@@ -1017,7 +1213,7 @@ impl GrooveApp {
                     .send(PlayerCommand::SelectShow(show_uri));
             }
             Message::PlayShow(show_uri) => {
-                let (label, publisher, _) = self.resolve_show_meta(&show_uri);
+                let (label, publisher, summary_opt) = self.resolve_show_meta(&show_uri);
                 tracing::info!("[UI] PlayShow('{show_uri}') -> label='{label}'");
                 if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
                     && label != "Podcast"
@@ -1025,9 +1221,26 @@ impl GrooveApp {
                     self.record_recent_search_entry(RecentSearchEntry {
                         label: label.clone(),
                         subtitle: format!("Podcast · {publisher}"),
-                        query: label,
+                        query: label.clone(),
                         kind: RecentSearchKind::Show {
                             uri: show_uri.clone(),
+                            publisher: publisher.clone(),
+                        },
+                    });
+                }
+                if label != "Podcast" {
+                    let cover = summary_opt.as_ref().and_then(|s| s.cover_art_url.clone());
+                    let theme = summary_opt
+                        .as_ref()
+                        .map(|s| s.artwork_theme)
+                        .unwrap_or(groove_core::ArtworkTheme::SunriseMountainLake);
+                    self.record_recently_listened(RecentListenedItem {
+                        title: label,
+                        subtitle: format!("Podcast · {publisher}"),
+                        cover_art_url: cover,
+                        artwork_theme: theme,
+                        kind: RecentListenedKind::Podcast {
+                            show_uri: show_uri.clone(),
                             publisher,
                         },
                     });
@@ -1039,7 +1252,7 @@ impl GrooveApp {
                 self.push_route(StageRoute::Section(NavSection::NowPlaying));
             }
             Message::PlayShowEpisode(ep_idx) => {
-                if let Some(detail) = &self.selected_show {
+                if let Some(detail) = self.selected_show.clone() {
                     if let Some(chosen_ep) = detail.episodes.get(ep_idx) {
                         let chosen_track = chosen_ep.into_playable_track();
                         tracing::info!(
@@ -1048,6 +1261,16 @@ impl GrooveApp {
                             detail.show.title,
                             chosen_track.spotify_uri
                         );
+                        self.record_recently_listened(RecentListenedItem {
+                            title: detail.show.title.clone(),
+                            subtitle: format!("Podcast · {}", detail.show.publisher),
+                            cover_art_url: detail.show.cover_art_url.clone(),
+                            artwork_theme: detail.show.artwork_theme,
+                            kind: RecentListenedKind::Podcast {
+                                show_uri: detail.show.spotify_uri.clone(),
+                                publisher: detail.show.publisher.clone(),
+                            },
+                        });
                         self.state.queue = detail
                             .episodes
                             .iter()
@@ -1083,6 +1306,17 @@ impl GrooveApp {
                         },
                     });
                 }
+                let (_, publisher, _) = self.resolve_show_meta(&episode.show_uri);
+                self.record_recently_listened(RecentListenedItem {
+                    title: episode.show_title.clone(),
+                    subtitle: format!("Podcast · {publisher}"),
+                    cover_art_url: episode.cover_art_url.clone(),
+                    artwork_theme: episode.artwork_theme,
+                    kind: RecentListenedKind::Podcast {
+                        show_uri: episode.show_uri.clone(),
+                        publisher,
+                    },
+                });
                 self.state
                     .apply_verified_action(VerifiedTransportAction::PlayTrack(track.clone()));
                 let _ = self.engine.command_tx.send(PlayerCommand::PlayTrack(track));
@@ -1100,6 +1334,17 @@ impl GrooveApp {
             }
             Message::ClearPodcastFilter => {
                 self.podcast_filter_query.clear();
+            }
+            Message::ToggleRecentlyListenedExpanded => {
+                self.recently_listened_expanded = !self.recently_listened_expanded;
+                tracing::info!(
+                    "[UI] ToggleRecentlyListenedExpanded -> expanded={} (showing {}/{} items)",
+                    self.recently_listened_expanded,
+                    self.recently_listened
+                        .visible_entries(self.recently_listened_expanded)
+                        .len(),
+                    self.recently_listened.len()
+                );
             }
             Message::CreateNewPlaylist => {
                 let next_idx = self.state.playlists.len() + 1;
@@ -1355,6 +1600,11 @@ impl GrooveApp {
                 urls.push(u.clone());
             }
         }
+        for item in self.recently_listened.entries() {
+            if let Some(u) = &item.cover_art_url {
+                urls.push(u.clone());
+            }
+        }
         for t in &self.search_results {
             if let Some(u) = &t.cover_art_url {
                 urls.push(u.clone());
@@ -1530,6 +1780,31 @@ impl GrooveApp {
                 let loaded_uri = detail.album.spotify_uri.clone();
                 let loaded_artist_name = detail.album.artist_name.clone();
                 let loaded_artist_uri = detail.artist_uri.clone();
+                if self.state.is_playing
+                    && (self
+                        .state
+                        .current_track
+                        .album
+                        .eq_ignore_ascii_case(&detail.album.title)
+                        || detail
+                            .tracks
+                            .iter()
+                            .any(|t| t.spotify_uri == self.state.current_track.spotify_uri))
+                {
+                    self.record_recently_listened(RecentListenedItem {
+                        title: detail.album.title.clone(),
+                        subtitle: format!(
+                            "Album · {} · {}",
+                            detail.album.artist_name, detail.album.release_year
+                        ),
+                        cover_art_url: detail.album.cover_art_url.clone(),
+                        artwork_theme: detail.album.artwork_theme,
+                        kind: RecentListenedKind::Album {
+                            album_uri: detail.album.spotify_uri.clone(),
+                            artist_name: detail.album.artist_name.clone(),
+                        },
+                    });
+                }
                 self.selected_album = Some(*detail);
                 if let StageRoute::Album {
                     id_or_uri,
@@ -1555,6 +1830,28 @@ impl GrooveApp {
                 );
                 let loaded_title = detail.show.title.clone();
                 let loaded_uri = detail.show.spotify_uri.clone();
+                if self.state.is_playing
+                    && (self
+                        .state
+                        .current_track
+                        .album
+                        .eq_ignore_ascii_case(&detail.show.title)
+                        || detail
+                            .episodes
+                            .iter()
+                            .any(|ep| ep.spotify_uri == self.state.current_track.spotify_uri))
+                {
+                    self.record_recently_listened(RecentListenedItem {
+                        title: detail.show.title.clone(),
+                        subtitle: format!("Podcast · {}", detail.show.publisher),
+                        cover_art_url: detail.show.cover_art_url.clone(),
+                        artwork_theme: detail.show.artwork_theme,
+                        kind: RecentListenedKind::Podcast {
+                            show_uri: detail.show.spotify_uri.clone(),
+                            publisher: detail.show.publisher.clone(),
+                        },
+                    });
+                }
                 self.selected_show = Some(*detail);
                 self.show_bio_expanded = false;
                 if let StageRoute::Show { id_or_uri, label } = self.nav_history.current_mut() {
@@ -1589,9 +1886,9 @@ impl GrooveApp {
     /// Column 1: Frosted warm-stone left sidebar matching the Groove mockup.
     fn view_sidebar(&self) -> Element<'_, Message> {
         let brand_header = row![
-            svg(icons::groove_logo())
-                .width(Length::Fixed(30.0))
-                .height(Length::Fixed(30.0)),
+            image(self.sidebar_app_icon.clone())
+                .width(Length::Fixed(34.0))
+                .height(Length::Fixed(34.0)),
             column![
                 text("Groove")
                     .font(SERIF_FONT)
@@ -3574,21 +3871,210 @@ impl GrooveApp {
         };
 
         let header = row![
-            text(heading)
-                .font(SERIF_FONT)
-                .size(32)
-                .color(palette::INK_PRIMARY),
+            column![
+                text(heading)
+                    .font(SERIF_FONT)
+                    .size(32)
+                    .color(palette::INK_PRIMARY),
+                text("Recently-listened albums & podcasts and your playlists")
+                    .size(13.0)
+                    .color(palette::INK_SECONDARY),
+            ]
+            .spacing(3),
             horizontal_space(),
         ]
         .align_y(Alignment::Center);
 
-        let mut playlist_cards = column![
+        let visible_recent = self
+            .recently_listened
+            .visible_entries(self.recently_listened_expanded);
+        let total_recent = self.recently_listened.len();
+        let extra_count = self.recently_listened.extra_count_beyond_top_ten();
+
+        let status_badge_label = if self.recently_listened_expanded {
+            format!("Showing all {total_recent}")
+        } else {
+            format!(
+                "Top {}",
+                visible_recent.len().min(RECENTLY_LISTENED_TOP_LIMIT)
+            )
+        };
+
+        let mut recent_header_row = row![
+            text("Recently-listened")
+                .font(SERIF_FONT)
+                .size(23)
+                .color(palette::INK_PRIMARY),
+            container(
+                text(status_badge_label)
+                    .size(11.5)
+                    .color(palette::INK_SECONDARY),
+            )
+            .padding(Padding::from([3, 9]))
+            .style(|_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(palette::SIDEBAR_ACTIVE_PILL)),
+                border: iced::Border {
+                    radius: 10.0.into(),
+                    color: palette::DIVIDER,
+                    width: 1.0,
+                },
+                ..Default::default()
+            }),
+            horizontal_space(),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        if self.recently_listened.has_more_than_top_ten() {
+            let toggle_label = if self.recently_listened_expanded {
+                "Show Top 10  ▴".to_string()
+            } else {
+                format!("Show More (+{extra_count})  ▾")
+            };
+            recent_header_row = recent_header_row.push(
+                button(text(toggle_label).size(12.0).color(palette::EMERALD))
+                    .on_press(Message::ToggleRecentlyListenedExpanded)
+                    .padding(Padding::from([6, 12]))
+                    .style(theme::subtle_row_button(false)),
+            );
+        }
+
+        let mut recent_section = column![recent_header_row].spacing(8);
+
+        for (idx, item) in visible_recent.iter().enumerate() {
+            let target_uri = item.kind.target_uri().to_string();
+            let (open_msg, play_msg, kind_badge) = match &item.kind {
+                RecentListenedKind::Album { .. } => (
+                    Message::OpenAlbum(target_uri.clone()),
+                    Message::PlayAlbum(target_uri),
+                    "ALBUM",
+                ),
+                RecentListenedKind::Podcast { .. } => (
+                    Message::OpenShow(target_uri.clone()),
+                    Message::PlayShow(target_uri),
+                    "PODCAST",
+                ),
+            };
+
+            let is_playing_this = self
+                .state
+                .current_track
+                .album
+                .eq_ignore_ascii_case(&item.title);
+
+            let row_item = row![
+                button(
+                    row![
+                        text(format!("{:02}", idx + 1))
+                            .size(12.0)
+                            .color(palette::INK_MUTED)
+                            .width(Length::Fixed(24.0)),
+                        image(
+                            self.artwork
+                                .thumb_or_url(item.cover_art_url.as_deref(), item.artwork_theme)
+                        )
+                        .width(Length::Fixed(52.0))
+                        .height(Length::Fixed(52.0)),
+                        column![
+                            row![
+                                container(
+                                    text(kind_badge).size(9.5).color(palette::EMERALD),
+                                )
+                                .padding(Padding::from([2, 6]))
+                                .style(|_theme: &Theme| container::Style {
+                                    background: Some(iced::Background::Color(
+                                        palette::SIDEBAR_ACTIVE_PILL
+                                    )),
+                                    border: iced::Border {
+                                        radius: 6.0.into(),
+                                        color: palette::DIVIDER,
+                                        width: 1.0,
+                                    },
+                                    ..Default::default()
+                                }),
+                                text(&item.title).size(15.0).color(palette::INK_PRIMARY),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                            text(&item.subtitle)
+                                .size(12.5)
+                                .color(palette::INK_SECONDARY),
+                        ]
+                        .spacing(3)
+                        .width(Length::Fill),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(open_msg)
+                .width(Length::Fill)
+                .padding(Padding::from([8, 12]))
+                .style(theme::subtle_row_button(is_playing_this)),
+                button(text("▶  Play").size(12.0).color(palette::INK_PRIMARY))
+                    .on_press(play_msg)
+                    .padding(Padding::from([10, 14]))
+                    .style(theme::subtle_row_button(false)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            recent_section = recent_section.push(row_item);
+        }
+
+        if self.recently_listened.has_more_than_top_ten() {
+            let footer_label = if self.recently_listened_expanded {
+                "Collapse to Top 10 Recently-listened  ▴".to_string()
+            } else {
+                format!(
+                    "Show {extra_count} More Recently-listened Albums & Podcasts  ▾"
+                )
+            };
+            recent_section = recent_section.push(
+                button(
+                    row![
+                        horizontal_space(),
+                        text(footer_label).size(12.5).color(palette::EMERALD),
+                        horizontal_space(),
+                    ]
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::ToggleRecentlyListenedExpanded)
+                .width(Length::Fill)
+                .padding(Padding::from([8, 12]))
+                .style(theme::subtle_row_button(false)),
+            );
+        }
+
+        let playlists_header = row![
             text("Playlists")
                 .font(SERIF_FONT)
-                .size(22)
+                .size(23)
                 .color(palette::INK_PRIMARY),
+            container(
+                text(format!("{}", self.state.playlists.len()))
+                    .size(11.5)
+                    .color(palette::INK_SECONDARY),
+            )
+            .padding(Padding::from([3, 9]))
+            .style(|_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(palette::SIDEBAR_ACTIVE_PILL)),
+                border: iced::Border {
+                    radius: 10.0.into(),
+                    color: palette::DIVIDER,
+                    width: 1.0,
+                },
+                ..Default::default()
+            }),
+            horizontal_space(),
+            button(text("+ New Playlist").size(12.0).color(palette::INK_SECONDARY))
+                .on_press(Message::CreateNewPlaylist)
+                .padding(Padding::from([6, 12]))
+                .style(theme::subtle_row_button(false)),
         ]
-        .spacing(10);
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        let mut playlist_cards = column![playlists_header].spacing(10);
         if self.state.playlists.is_empty() {
             playlist_cards = playlist_cards.push(
                 text("Connect your Spotify account to load your playlists.")
@@ -3625,12 +4111,26 @@ impl GrooveApp {
             playlist_cards = playlist_cards.push(card);
         }
 
-        let mut top_col = column![vertical_space().height(Length::Fixed(10.0)), header,].spacing(12);
+        let library_body = column![recent_section, horizontal_rule(1), playlist_cards]
+            .spacing(22)
+            .padding(Padding {
+                top: 0.0,
+                right: 16.0,
+                bottom: 20.0,
+                left: 0.0,
+            });
+
+        let mut top_col = column![
+            vertical_space().height(Length::Fixed(10.0)),
+            self.view_navigation_bar(),
+            header,
+        ]
+        .spacing(12);
         if let Some(banner) = self.view_spotify_auth_banner() {
             top_col = top_col.push(banner);
         }
         top_col = top_col
-            .push(scrollable(playlist_cards).height(Length::Fill))
+            .push(scrollable(library_body).height(Length::Fill))
             .padding(Padding::from([20, 34]));
 
         container(top_col)
@@ -3760,6 +4260,45 @@ fn save_recent_searches(entries: &[RecentSearchEntry]) {
         return;
     }
     let path = recent_searches_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(entries) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+fn recently_listened_file_path() -> PathBuf {
+    groove_spotify::auth::AppCachePaths::resolve()
+        .root_dir
+        .join("recently_listened.json")
+}
+
+fn load_recently_listened() -> RecentListenedStore {
+    let mut store = if cfg!(test) {
+        RecentListenedStore::new(24)
+    } else {
+        let path = recently_listened_file_path();
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let raw =
+                    serde_json::from_slice::<Vec<RecentListenedItem>>(&bytes).unwrap_or_default();
+                RecentListenedStore::from_loaded(raw, 24)
+            }
+            Err(_) => RecentListenedStore::new(24),
+        }
+    };
+    for seed in groove_spotify::web_api::default_recently_listened_items() {
+        store.append_if_absent(seed);
+    }
+    store
+}
+
+fn save_recently_listened(entries: &[RecentListenedItem]) {
+    if cfg!(test) {
+        return;
+    }
+    let path = recently_listened_file_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -3939,6 +4478,72 @@ mod tests {
         );
         assert!(app.state.is_playing);
         assert_eq!(app.state.current_track.formatted_duration(), "1:15:20");
+        app.assert_invariants();
+    }
+
+    #[test]
+    fn your_library_shows_top_10_recently_listened_and_expands_to_more_than_10() {
+        let (mut app, _) = GrooveApp::new();
+        assert!(app.recently_listened.len() > RECENTLY_LISTENED_TOP_LIMIT);
+        assert!(app.recently_listened.has_more_than_top_ten());
+        assert!(!app.recently_listened_expanded);
+        assert_eq!(
+            app.recently_listened
+                .visible_entries(app.recently_listened_expanded)
+                .len(),
+            RECENTLY_LISTENED_TOP_LIMIT
+        );
+
+        // Navigate to Your Library and render collapsed Top 10 + Playlists
+        let _ = app.update(Message::SelectNav(NavSection::YourLibrary));
+        assert_eq!(app.active_nav, NavSection::YourLibrary);
+        let _ = app.view();
+        app.assert_invariants();
+
+        // Expand Recently-listened to show more than 10
+        let _ = app.update(Message::ToggleRecentlyListenedExpanded);
+        assert!(app.recently_listened_expanded);
+        assert_eq!(
+            app.recently_listened
+                .visible_entries(app.recently_listened_expanded)
+                .len(),
+            app.recently_listened.len()
+        );
+        assert!(
+            app.recently_listened
+                .visible_entries(app.recently_listened_expanded)
+                .len()
+                > RECENTLY_LISTENED_TOP_LIMIT
+        );
+        let _ = app.view();
+        app.assert_invariants();
+
+        // Playing an item promotes it to #1 in Recently-listened
+        let item_at_12 = app.recently_listened.entries()[12].clone();
+        let target_uri = item_at_12.kind.target_uri().to_string();
+        match &item_at_12.kind {
+            RecentListenedKind::Album { .. } => {
+                let _ = app.update(Message::PlayAlbum(target_uri.clone()));
+            }
+            RecentListenedKind::Podcast { .. } => {
+                let _ = app.update(Message::PlayShow(target_uri.clone()));
+            }
+        }
+        assert_eq!(
+            app.recently_listened.entries()[0].kind.target_uri(),
+            target_uri
+        );
+        app.assert_invariants();
+
+        // Collapse back to Top 10
+        let _ = app.update(Message::ToggleRecentlyListenedExpanded);
+        assert!(!app.recently_listened_expanded);
+        assert_eq!(
+            app.recently_listened
+                .visible_entries(app.recently_listened_expanded)
+                .len(),
+            RECENTLY_LISTENED_TOP_LIMIT
+        );
         app.assert_invariants();
     }
 }

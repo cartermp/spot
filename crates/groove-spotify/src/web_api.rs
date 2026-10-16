@@ -3,7 +3,7 @@ use std::time::Duration;
 use groove_core::{
     normalize_spotify_episode_uri, normalize_spotify_show_uri, AlbumDetail, AlbumSummary,
     ArtistDetail, ArtistSummary, ArtworkTheme, PlaybackState, Playlist, PodcastEpisode,
-    PodcastShowDetail, PodcastShowSummary, Track,
+    PodcastShowDetail, PodcastShowSummary, RecentListenedItem, RecentListenedKind, Track,
 };
 use librespot_core::{Session, SpotifyUri};
 use librespot_metadata::{
@@ -2415,6 +2415,123 @@ pub fn search_podcast_shows(query: &str) -> Vec<PodcastShowSummary> {
 
     scored.sort_by(|a, b| b.0.cmp(&a.0));
     scored.into_iter().take(6).map(|(_, s)| s).collect()
+}
+
+/// Curated seed list of 16 real Spotify Albums and Podcasts with canonical URIs
+/// (`spotify:album:<id>` and `spotify:show:<id>`) and Spotify CDN cover artwork.
+/// Used to populate `RecentListenedStore` behind any user-recorded listening history so
+/// "Recently-listened" in Your Library displays Top 10 items by default and supports expanding
+/// to view all `> 10` items.
+pub fn default_recently_listened_items() -> Vec<RecentListenedItem> {
+    let shows = featured_podcast_shows();
+    let show_item = |idx: usize| -> RecentListenedItem {
+        let s = &shows[idx % shows.len()];
+        RecentListenedItem {
+            title: s.title.clone(),
+            subtitle: format!("Podcast · {}", s.publisher),
+            cover_art_url: s.cover_art_url.clone(),
+            artwork_theme: s.artwork_theme,
+            kind: RecentListenedKind::Podcast {
+                show_uri: s.spotify_uri.clone(),
+                publisher: s.publisher.clone(),
+            },
+        }
+    };
+
+    let album_item = |id: &str,
+                      title: &str,
+                      artist: &str,
+                      year: &str,
+                      cover_url: Option<&str>,
+                      theme: ArtworkTheme|
+     -> RecentListenedItem {
+        RecentListenedItem {
+            title: title.to_string(),
+            subtitle: format!("Album · {artist} · {year}"),
+            cover_art_url: cover_url.map(|u| u.to_string()),
+            artwork_theme: theme,
+            kind: RecentListenedKind::Album {
+                album_uri: format!("spotify:album:{id}"),
+                artist_name: artist.to_string(),
+            },
+        }
+    };
+
+    vec![
+        album_item(
+            "4m2880jivSbbyEGAKfITCa",
+            "Random Access Memories",
+            "Daft Punk",
+            "2013",
+            Some("https://i.scdn.co/image/ab67616d0000b2739b9b36b0e22870b9f542d937"),
+            ArtworkTheme::TwilightHorizon,
+        ),
+        show_item(0), // Huberman Lab
+        album_item(
+            "5vkqYmiPBYLaalcmjujWxK",
+            "In Rainbows",
+            "Radiohead",
+            "2007",
+            Some("https://i.scdn.co/image/ab67616d0000b273de3c04b5fc750b68899b20a9"),
+            ArtworkTheme::GoldenCanyon,
+        ),
+        show_item(1), // Lex Fridman Podcast
+        album_item(
+            "79dL7FLiJFOO0EoehUHQBv",
+            "Currents",
+            "Tame Impala",
+            "2015",
+            Some("https://i.scdn.co/image/ab67616d0000b2739e1cfc756886ac782e363d79"),
+            ArtworkTheme::VioletAura,
+        ),
+        show_item(2), // The Daily
+        album_item(
+            "4LH4d3cOWNNsVw41Gqt2kv",
+            "The Dark Side of the Moon",
+            "Pink Floyd",
+            "1973",
+            Some("https://i.scdn.co/image/ab67616d0000b273db216ca805faf5fe35df4ee6"),
+            ArtworkTheme::MistyArch,
+        ),
+        show_item(3), // Darknet Diaries
+        album_item(
+            "78bpIziExqiI9qztvNFlQu",
+            "AM",
+            "Arctic Monkeys",
+            "2013",
+            Some("https://i.scdn.co/image/ab67616d0000b2734ae1c4c5c45aabe565499163"),
+            ArtworkTheme::MoonlitClouds,
+        ),
+        show_item(4), // Syntax
+        // Items 11..=16 (revealed when "Show More" is expanded beyond the Top 10)
+        album_item(
+            "1vWnB0hYmluskQuzxwo25a",
+            "Music Has The Right To Children",
+            "Boards of Canada",
+            "1998",
+            Some("https://i.scdn.co/image/ab67616d0000b2730ddcb1077d30a5ffb59b6864"),
+            ArtworkTheme::SunriseMountainLake,
+        ),
+        show_item(5), // 99% Invisible
+        album_item(
+            "0fLhefnjlIV3pGNF9Wo8CD",
+            "Californication",
+            "Red Hot Chili Peppers",
+            "1999",
+            Some("https://i.scdn.co/image/ab67616d0000b273a9249ebb15ca7a5b75f16a90"),
+            ArtworkTheme::DawnReflection,
+        ),
+        show_item(6), // How I Built This
+        album_item(
+            "623Ef2ZEB3Njklix4PC0Rs",
+            "channel ORANGE",
+            "Frank Ocean",
+            "2012",
+            Some("https://i.scdn.co/image/ab67616d0000b273f11f1c4ad183b7fa625f8534"),
+            ArtworkTheme::WarmDusk,
+        ),
+        show_item(10), // Science Vs
+    ]
 }
 
 
