@@ -9,13 +9,14 @@ use artwork::{download_and_decode_artwork, ArtworkCache, DecodedArtwork};
 use groove_audio::SpectrumAnalyzer;
 use groove_core::{
     delete_last_word_verified, format_compact_count, format_seconds, merge_devices_verified,
-    sanitize_position_secs, sanitize_unit_float, select_device_verified, summarize_artist_bio,
-    AlbumDetail, AlbumPlaybackQueue, AlbumSummary, ArtistDetail, ArtistSummary, AudioDevice,
-    ConnectionStatus, EngineEvent, FormalInvariant, InvariantViolation, NavHistoryMachine,
-    NavRouteTarget, NavSection, PlaybackContext, PlaybackState, PlayerCommand, PodcastEpisode,
-    PodcastShowDetail, PodcastShowSummary, RecentListenedItem, RecentListenedKind,
-    RecentListenedStore, RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode,
-    SpectrumFrame, Track, VerifiedTransportAction, RECENTLY_LISTENED_TOP_LIMIT,
+    sanitize_position_secs, sanitize_unit_float, select_device_verified,
+    should_toggle_play_pause_on_space_verified, summarize_artist_bio, AlbumDetail,
+    AlbumPlaybackQueue, AlbumSummary, ArtistDetail, ArtistSummary, AudioDevice, ConnectionStatus,
+    EngineEvent, FormalInvariant, InvariantViolation, NavHistoryMachine, NavRouteTarget,
+    NavSection, PlaybackContext, PlaybackState, PlayerCommand, PodcastEpisode, PodcastShowDetail,
+    PodcastShowSummary, RecentListenedItem, RecentListenedKind, RecentListenedStore,
+    RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode, SpectrumFrame, Track,
+    VerifiedTransportAction, RECENTLY_LISTENED_TOP_LIMIT,
 };
 use groove_spotify::{spawn_engine, EngineHandle};
 use iced::alignment::{Horizontal, Vertical};
@@ -220,6 +221,11 @@ pub enum Message {
     ConnectSpotifyClicked { force_reauth: bool },
     LogoutSpotifyClicked,
     ModifiersChanged(iced::keyboard::Modifiers),
+    SpacePressed {
+        status_captured: bool,
+        has_command_ctrl_alt: bool,
+    },
+    SpaceReleased,
     SearchQueryChanged(String),
     SearchDeleteWord,
     SubmitSearch,
@@ -244,6 +250,8 @@ pub struct GrooveApp {
     tray: Option<GrooveTray>,
     tray_init_attempted: bool,
     keyboard_modifiers: iced::keyboard::Modifiers,
+    space_key_held: bool,
+    text_input_edited_this_event: bool,
     pre_backspace_search_query: Option<String>,
     last_cmd_backspace_applied: bool,
     scrubbing_position: Option<f32>,
@@ -270,6 +278,7 @@ pub struct GrooveApp {
 impl FormalInvariant for GrooveApp {
     fn check_invariants(&self) -> Result<(), InvariantViolation> {
         self.state.check_invariants()?;
+        self.engine.audio_gate.check_sync_with_playback(&self.state)?;
         let tray_snapshot = groove_core::TrayMenuSnapshot::from_playback_state(&self.state);
         tray_snapshot.check_invariants()?;
         tray_snapshot.check_sync_with_playback(&self.state)?;
@@ -332,6 +341,8 @@ impl GrooveApp {
             tray,
             tray_init_attempted,
             keyboard_modifiers: iced::keyboard::Modifiers::empty(),
+            space_key_held: false,
+            text_input_edited_this_event: false,
             pre_backspace_search_query: None,
             last_cmd_backspace_applied: false,
             scrubbing_position: None,
@@ -702,10 +713,10 @@ impl GrooveApp {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        // 60 FPS frame ticker + global keyboard listener for Cmd+Backspace whole-word deletion in Search
+        // 60 FPS frame ticker + global keyboard listener for Spacebar play/pause & Cmd+Backspace whole-word deletion
         Subscription::batch([
             iced::time::every(Duration::from_millis(16)).map(|_| Message::AnimationTick),
-            iced::event::listen_with(|event, _status, _window| match event {
+            iced::event::listen_with(|event, status, _window| match event {
                 iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
                     Some(Message::ModifiersChanged(modifiers))
                 }
@@ -716,6 +727,22 @@ impl GrooveApp {
                 }) if modifiers.command() || modifiers.macos_command() => {
                     Some(Message::SearchDeleteWord)
                 }
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key,
+                    modifiers,
+                    ..
+                }) if is_space_keyboard_key(&key) => Some(Message::SpacePressed {
+                    status_captured: status == iced::event::Status::Captured,
+                    has_command_ctrl_alt: modifiers.command()
+                        || modifiers.macos_command()
+                        || modifiers.control()
+                        || modifiers.alt(),
+                }),
+                iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { key, .. })
+                    if is_space_keyboard_key(&key) =>
+                {
+                    Some(Message::SpaceReleased)
+                }
                 _ => None,
             }),
         ])
@@ -724,6 +751,7 @@ impl GrooveApp {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::AnimationTick => {
+                self.text_input_edited_this_event = false;
                 if !self.dock_icon_installed {
                     self.dock_icon_installed = app_icon::install_macos_dock_icon();
                 }
@@ -741,22 +769,28 @@ impl GrooveApp {
                         TrayAction::Play => {
                             if !self.state.is_playing {
                                 self.state.is_playing = true;
+                                self.engine.audio_gate.set_playing(true);
                                 let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
                             }
                         }
                         TrayAction::Pause => {
                             if self.state.is_playing {
                                 self.state.is_playing = false;
+                                self.engine.audio_gate.set_playing(false);
                                 let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
                             }
                         }
                         TrayAction::TogglePlayPause => {
                             self.state.is_playing = !self.state.is_playing;
+                            self.engine.audio_gate.set_playing(self.state.is_playing);
                             let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
                         }
                         TrayAction::NextTrack => {
                             self.state
                                 .apply_verified_action(VerifiedTransportAction::NextTrack);
+                            self.engine
+                                .audio_gate
+                                .flush_and_set_playing(self.state.is_playing);
                             self.record_recently_listened_from_track(
                                 &self.state.current_track.clone(),
                             );
@@ -765,6 +799,9 @@ impl GrooveApp {
                         TrayAction::PreviousTrack => {
                             self.state
                                 .apply_verified_action(VerifiedTransportAction::PreviousTrack);
+                            self.engine
+                                .audio_gate
+                                .flush_and_set_playing(self.state.is_playing);
                             self.record_recently_listened_from_track(
                                 &self.state.current_track.clone(),
                             );
@@ -785,6 +822,9 @@ impl GrooveApp {
                             );
                             self.scrubbing_position = None;
                             self.state.position_secs = sanitized;
+                            self.engine
+                                .audio_gate
+                                .flush_and_set_playing(self.state.is_playing);
                             let _ = self
                                 .engine
                                 .command_tx
@@ -846,8 +886,9 @@ impl GrooveApp {
             }
             Message::TogglePlayPause => {
                 self.state.is_playing = !self.state.is_playing;
+                self.engine.audio_gate.set_playing(self.state.is_playing);
                 tracing::info!(
-                    "[UI] TogglePlayPause clicked -> is_playing={}",
+                    "[UI] TogglePlayPause clicked -> is_playing={} (instant audio gate updated)",
                     self.state.is_playing
                 );
                 let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
@@ -856,6 +897,9 @@ impl GrooveApp {
                 tracing::info!("[UI] NextTrack clicked");
                 self.state
                     .apply_verified_action(VerifiedTransportAction::NextTrack);
+                self.engine
+                    .audio_gate
+                    .flush_and_set_playing(self.state.is_playing);
                 self.record_recently_listened_from_track(&self.state.current_track.clone());
                 let _ = self.engine.command_tx.send(PlayerCommand::NextTrack);
             }
@@ -863,6 +907,9 @@ impl GrooveApp {
                 tracing::info!("[UI] PreviousTrack clicked");
                 self.state
                     .apply_verified_action(VerifiedTransportAction::PreviousTrack);
+                self.engine
+                    .audio_gate
+                    .flush_and_set_playing(self.state.is_playing);
                 self.record_recently_listened_from_track(&self.state.current_track.clone());
                 let _ = self.engine.command_tx.send(PlayerCommand::PreviousTrack);
             }
@@ -874,6 +921,9 @@ impl GrooveApp {
             Message::SeekReleased => {
                 if let Some(pos) = self.scrubbing_position.take() {
                     tracing::info!("[UI] SeekReleased -> {pos:.1}s");
+                    self.engine
+                        .audio_gate
+                        .flush_and_set_playing(self.state.is_playing);
                     let _ = self.engine.command_tx.send(PlayerCommand::SeekSeconds(pos));
                 }
             }
@@ -1179,6 +1229,9 @@ impl GrooveApp {
                             start_track_index: 0,
                             auto_play: true,
                         });
+                    self.engine
+                        .audio_gate
+                        .flush_and_set_playing(self.state.is_playing);
                 }
                 let _ = self
                     .engine
@@ -1221,6 +1274,9 @@ impl GrooveApp {
                                 start_track_index: track_idx,
                                 auto_play: true,
                             });
+                        self.engine
+                            .audio_gate
+                            .flush_and_set_playing(self.state.is_playing);
                         let _ =
                             self.engine
                                 .command_tx
@@ -1366,6 +1422,9 @@ impl GrooveApp {
                                 auto_play: true,
                             },
                         );
+                        self.engine
+                            .audio_gate
+                            .flush_and_set_playing(self.state.is_playing);
                         let _ =
                             self.engine
                                 .command_tx
@@ -1409,6 +1468,9 @@ impl GrooveApp {
                 });
                 self.state
                     .apply_verified_action(VerifiedTransportAction::PlayTrack(track.clone()));
+                self.engine
+                    .audio_gate
+                    .flush_and_set_playing(self.state.is_playing);
                 let _ = self.engine.command_tx.send(PlayerCommand::PlayTrack(track));
                 self.push_route(StageRoute::Section(NavSection::NowPlaying));
             }
@@ -1416,6 +1478,7 @@ impl GrooveApp {
                 self.show_bio_expanded = !self.show_bio_expanded;
             }
             Message::PodcastFilterChanged(query) => {
+                self.text_input_edited_this_event = true;
                 let trimmed = query.trim().to_string();
                 self.podcast_filter_query = query;
                 if groove_core::normalize_spotify_show_uri(&trimmed).is_some() {
@@ -1480,7 +1543,35 @@ impl GrooveApp {
             Message::ModifiersChanged(modifiers) => {
                 self.keyboard_modifiers = modifiers;
             }
+            Message::SpacePressed {
+                status_captured,
+                has_command_ctrl_alt,
+            } => {
+                let should_toggle = should_toggle_play_pause_on_space_verified(
+                    true,
+                    has_command_ctrl_alt,
+                    self.space_key_held,
+                    status_captured,
+                    self.text_input_edited_this_event,
+                );
+                self.space_key_held = true;
+                self.text_input_edited_this_event = false;
+                if should_toggle {
+                    self.state.is_playing = !self.state.is_playing;
+                    self.engine.audio_gate.set_playing(self.state.is_playing);
+                    tracing::info!(
+                        "[UI] Spacebar TogglePlayPause -> is_playing={} (instant audio gate updated)",
+                        self.state.is_playing
+                    );
+                    let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
+                }
+            }
+            Message::SpaceReleased => {
+                self.space_key_held = false;
+                self.text_input_edited_this_event = false;
+            }
             Message::SearchQueryChanged(query) => {
+                self.text_input_edited_this_event = true;
                 let prev_query = self.search_query.clone();
                 let is_single_char_backspace =
                     prev_query.chars().count() == query.chars().count() + 1
@@ -1654,6 +1745,13 @@ impl GrooveApp {
     }
 
     fn sync_tray(&mut self) {
+        self.engine.audio_gate.set_playing(self.state.is_playing);
+        if let Err(err) = self.engine.audio_gate.check_sync_with_playback(&self.state) {
+            panic!(
+                "[FORMAL VERIFICATION FAILURE] Instant audio gate invariant violated ({}): {}",
+                err.code, err.details
+            );
+        }
         if let Some(tray) = &mut self.tray {
             tray.sync(&self.state, &self.artwork);
             if let Some(snapshot) = tray.snapshot() {
@@ -1962,6 +2060,7 @@ impl GrooveApp {
                 }
             }
         }
+        self.engine.audio_gate.set_playing(self.state.is_playing);
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -4401,6 +4500,14 @@ impl GrooveApp {
     }
 }
 
+fn is_space_keyboard_key(key: &iced::keyboard::Key) -> bool {
+    match key {
+        iced::keyboard::Key::Named(iced::keyboard::key::Named::Space) => true,
+        iced::keyboard::Key::Character(c) => c.as_str() == " ",
+        _ => false,
+    }
+}
+
 fn truncate_nav_label(label: &str, max_chars: usize) -> String {
     let trimmed = label.trim();
     if trimmed.chars().count() <= max_chars {
@@ -4766,6 +4873,7 @@ mod tests {
                 tracks: playlist_tracks,
                 auto_play: true,
             });
+        app.engine.audio_gate.set_playing(app.state.is_playing);
         assert_eq!(app.state.active_playlist_id.as_deref(), Some("pl-jarvis"));
         app.assert_invariants();
 
@@ -4922,5 +5030,74 @@ mod tests {
         let snap_paused = TrayMenuSnapshot::from_playback_state(&app.state);
         assert_eq!(snap_paused.playback_rate_milli, 0);
         assert_eq!(snap_paused.elapsed_secs, app.state.synced_elapsed_secs());
+    }
+
+    #[test]
+    fn spacebar_toggles_play_pause_instantly_and_ignores_focused_text_inputs() {
+        let (mut app, _) = GrooveApp::new();
+        assert!(!app.state.is_playing);
+        assert!(!app.engine.audio_gate.is_playing());
+        app.assert_invariants();
+
+        // 1. Pressing Space on NowPlaying (status_captured = false) immediately unpauses both UI and audio_gate
+        let _ = app.update(Message::SpacePressed {
+            status_captured: false,
+            has_command_ctrl_alt: false,
+        });
+        assert!(app.state.is_playing);
+        assert!(app.engine.audio_gate.is_playing());
+        assert!(app.space_key_held);
+        app.assert_invariants();
+
+        // 2. OS auto-repeat while Space is still held down does NOT rapid-toggle play/pause
+        let _ = app.update(Message::SpacePressed {
+            status_captured: false,
+            has_command_ctrl_alt: false,
+        });
+        assert!(app.state.is_playing);
+        assert!(app.engine.audio_gate.is_playing());
+        app.assert_invariants();
+
+        // Release Space
+        let _ = app.update(Message::SpaceReleased);
+        assert!(!app.space_key_held);
+
+        // 3. Pressing Space even when mouse cursor hovers over a slider (status_captured = true,
+        //    but text_input_edited_this_event = false) still pauses immediately!
+        let _ = app.update(Message::SpacePressed {
+            status_captured: true,
+            has_command_ctrl_alt: false,
+        });
+        let _ = app.update(Message::SpaceReleased);
+        assert!(!app.state.is_playing);
+        assert!(!app.engine.audio_gate.is_playing());
+        app.assert_invariants();
+
+        // 4. Typing a space into the focused Search input emits SearchQueryChanged first,
+        //    then SpacePressed { status_captured: true }. Must NOT toggle play/pause!
+        let _ = app.update(Message::SelectNav(NavSection::Search));
+        let _ = app.update(Message::SearchQueryChanged("run ".into()));
+        let _ = app.update(Message::SpacePressed {
+            status_captured: true,
+            has_command_ctrl_alt: false,
+        });
+        let _ = app.update(Message::SpaceReleased);
+        assert!(!app.state.is_playing);
+        assert!(!app.engine.audio_gate.is_playing());
+        assert_eq!(app.search_query, "run ");
+        app.assert_invariants();
+
+        // 5. Typing a space into the focused Podcast filter input also must NOT toggle play/pause!
+        let _ = app.update(Message::SelectNav(NavSection::Podcasts));
+        let _ = app.update(Message::PodcastFilterChanged("the daily ".into()));
+        let _ = app.update(Message::SpacePressed {
+            status_captured: true,
+            has_command_ctrl_alt: false,
+        });
+        let _ = app.update(Message::SpaceReleased);
+        assert!(!app.state.is_playing);
+        assert!(!app.engine.audio_gate.is_playing());
+        assert_eq!(app.podcast_filter_query, "the daily ");
+        app.assert_invariants();
     }
 }

@@ -7,10 +7,10 @@ use std::{sync::Arc, time::Duration};
 use flume::{Receiver, Sender};
 use groove_audio::{enumerate_output_devices, AudioSampleProducer};
 use groove_core::{
-    advance_queue_verified, merge_devices_verified, resolve_playable_track_candidate,
-    sanitize_position_secs, sanitize_unit_float, select_device_verified, AlbumPlaybackQueue,
-    AudioDevice, ConnectionStatus, EngineEvent, FormalInvariant, PlaybackContext, PlaybackState,
-    PlayerCommand, Track, VerifiedTransportAction,
+    advance_queue_verified, merge_devices_verified, sanitize_position_secs, sanitize_unit_float,
+    select_device_verified, AlbumPlaybackQueue, AudioDevice, ConnectionStatus, EngineEvent,
+    FormalInvariant, InstantAudioGate, PlaybackContext, PlaybackState, PlayerCommand, Track,
+    VerifiedTransportAction,
 };
 use librespot_core::{session::Session, SpotifyUri};
 use librespot_playback::{
@@ -28,13 +28,17 @@ use crate::{
 pub struct EngineHandle {
     pub command_tx: Sender<PlayerCommand>,
     pub event_rx: Receiver<EngineEvent>,
+    pub audio_gate: InstantAudioGate,
 }
 
 /// Spawns the asynchronous Spotify Premium + Audio transport engine on a dedicated
-/// multi-threaded Tokio runtime thread and returns the bidirectional `flume` channel handle.
+/// multi-threaded Tokio runtime thread and returns the bidirectional `flume` channel handle
+/// plus the shared lock-free `InstantAudioGate` for sub-millisecond UI-thread pause/unpause.
 pub fn spawn_engine(sample_producer: AudioSampleProducer) -> EngineHandle {
     let (command_tx, command_rx) = flume::unbounded();
     let (event_tx, event_rx) = flume::unbounded();
+    let audio_gate = InstantAudioGate::new(false);
+    let engine_audio_gate = audio_gate.clone();
 
     std::thread::Builder::new()
         .name("groove-spotify-engine".into())
@@ -44,13 +48,19 @@ pub fn spawn_engine(sample_producer: AudioSampleProducer) -> EngineHandle {
                 .build()
                 .expect("failed to build Tokio runtime for groove-spotify");
 
-            runtime.block_on(run_engine_loop(command_rx, event_tx, sample_producer));
+            runtime.block_on(run_engine_loop(
+                command_rx,
+                event_tx,
+                sample_producer,
+                engine_audio_gate,
+            ));
         })
         .expect("failed to spawn groove-spotify-engine thread");
 
     EngineHandle {
         command_tx,
         event_rx,
+        audio_gate,
     }
 }
 
@@ -58,6 +68,7 @@ async fn run_engine_loop(
     command_rx: Receiver<PlayerCommand>,
     event_tx: Sender<EngineEvent>,
     sample_producer: AudioSampleProducer,
+    audio_gate: InstantAudioGate,
 ) {
     let mut state = PlaybackState::mockup_default();
 
@@ -128,6 +139,7 @@ async fn run_engine_loop(
                     &event_tx,
                     &sample_producer,
                     &volume_scaler,
+                    &audio_gate,
                     &mut web_client,
                     &mut live_session,
                     &mut player,
@@ -153,6 +165,7 @@ async fn run_engine_loop(
                     &event_tx,
                     &sample_producer,
                     &volume_scaler,
+                    &audio_gate,
                     &mut web_client,
                     &mut live_session,
                     &mut player,
@@ -185,6 +198,7 @@ async fn run_engine_loop(
                     &event_tx,
                     &player,
                     &live_session,
+                    &audio_gate,
                     &mut player_has_loaded_track,
                     &mut playback_anchor,
                     &mut player_is_buffering,
@@ -213,6 +227,7 @@ async fn run_engine_loop(
                             &state,
                             &player,
                             &live_session,
+                            &audio_gate,
                             &mut player_has_loaded_track,
                         );
                         playback_anchor = if state.is_playing {
@@ -248,6 +263,7 @@ fn handle_librespot_event(
     event_tx: &Sender<EngineEvent>,
     player: &Option<Arc<Player>>,
     live_session: &Option<Session>,
+    audio_gate: &InstantAudioGate,
     player_has_loaded_track: &mut bool,
     playback_anchor: &mut Option<(std::time::Instant, f32)>,
     player_is_buffering: &mut bool,
@@ -263,8 +279,12 @@ fn handle_librespot_event(
             );
             *player_is_buffering = false;
             state.is_playing = true;
-            state.position_secs =
-                sanitize_position_secs(position_ms as f32 / 1000.0, state.current_track.duration_secs);
+            audio_gate.set_playing(true);
+            state.position_secs = audio_gate.audible_position_secs(
+                position_ms,
+                state.current_track.duration_secs,
+                44_100,
+            );
             *playback_anchor = Some((std::time::Instant::now(), state.position_secs));
             let _ = event_tx.send(EngineEvent::PlayStateChanged(true));
             let _ = event_tx.send(EngineEvent::PositionTick(state.position_secs));
@@ -279,8 +299,12 @@ fn handle_librespot_event(
             );
             *player_is_buffering = false;
             state.is_playing = false;
-            state.position_secs =
-                sanitize_position_secs(position_ms as f32 / 1000.0, state.current_track.duration_secs);
+            audio_gate.set_playing(false);
+            state.position_secs = audio_gate.audible_position_secs(
+                position_ms,
+                state.current_track.duration_secs,
+                44_100,
+            );
             *playback_anchor = None;
             let _ = event_tx.send(EngineEvent::PlayStateChanged(false));
             let _ = event_tx.send(EngineEvent::PositionTick(state.position_secs));
@@ -289,6 +313,7 @@ fn handle_librespot_event(
             info!("[LibrespotPlayer] Event: Stopped track={track_id:?}");
             *player_is_buffering = false;
             state.is_playing = false;
+            audio_gate.flush_and_set_playing(false);
             *playback_anchor = None;
             let _ = event_tx.send(EngineEvent::PlayStateChanged(false));
             let _ = event_tx.send(EngineEvent::PositionTick(state.position_secs));
@@ -300,15 +325,24 @@ fn handle_librespot_event(
                 "[LibrespotPlayer] Event: Position/Seek synced to position_ms={position_ms}"
             );
             *player_is_buffering = false;
-            state.position_secs =
-                sanitize_position_secs(position_ms as f32 / 1000.0, state.current_track.duration_secs);
+            state.position_secs = audio_gate.audible_position_secs(
+                position_ms,
+                state.current_track.duration_secs,
+                44_100,
+            );
             *playback_anchor = Some((std::time::Instant::now(), state.position_secs));
             let _ = event_tx.send(EngineEvent::PositionTick(state.position_secs));
         }
         PlayerEvent::EndOfTrack { track_id, .. } => {
             info!("[LibrespotPlayer] Event: EndOfTrack ({track_id:?}) -> advancing queue");
             advance_queue_track(state, true, true);
-            sync_player_after_advance(state, player, live_session, player_has_loaded_track);
+            sync_player_after_advance(
+                state,
+                player,
+                live_session,
+                audio_gate,
+                player_has_loaded_track,
+            );
             *playback_anchor = if state.is_playing {
                 Some((std::time::Instant::now(), state.position_secs))
             } else {
@@ -349,6 +383,7 @@ async fn apply_auth_result(
     event_tx: &Sender<EngineEvent>,
     sample_producer: &AudioSampleProducer,
     volume_scaler: &AtomicVolumeScaler,
+    audio_gate: &InstantAudioGate,
     web_client: &mut SpotifyWebClient,
     live_session: &mut Option<Session>,
     player: &mut Option<Arc<Player>>,
@@ -397,6 +432,7 @@ async fn apply_auth_result(
                 device_arg,
                 sample_producer.clone(),
                 volume_scaler.clone(),
+                audio_gate.clone(),
             );
             *player_has_loaded_track = false;
 
@@ -408,6 +444,7 @@ async fn apply_auth_result(
                     &state.current_track,
                     state.is_playing,
                     state.position_secs,
+                    audio_gate,
                 );
                 *player_has_loaded_track = true;
             }
@@ -456,6 +493,7 @@ async fn handle_command(
     event_tx: &Sender<EngineEvent>,
     sample_producer: &AudioSampleProducer,
     volume_scaler: &AtomicVolumeScaler,
+    audio_gate: &InstantAudioGate,
     web_client: &mut SpotifyWebClient,
     live_session: &mut Option<Session>,
     player: &mut Option<Arc<Player>>,
@@ -472,6 +510,7 @@ async fn handle_command(
             state.apply_verified_action(VerifiedTransportAction::TogglePlayPause {
                 has_loaded_track: has_loaded,
             });
+            audio_gate.set_playing(state.is_playing);
             info!(
                 "[Engine] Command: TogglePlayPause -> is_playing={} (track='{}', uri='{}', was_exhausted={was_exhausted})",
                 state.is_playing, state.current_track.title, state.current_track.spotify_uri
@@ -485,6 +524,7 @@ async fn handle_command(
                             &state.current_track,
                             true,
                             state.position_secs,
+                            audio_gate,
                         );
                         *player_has_loaded_track = true;
                     } else {
@@ -503,6 +543,7 @@ async fn handle_command(
         PlayerCommand::Play => {
             let was_exhausted = state.is_discography_exhausted();
             state.apply_verified_action(VerifiedTransportAction::Play);
+            audio_gate.set_playing(state.is_playing);
             info!(
                 "[Engine] Command: Play (track='{}', uri='{}', was_exhausted={was_exhausted})",
                 state.current_track.title, state.current_track.spotify_uri
@@ -515,13 +556,14 @@ async fn handle_command(
                         &state.current_track,
                         true,
                         state.position_secs,
+                        audio_gate,
                     );
                     *player_has_loaded_track = true;
                 } else {
                     active_player.play();
                 }
             }
-            let _ = event_tx.send(EngineEvent::PlayStateChanged(true));
+            let _ = event_tx.send(EngineEvent::PlayStateChanged(state.is_playing));
             if was_exhausted {
                 let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
             }
@@ -529,6 +571,7 @@ async fn handle_command(
 
         PlayerCommand::Pause => {
             state.apply_verified_action(VerifiedTransportAction::Pause);
+            audio_gate.set_playing(false);
             info!("[Engine] Command: Pause");
             if let Some(active_player) = player.as_ref() {
                 if *player_has_loaded_track {
@@ -548,7 +591,13 @@ async fn handle_command(
                 state.is_playing,
                 state.is_discography_exhausted()
             );
-            sync_player_after_advance(state, player, live_session, player_has_loaded_track);
+            sync_player_after_advance(
+                state,
+                player,
+                live_session,
+                audio_gate,
+                player_has_loaded_track,
+            );
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
@@ -561,12 +610,19 @@ async fn handle_command(
                 state.current_track.spotify_uri,
                 state.is_playing
             );
-            sync_player_after_advance(state, player, live_session, player_has_loaded_track);
+            sync_player_after_advance(
+                state,
+                player,
+                live_session,
+                audio_gate,
+                player_has_loaded_track,
+            );
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
 
         PlayerCommand::SeekSeconds(pos) => {
             state.apply_verified_action(VerifiedTransportAction::SeekSeconds(pos));
+            audio_gate.flush_and_set_playing(state.is_playing);
             let clamped = state.position_secs;
             info!("[Engine] Command: SeekSeconds -> {clamped:.1}s");
             if let Some(active_player) = player.as_ref() {
@@ -628,9 +684,12 @@ async fn handle_command(
                         &state.current_track,
                         true,
                         0.0,
+                        audio_gate,
                     );
                     *player_has_loaded_track = true;
                 }
+            } else {
+                audio_gate.set_playing(state.is_playing);
             }
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
         }
@@ -651,6 +710,7 @@ async fn handle_command(
             });
 
             state.apply_verified_action(VerifiedTransportAction::PlayTrack(track.clone()));
+            audio_gate.flush_and_set_playing(state.is_playing);
             if let Some(active_player) = player.as_ref() {
                 load_track_on_player(
                     active_player,
@@ -658,6 +718,7 @@ async fn handle_command(
                     &state.current_track,
                     true,
                     0.0,
+                    audio_gate,
                 );
                 *player_has_loaded_track = true;
             }
@@ -753,6 +814,7 @@ async fn handle_command(
                 tracks,
                 auto_play: true,
             });
+            audio_gate.flush_and_set_playing(state.is_playing);
             if had_tracks {
                 if let Some(active_player) = player.as_ref() {
                     load_track_on_player(
@@ -761,6 +823,7 @@ async fn handle_command(
                         &state.current_track,
                         true,
                         0.0,
+                        audio_gate,
                     );
                     *player_has_loaded_track = true;
                 }
@@ -822,6 +885,7 @@ async fn handle_command(
                 web_client,
                 live_session,
                 player,
+                audio_gate,
                 player_has_loaded_track,
             )
             .await;
@@ -845,6 +909,7 @@ async fn handle_command(
                 web_client,
                 live_session,
                 player,
+                audio_gate,
                 player_has_loaded_track,
             )
             .await;
@@ -880,6 +945,7 @@ async fn handle_command(
                 web_client,
                 live_session,
                 player,
+                audio_gate,
                 player_has_loaded_track,
             )
             .await;
@@ -903,6 +969,7 @@ async fn handle_command(
                 web_client,
                 live_session,
                 player,
+                audio_gate,
                 player_has_loaded_track,
             )
             .await;
@@ -929,6 +996,7 @@ async fn handle_command(
                     device_arg,
                     sample_producer.clone(),
                     volume_scaler.clone(),
+                    audio_gate.clone(),
                 );
                 if *player_has_loaded_track || state.current_track.id != "higher-ground" {
                     load_track_on_player(
@@ -937,6 +1005,7 @@ async fn handle_command(
                         &state.current_track,
                         state.is_playing,
                         state.position_secs,
+                        audio_gate,
                     );
                     *player_has_loaded_track = true;
                 }
@@ -970,6 +1039,7 @@ async fn handle_command(
         PlayerCommand::LogoutSpotify => {
             info!("[Engine] Command: LogoutSpotify -> clearing credentials and stopping player");
             auth::clear_cached_credentials();
+            audio_gate.flush_and_set_playing(false);
             if let Some(active_player) = player.take() {
                 active_player.stop();
             }
@@ -1040,8 +1110,10 @@ fn sync_player_after_advance(
     state: &PlaybackState,
     player: &Option<Arc<Player>>,
     live_session: &Option<Session>,
+    audio_gate: &InstantAudioGate,
     player_has_loaded_track: &mut bool,
 ) {
+    audio_gate.flush_and_set_playing(state.is_playing);
     if let Some(active_player) = player.as_ref() {
         if state.is_discography_exhausted() || (!state.is_playing && state.position_secs == 0.0) {
             if state.is_discography_exhausted() {
@@ -1057,6 +1129,7 @@ fn sync_player_after_advance(
                     &state.current_track,
                     false,
                     0.0,
+                    audio_gate,
                 );
                 *player_has_loaded_track = true;
             }
@@ -1067,6 +1140,7 @@ fn sync_player_after_advance(
                 &state.current_track,
                 state.is_playing,
                 0.0,
+                audio_gate,
             );
             *player_has_loaded_track = true;
         }
@@ -1083,6 +1157,7 @@ async fn activate_album_playback(
     web_client: &mut SpotifyWebClient,
     live_session: &mut Option<Session>,
     player: &mut Option<Arc<Player>>,
+    audio_gate: &InstantAudioGate,
     player_has_loaded_track: &mut bool,
 ) {
     let detail = match preloaded_album.filter(|d| !d.tracks.is_empty()) {
@@ -1114,6 +1189,7 @@ async fn activate_album_playback(
             start_track_index: clamped_idx,
             auto_play: true,
         });
+        audio_gate.flush_and_set_playing(state.is_playing);
 
         info!(
             "[Engine] Activated album '{}' by '{}' ({} tracks, starting at index {} '{}')",
@@ -1131,6 +1207,7 @@ async fn activate_album_playback(
                 &state.current_track,
                 true,
                 0.0,
+                audio_gate,
             );
             *player_has_loaded_track = true;
         }
@@ -1177,6 +1254,7 @@ async fn activate_show_playback(
     web_client: &mut SpotifyWebClient,
     live_session: &mut Option<Session>,
     player: &mut Option<Arc<Player>>,
+    audio_gate: &InstantAudioGate,
     player_has_loaded_track: &mut bool,
 ) {
     let detail = match preloaded_show.filter(|d| !d.episodes.is_empty()) {
@@ -1206,6 +1284,7 @@ async fn activate_show_playback(
             start_episode_index: clamped_idx,
             auto_play: true,
         });
+        audio_gate.flush_and_set_playing(state.is_playing);
 
         info!(
             "[Engine] Activated podcast show '{}' ({} episodes, starting at index {} '{}')",
@@ -1222,6 +1301,7 @@ async fn activate_show_playback(
                 &state.current_track,
                 true,
                 0.0,
+                audio_gate,
             );
             *player_has_loaded_track = true;
         }
@@ -1234,6 +1314,7 @@ fn create_librespot_player(
     device_name: Option<String>,
     sample_producer: AudioSampleProducer,
     volume_scaler: AtomicVolumeScaler,
+    audio_gate: InstantAudioGate,
 ) -> (Arc<Player>, PlayerEventChannel) {
     let player_config = PlayerConfig {
         bitrate: Bitrate::Bitrate320,
@@ -1248,6 +1329,7 @@ fn create_librespot_player(
             AudioFormat::F32,
             sample_producer,
             volume_scaler,
+            audio_gate,
         ))
     });
     let events = player.get_player_event_channel();
@@ -1256,86 +1338,23 @@ fn create_librespot_player(
 
 fn load_track_on_player(
     player: &Arc<Player>,
-    session: Option<&Session>,
+    _session: Option<&Session>,
     track: &Track,
     start_playing: bool,
     position_secs: f32,
+    audio_gate: &InstantAudioGate,
 ) {
     match SpotifyUri::from_uri(&track.spotify_uri) {
         Ok(uri) if uri.is_playable() => {
             let position_ms = (position_secs.max(0.0) * 1000.0) as u32;
-            let player_clone = Arc::clone(player);
-            let sess_clone = session.cloned();
-            let title = track.title.clone();
-            let raw_uri_str = track.spotify_uri.clone();
-
-            tokio::spawn(async move {
-                let mut resolved_uri = uri;
-                if let Some(sess) = sess_clone {
-                    use librespot_metadata::{
-                        Episode as LibrespotEpisode, Metadata, Track as LibrespotTrack,
-                    };
-                    if matches!(resolved_uri, SpotifyUri::Episode { .. }) {
-                        if let Ok(meta_ep) = LibrespotEpisode::get(&sess, &resolved_uri).await {
-                            info!(
-                                "[LibrespotPlayer] Podcast episode '{}' ({}) verified with {} audio files",
-                                title,
-                                raw_uri_str,
-                                meta_ep.audio.0.len()
-                            );
-                        }
-                    } else if let Ok(meta) = LibrespotTrack::get(&sess, &resolved_uri).await {
-                        let primary_files = meta.files.len();
-                        let mut alt_candidates: Vec<(String, SpotifyUri, usize)> = Vec::new();
-                        if primary_files == 0 {
-                            for alt_uri in meta.alternatives.iter() {
-                                if let Ok(alt_meta) = LibrespotTrack::get(&sess, alt_uri).await {
-                                    alt_candidates.push((
-                                        format!("{alt_uri:?}"),
-                                        alt_uri.clone(),
-                                        alt_meta.files.len(),
-                                    ));
-                                    if !alt_meta.files.is_empty() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        let chosen = {
-                            let alt_refs: Vec<(&str, usize)> = alt_candidates
-                                .iter()
-                                .map(|(s, _, count)| (s.as_str(), *count))
-                                .collect();
-                            resolve_playable_track_candidate(&raw_uri_str, primary_files, &alt_refs)
-                                .map(|(label, files)| (label.to_string(), files))
-                        };
-                        if let Some((chosen_label, chosen_files)) = chosen {
-                            if primary_files == 0 {
-                                if let Some((_, chosen_uri, _)) = alt_candidates
-                                    .into_iter()
-                                    .find(|(label, _, _)| *label == chosen_label)
-                                {
-                                    info!(
-                                        "[LibrespotPlayer] Track '{}' ({}) had 0 direct files; resolved to playable alternative {:?} ({} files)",
-                                        title, raw_uri_str, chosen_uri, chosen_files
-                                    );
-                                    resolved_uri = chosen_uri;
-                                }
-                            } else {
-                                info!(
-                                    "[LibrespotPlayer] Track '{}' ({}) verified with {} direct audio files",
-                                    title, raw_uri_str, chosen_files
-                                );
-                            }
-                        }
-                    }
-                }
-                info!(
-                    "[LibrespotPlayer] Loading track '{}' ({:?}) start_playing={} position_ms={}",
-                    title, resolved_uri, start_playing, position_ms
-                );
-                player_clone.load(resolved_uri, start_playing, position_ms);
-            });
+            audio_gate.flush_and_set_playing(start_playing);
+            info!(
+                "[LibrespotPlayer] Loading track '{}' ({:?}) start_playing={} position_ms={}",
+                track.title, uri, start_playing, position_ms
+            );
+            // Send `Load` directly on `player`'s internal command channel in strict FIFO order
+            // (librespot's internal `PlayerTrackLoader` resolves alternatives automatically).
+            player.load(uri, start_playing, position_ms);
         }
         Ok(_) => {
             warn!(

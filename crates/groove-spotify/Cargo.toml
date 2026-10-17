@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 groove-core.workspace = true
 groove-audio.workspace = true
+cpal.workspace = true
+rodio.workspace = true
 tokio.workspace = true
 flume.workspace = true
 serde.workspace = true

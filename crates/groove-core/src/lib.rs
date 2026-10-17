@@ -7,10 +7,12 @@ pub use formal::{
     is_opaque_spotify_user_id, merge_devices_verified, normalize_album_playback_queue,
     normalize_spotify_episode_uri, normalize_spotify_show_uri, resolve_playable_track_candidate,
     sanitize_pcm_sample, sanitize_position_secs, sanitize_spotify_biography, sanitize_unit_float,
-    select_device_verified, summarize_artist_bio, FormalInvariant, InvariantViolation,
-    NavHistoryMachine, NavRouteTarget, RecentListenedItem, RecentListenedKind,
+    select_device_verified, should_toggle_play_pause_on_space_verified,
+    step_gated_stereo_frame_verified, summarize_artist_bio, FormalInvariant, InstantAudioGate,
+    InvariantViolation, NavHistoryMachine, NavRouteTarget, RecentListenedItem, RecentListenedKind,
     RecentListenedStore, RecentSearchEntry, RecentSearchKind, RecentSearchStore,
-    TrayMenuSnapshot, VerifiedTransportAction, RECENTLY_LISTENED_TOP_LIMIT,
+    TrayMenuSnapshot, VerifiedTransportAction, INSTANT_PAUSE_RAMP_FRAMES,
+    INSTANT_SINK_MAX_BUFFERED_FRAMES, RECENTLY_LISTENED_TOP_LIMIT,
 };
 
 /// Number of logarithmically spaced frequency bands used by the ribbon visualizer.

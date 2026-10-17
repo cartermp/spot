@@ -32,7 +32,8 @@ thiserror = "2.0"
 dirs = "5.0"
 
 # Audio & DSP
-cpal = "0.15"
+cpal = "0.16"
+rodio = { version = "0.21", default-features = false }
 rtrb = "0.3"
 realfft = "3.4"
 
