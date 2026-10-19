@@ -1,25 +1,25 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/groove-core",
-    "crates/groove-audio",
-    "crates/groove-spotify",
-    "crates/groove-app",
-    "crates/groove-verify",
+    "crates/spot-core",
+    "crates/spot-audio",
+    "crates/spot-spotify",
+    "crates/spot-app",
+    "crates/spot-verify",
 ]
-default-members = ["crates/groove-app"]
+default-members = ["crates/spot-app"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-authors = ["Groove Contributors"]
+authors = ["Carter Phillip"]
 
 [workspace.dependencies]
-groove-core = { path = "crates/groove-core" }
-groove-audio = { path = "crates/groove-audio" }
-groove-spotify = { path = "crates/groove-spotify" }
-groove-verify = { path = "crates/groove-verify" }
+spot-core = { path = "crates/spot-core" }
+spot-audio = { path = "crates/spot-audio" }
+spot-spotify = { path = "crates/spot-spotify" }
+spot-verify = { path = "crates/spot-verify" }
 
 tokio = { version = "1.40", features = ["full"] }
 flume = "0.11"

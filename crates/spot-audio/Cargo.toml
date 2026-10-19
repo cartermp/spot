@@ -1,0 +1,12 @@
+[package]
+name = "spot-audio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+spot-core.workspace = true
+cpal.workspace = true
+rtrb.workspace = true
+realfft.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

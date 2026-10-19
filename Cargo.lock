@@ -2106,91 +2106,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "groove-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "block2 0.6.2",
- "dirs 5.0.1",
- "flume",
- "groove-audio",
- "groove-core",
- "groove-spotify",
- "iced",
- "image 0.25.10",
- "libc",
- "objc2 0.6.5",
- "objc2-app-kit 0.3.2",
- "objc2-foundation 0.3.2",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tray-icon",
-]
-
-[[package]]
-name = "groove-audio"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cpal",
- "groove-core",
- "realfft",
- "rtrb",
- "tracing",
-]
-
-[[package]]
-name = "groove-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "groove-spotify"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cpal",
- "dirs 5.0.1",
- "flume",
- "groove-audio",
- "groove-core",
- "librespot-core",
- "librespot-metadata",
- "librespot-oauth",
- "librespot-playback",
- "librespot-protocol",
- "protobuf",
- "reqwest",
- "rodio",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "groove-verify"
-version = "0.1.0"
-dependencies = [
- "groove-audio",
- "groove-core",
- "groove-spotify",
- "proptest",
- "serde",
- "serde_json",
- "stateright",
-]
-
-[[package]]
 name = "gtk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6019,6 +5934,91 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "spot-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "block2 0.6.2",
+ "dirs 5.0.1",
+ "flume",
+ "iced",
+ "image 0.25.10",
+ "libc",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "spot-audio",
+ "spot-core",
+ "spot-spotify",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tray-icon",
+]
+
+[[package]]
+name = "spot-audio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "realfft",
+ "rtrb",
+ "spot-core",
+ "tracing",
+]
+
+[[package]]
+name = "spot-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "spot-spotify"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "dirs 5.0.1",
+ "flume",
+ "librespot-core",
+ "librespot-metadata",
+ "librespot-oauth",
+ "librespot-playback",
+ "librespot-protocol",
+ "protobuf",
+ "reqwest",
+ "rodio",
+ "serde",
+ "serde_json",
+ "spot-audio",
+ "spot-core",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "spot-verify"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "spot-audio",
+ "spot-core",
+ "spot-spotify",
+ "stateright",
 ]
 
 [[package]]

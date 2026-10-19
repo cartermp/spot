@@ -1,24 +1,46 @@
-# Groove
+# Spot
 
-*A natural home for your music.*
+Personal macOS Spotify Premium player written in Rust (`iced` + `librespot` 320 kbps Ogg Vorbis + CoreAudio).
 
-**Groove** is a native, low-resource Spotify Premium desktop player written in 100% Rust using [`librespot` 0.8](https://github.com/librespot-org/librespot) for 320 kbps Ogg Vorbis streaming and [`iced` 0.13](https://github.com/iced-rs/iced) (`wgpu` Metal backend) for a hardware-accelerated 60–120 FPS interface.
-
-## Architecture
-
-- **`crates/groove-core`**: Shared domain types (`Track`, `Playlist`, `PlaybackState`, `AudioDevice`, `SpectrumFrame`), command/event channels (`PlayerCommand`, `EngineEvent`), and default mockup state.
-- **`crates/groove-audio`**: Lock-free `rtrb` SPSC PCM sample ring buffer, 2048-point Hann-windowed `realfft` spectrum analyzer (32 logarithmic bands with exponential attack/release smoothing), and `cpal` CoreAudio output device enumeration.
-- **`crates/groove-spotify`**: Async `tokio` engine integrating `librespot-core`, `librespot-oauth` (PKCE login + persistent credential & 1 GB encrypted audio chunk caching in `~/Library/Application Support/Groove`), custom `TeeSink` wrapping `librespot-playback` (`Bitrate::Bitrate320`), and a `reqwest` Spotify Web API client.
-- **`crates/groove-app`**: Native macOS GUI featuring a transparent full-size content titlebar with inset traffic lights, bundled `Instrument Serif` editorial typography, procedural high-DPI artwork rendering, and a multi-layered 3D contour ribbon wave visualizer.
-
-## Running Groove
+## Quick Start
 
 ```bash
-cargo run --release -p groove-app
+# Build and install Spot.app to /Applications (plus ~/.local/bin/spot)
+make install
+
+# Or build dist/Spot.app without installing
+make package
+
+# Or run directly from source
+make run
 ```
 
-## Connecting Spotify Premium
+## Shortcuts
 
-1. Click the **Spotify streaming** status card in the bottom-left of the sidebar (or set `SPOTIFY_CLIENT_ID=<your_client_id>` from the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) with redirect URI `http://127.0.0.1:8898/login`).
-2. Complete the one-time OAuth 2.0 PKCE login in your browser.
-3. Groove caches your reusable `librespot` credentials in `~/Library/Application Support/Groove/credentials` so subsequent launches connect automatically.
+| Key | Action |
+| --- | --- |
+| `Space` | Instant play / pause (when search isn't focused) |
+| `Cmd + Backspace` | Delete previous word in the search bar |
+
+## Where Data Lives
+
+Cached credentials, encrypted audio chunks, recent searches, and recently-listened history are stored in:
+
+```text
+~/Library/Application Support/Spot/
+```
+
+## Crates
+
+- `crates/spot-app` — `iced` 0.13 (`wgpu` Metal) UI, macOS menu bar tray, and procedural dog icon (`spot` binary)
+- `crates/spot-spotify` — `librespot` 320 kbps streaming, OAuth PKCE login, `spclient` catalog/podcast client, and instant-gate `TeeSink`
+- `crates/spot-audio` — Lock-free PCM ring buffer, 32-band `realfft` spectrum analyzer, and `cpal` CoreAudio device discovery
+- `crates/spot-core` — Domain types, playback queue/discography state machine, and formally verified transitions
+- `crates/spot-verify` — Exhaustive model-checking (`stateright`) & property verification suite (`spot-verify` binary)
+
+## Verification & Tests
+
+```bash
+make verify   # Run all 18 formal proofs & model checks
+make test     # Run unit/property tests + formal suite
+```
