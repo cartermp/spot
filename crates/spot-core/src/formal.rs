@@ -2918,6 +2918,520 @@ pub fn should_toggle_play_pause_on_space_verified(
         && !(widget_status_captured && text_input_edited_this_event)
 }
 
+/// Default maximum number of downloaded `main` update archives retained in local storage
+/// (`~/Library/Application Support/Spot/updates/archives`).
+pub const MAX_STORED_UPDATES: usize = 10;
+
+/// Normalizes a git commit SHA (7..=40 ASCII hex characters) into `(canonical_lower_sha, short_7_sha)`.
+pub fn normalize_git_sha_verified(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.len() < 7 || trimmed.len() > 40 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let short = lower[..7].to_string();
+    Some((lower, short))
+}
+
+/// Normalizes a SHA-256 hex digest (exact 64 ASCII hex characters) into canonical lowercase.
+pub fn normalize_sha256_hex_verified(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+/// Returns `true` if two normalized or raw git commit SHAs refer to the same commit
+/// (supporting 7-char short SHA vs 40-char full SHA comparison).
+pub fn git_shas_match_verified(a: &str, b: &str) -> bool {
+    let Some((na, _)) = normalize_git_sha_verified(a) else {
+        return false;
+    };
+    let Some((nb, _)) = normalize_git_sha_verified(b) else {
+        return false;
+    };
+    if na.len() <= nb.len() {
+        nb.starts_with(&na)
+    } else {
+        na.starts_with(&nb)
+    }
+}
+
+/// Formally verified SHA-256 integrity gate (`INV-U2`).
+/// Returns `true` iff both `expected_sha256` and `actual_sha256` are valid 64-character hex
+/// SHA-256 digests and match identically in lowercase.
+pub fn verify_update_digest_verified(expected_sha256: &str, actual_sha256: &str) -> bool {
+    match (
+        normalize_sha256_hex_verified(expected_sha256),
+        normalize_sha256_hex_verified(actual_sha256),
+    ) {
+        (Some(exp), Some(act)) => exp == act,
+        _ => false,
+    }
+}
+
+/// Release manifest published on every push to `main` (`spot-update-manifest.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UpdateReleaseManifest {
+    pub version: String,
+    pub build_number: u64,
+    pub commit_sha: String,
+    pub short_sha: String,
+    pub tag: String,
+    pub commit_title: String,
+    pub published_at: String,
+    pub asset_name: String,
+    pub download_url: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+impl UpdateReleaseManifest {
+    /// Sanitizes and validates a release manifest, returning `None` if the commit SHA,
+    /// SHA-256 digest, or download URL is malformed.
+    pub fn sanitize(mut self) -> Option<Self> {
+        let (commit_sha, short_sha) = normalize_git_sha_verified(&self.commit_sha)
+            .or_else(|| normalize_git_sha_verified(&self.short_sha))?;
+        let sha256 = normalize_sha256_hex_verified(&self.sha256)?;
+
+        self.commit_sha = commit_sha;
+        self.short_sha = short_sha.clone();
+        self.sha256 = sha256;
+        self.build_number = self.build_number.max(1);
+
+        let clean_version: String = self.version.split_whitespace().collect::<Vec<_>>().join(" ");
+        self.version = if clean_version.is_empty() {
+            "0.1.0".to_string()
+        } else {
+            clean_version
+        };
+
+        let clean_tag: String = self.tag.split_whitespace().collect::<Vec<_>>().join("");
+        self.tag = if clean_tag.is_empty() {
+            format!("main-b{}-{short_sha}", self.build_number)
+        } else {
+            clean_tag
+        };
+
+        let clean_title: String = self
+            .commit_title
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.commit_title = if clean_title.is_empty() {
+            format!("Spot main build #{} ({short_sha})", self.build_number)
+        } else {
+            clean_title
+        };
+
+        let clean_pub: String = self
+            .published_at
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.published_at = if clean_pub.is_empty() {
+            "latest".to_string()
+        } else {
+            clean_pub
+        };
+
+        let clean_asset: String = self
+            .asset_name
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("");
+        self.asset_name = if clean_asset.is_empty() {
+            "Spot-macos.zip".to_string()
+        } else {
+            clean_asset
+        };
+
+        let clean_url = self.download_url.trim().to_string();
+        if clean_url.is_empty() || clean_url.contains('\n') || clean_url.contains('\r') {
+            return None;
+        }
+        self.download_url = clean_url;
+        self.size_bytes = self.size_bytes.max(1);
+
+        Some(self)
+    }
+
+    /// Canonical filename used when storing this update in `~/Library/Application Support/Spot/updates/archives/`.
+    pub fn canonical_archive_filename(&self) -> String {
+        format!("Spot-b{}-{}.zip", self.build_number, self.short_sha)
+    }
+}
+
+/// Formally verified freshness check (`INV-U1`) determining whether a remote `main` release
+/// represents a newer update over the currently installed build.
+///
+/// Formal Guarantees:
+/// - **INV-U1a (Anti-Self-Update)**: Returns `false` whenever `candidate.commit_sha` matches `installed_sha`.
+/// - **INV-U1b (Anti-Downgrade Monotonicity)**: Returns `false` whenever `candidate.build_number < installed_build`.
+/// - **INV-U1c (Same-Build Commit Push Detection)**: Returns `true` when `candidate.build_number >= installed_build`
+///   and `candidate.commit_sha` is a valid commit distinct from `installed_sha`.
+pub fn is_release_newer_verified(
+    installed_build: u64,
+    installed_sha: &str,
+    candidate: &UpdateReleaseManifest,
+) -> bool {
+    let Some((cand_sha, _)) = normalize_git_sha_verified(&candidate.commit_sha) else {
+        return false;
+    };
+    if normalize_sha256_hex_verified(&candidate.sha256).is_none() {
+        return false;
+    }
+    if git_shas_match_verified(installed_sha, &cand_sha) {
+        return false;
+    }
+    candidate.build_number >= installed_build
+}
+
+/// Entry for a downloaded & SHA-256 verified update archive stored on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StoredUpdateEntry {
+    pub manifest: UpdateReleaseManifest,
+    pub archive_filename: String,
+    pub verified_sha256: String,
+}
+
+/// Resolved update status relative to the currently running `Spot` binary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateAvailability {
+    UpToDate {
+        installed_build: u64,
+        installed_short_sha: String,
+    },
+    UpdateAvailable {
+        manifest: UpdateReleaseManifest,
+        stored_archive_filename: Option<String>,
+    },
+}
+
+/// Formally verified local update catalog & archive store (`updates_catalog.json`).
+///
+/// Formal Guarantees:
+/// - **INV-U1 (Monotonic Update Availability)**: `evaluate_availability()` reports `UpdateAvailable`
+///   iff `latest_remote` is strictly newer than `(installed_build_number, installed_commit_sha)` per `is_release_newer_verified`.
+/// - **INV-U2 (Cryptographic SHA-256 Integrity Gate)**: Every entry in `stored_updates` has a valid
+///   64-hex `verified_sha256` identical to `entry.manifest.sha256`. Corrupted downloads are rejected.
+/// - **INV-U3 (Bounded & Pairwise-Unique Archive Store)**: `stored_updates.len() <= max_stored`,
+///   ordered newest-first by `build_number`, with pairwise-distinct commits.
+/// - **INV-U4 (Install Convergence)**: `mark_installed` updates the installed build/commit so
+///   `evaluate_availability()` immediately transitions to `UpToDate` for that release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateCatalogStore {
+    installed_build_number: u64,
+    installed_commit_sha: String,
+    installed_short_sha: String,
+    latest_remote: Option<UpdateReleaseManifest>,
+    stored_updates: Vec<StoredUpdateEntry>,
+    max_stored: usize,
+}
+
+impl Default for UpdateCatalogStore {
+    fn default() -> Self {
+        Self::new(1, "0000000", MAX_STORED_UPDATES)
+    }
+}
+
+impl UpdateCatalogStore {
+    pub fn new(installed_build_number: u64, installed_commit_sha: &str, max_stored: usize) -> Self {
+        let (commit_sha, short_sha) = normalize_git_sha_verified(installed_commit_sha)
+            .unwrap_or_else(|| ("0000000".to_string(), "0000000".to_string()));
+        Self {
+            installed_build_number: installed_build_number.max(1),
+            installed_commit_sha: commit_sha,
+            installed_short_sha: short_sha,
+            latest_remote: None,
+            stored_updates: Vec::new(),
+            max_stored: max_stored.max(1),
+        }
+    }
+
+    pub fn from_loaded(
+        installed_build_number: u64,
+        installed_commit_sha: &str,
+        latest_remote: Option<UpdateReleaseManifest>,
+        raw_stored: Vec<StoredUpdateEntry>,
+        max_stored: usize,
+    ) -> Self {
+        let mut store = Self::new(installed_build_number, installed_commit_sha, max_stored);
+        if let Some(remote) = latest_remote {
+            let _ = store.observe_remote_release(remote);
+        }
+        for entry in raw_stored.into_iter().rev() {
+            let _ = store.record_downloaded_update(entry.manifest, &entry.verified_sha256);
+        }
+        store
+    }
+
+    #[inline]
+    pub fn installed_build_number(&self) -> u64 {
+        self.installed_build_number
+    }
+
+    #[inline]
+    pub fn installed_commit_sha(&self) -> &str {
+        &self.installed_commit_sha
+    }
+
+    #[inline]
+    pub fn installed_short_sha(&self) -> &str {
+        &self.installed_short_sha
+    }
+
+    #[inline]
+    pub fn latest_remote(&self) -> Option<&UpdateReleaseManifest> {
+        self.latest_remote.as_ref()
+    }
+
+    #[inline]
+    pub fn stored_updates(&self) -> &[StoredUpdateEntry] {
+        &self.stored_updates
+    }
+
+    #[inline]
+    pub fn max_stored(&self) -> usize {
+        self.max_stored
+    }
+
+    /// Finds a locally stored update matching `sha_or_prefix` (if already downloaded & verified).
+    pub fn find_stored(&self, sha_or_prefix: &str) -> Option<&StoredUpdateEntry> {
+        self.stored_updates
+            .iter()
+            .find(|e| git_shas_match_verified(&e.manifest.commit_sha, sha_or_prefix))
+    }
+
+    /// Records the latest release manifest observed from GitHub (`main` branch release).
+    /// Only updates `latest_remote` if the manifest is valid and has a build number at least
+    /// as high as any previously observed remote release.
+    pub fn observe_remote_release(&mut self, raw_manifest: UpdateReleaseManifest) -> bool {
+        let Some(manifest) = raw_manifest.sanitize() else {
+            return false;
+        };
+        if let Some(prev) = &self.latest_remote {
+            if manifest.build_number < prev.build_number {
+                return false;
+            }
+        }
+        self.latest_remote = Some(manifest);
+        true
+    }
+
+    /// Verifies and stores a downloaded update archive in the catalog (`INV-U2` & `INV-U3`).
+    /// Returns `(stored_entry, evicted_archive_filenames)` on success, or `Err(InvariantViolation)`
+    /// if the SHA-256 digest does not match the manifest.
+    pub fn record_downloaded_update(
+        &mut self,
+        raw_manifest: UpdateReleaseManifest,
+        actual_sha256: &str,
+    ) -> Result<(StoredUpdateEntry, Vec<String>), InvariantViolation> {
+        let Some(manifest) = raw_manifest.sanitize() else {
+            return Err(InvariantViolation {
+                code: "INV-U2",
+                subsystem: "UpdateCatalogStore",
+                details: "manifest failed sanitization".to_string(),
+            });
+        };
+
+        if !verify_update_digest_verified(&manifest.sha256, actual_sha256) {
+            return Err(InvariantViolation {
+                code: "INV-U2",
+                subsystem: "UpdateCatalogStore",
+                details: format!(
+                    "SHA-256 mismatch for commit {}: expected {}, got {}",
+                    manifest.short_sha, manifest.sha256, actual_sha256
+                ),
+            });
+        }
+
+        let verified_sha256 = normalize_sha256_hex_verified(actual_sha256).unwrap();
+        let archive_filename = manifest.canonical_archive_filename();
+
+        // Observe as latest remote if newer
+        let _ = self.observe_remote_release(manifest.clone());
+
+        // Deduplicate any existing entry with matching commit SHA
+        self.stored_updates
+            .retain(|existing| !git_shas_match_verified(&existing.manifest.commit_sha, &manifest.commit_sha));
+
+        let entry = StoredUpdateEntry {
+            manifest,
+            archive_filename,
+            verified_sha256,
+        };
+
+        self.stored_updates.insert(0, entry.clone());
+        // Sort newest-first by build_number (preserving insertion order on ties)
+        self.stored_updates
+            .sort_by(|a, b| b.manifest.build_number.cmp(&a.manifest.build_number));
+
+        let mut evicted = Vec::new();
+        while self.stored_updates.len() > self.max_stored {
+            if let Some(removed) = self.stored_updates.pop() {
+                evicted.push(removed.archive_filename);
+            }
+        }
+
+        Ok((entry, evicted))
+    }
+
+    /// Marks a specific build and commit as installed (`INV-U4`).
+    pub fn mark_installed(&mut self, build_number: u64, commit_sha: &str) -> bool {
+        let Some((norm_sha, short_sha)) = normalize_git_sha_verified(commit_sha) else {
+            return false;
+        };
+        self.installed_build_number = build_number.max(1);
+        self.installed_commit_sha = norm_sha;
+        self.installed_short_sha = short_sha;
+        true
+    }
+
+    /// Evaluates whether a newer `main` push is available to download or install (`INV-U1`).
+    pub fn evaluate_availability(&self) -> UpdateAvailability {
+        if let Some(remote) = &self.latest_remote {
+            if is_release_newer_verified(
+                self.installed_build_number,
+                &self.installed_commit_sha,
+                remote,
+            ) {
+                let stored_archive_filename = self
+                    .find_stored(&remote.commit_sha)
+                    .map(|s| s.archive_filename.clone());
+                return UpdateAvailability::UpdateAvailable {
+                    manifest: remote.clone(),
+                    stored_archive_filename,
+                };
+            }
+        }
+        UpdateAvailability::UpToDate {
+            installed_build: self.installed_build_number,
+            installed_short_sha: self.installed_short_sha.clone(),
+        }
+    }
+}
+
+impl FormalInvariant for UpdateCatalogStore {
+    fn check_invariants(&self) -> Result<(), InvariantViolation> {
+        // INV-U1: Installed SHA is valid and evaluate_availability agrees with is_release_newer_verified.
+        if normalize_git_sha_verified(&self.installed_commit_sha).is_none()
+            || self.installed_short_sha.len() != 7
+            || self.installed_build_number == 0
+        {
+            return Err(InvariantViolation {
+                code: "INV-U1",
+                subsystem: "UpdateCatalogStore",
+                details: format!(
+                    "invalid installed build={} or sha='{}'",
+                    self.installed_build_number, self.installed_commit_sha
+                ),
+            });
+        }
+
+        let availability = self.evaluate_availability();
+        match (&self.latest_remote, &availability) {
+            (Some(remote), UpdateAvailability::UpdateAvailable { manifest, .. }) => {
+                if !is_release_newer_verified(
+                    self.installed_build_number,
+                    &self.installed_commit_sha,
+                    remote,
+                ) || manifest != remote
+                {
+                    return Err(InvariantViolation {
+                        code: "INV-U1",
+                        subsystem: "UpdateCatalogStore",
+                        details: "UpdateAvailable reported for non-newer or mismatched remote release"
+                            .to_string(),
+                    });
+                }
+            }
+            (Some(remote), UpdateAvailability::UpToDate { .. }) => {
+                if is_release_newer_verified(
+                    self.installed_build_number,
+                    &self.installed_commit_sha,
+                    remote,
+                ) {
+                    return Err(InvariantViolation {
+                        code: "INV-U1",
+                        subsystem: "UpdateCatalogStore",
+                        details: "UpToDate reported despite newer remote release".to_string(),
+                    });
+                }
+            }
+            (None, UpdateAvailability::UpdateAvailable { .. }) => {
+                return Err(InvariantViolation {
+                    code: "INV-U1",
+                    subsystem: "UpdateCatalogStore",
+                    details: "UpdateAvailable reported when latest_remote is None".to_string(),
+                });
+            }
+            (None, UpdateAvailability::UpToDate { .. }) => {}
+        }
+
+        // INV-U2: Every stored update has a valid 64-hex SHA-256 matching its manifest and a non-empty archive filename.
+        for (idx, entry) in self.stored_updates.iter().enumerate() {
+            if !verify_update_digest_verified(&entry.manifest.sha256, &entry.verified_sha256)
+                || entry.archive_filename.trim().is_empty()
+                || !entry.archive_filename.ends_with(".zip")
+            {
+                return Err(InvariantViolation {
+                    code: "INV-U2",
+                    subsystem: "UpdateCatalogStore",
+                    details: format!(
+                        "stored_updates[{idx}] failed digest or filename integrity: {entry:?}"
+                    ),
+                });
+            }
+        }
+
+        // INV-U3: Bounded capacity (`<= max_stored`), descending build_number order, and pairwise unique commit SHAs.
+        if self.stored_updates.len() > self.max_stored {
+            return Err(InvariantViolation {
+                code: "INV-U3",
+                subsystem: "UpdateCatalogStore",
+                details: format!(
+                    "stored_updates.len()={} exceeds max_stored={}",
+                    self.stored_updates.len(),
+                    self.max_stored
+                ),
+            });
+        }
+        for window in self.stored_updates.windows(2) {
+            if window[0].manifest.build_number < window[1].manifest.build_number {
+                return Err(InvariantViolation {
+                    code: "INV-U3",
+                    subsystem: "UpdateCatalogStore",
+                    details: format!(
+                        "stored_updates not sorted descending by build_number: {} < {}",
+                        window[0].manifest.build_number, window[1].manifest.build_number
+                    ),
+                });
+            }
+        }
+        for i in 0..self.stored_updates.len() {
+            for j in (i + 1)..self.stored_updates.len() {
+                if git_shas_match_verified(
+                    &self.stored_updates[i].manifest.commit_sha,
+                    &self.stored_updates[j].manifest.commit_sha,
+                ) {
+                    return Err(InvariantViolation {
+                        code: "INV-U3",
+                        subsystem: "UpdateCatalogStore",
+                        details: format!(
+                            "duplicate commit SHA in stored_updates at {i} and {j}: {}",
+                            self.stored_updates[i].manifest.commit_sha
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[allow(unexpected_cfgs)]
 #[cfg(kani)]
 mod kani_proofs {

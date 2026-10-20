@@ -11,9 +11,32 @@ make install
 # Or build dist/Spot.app without installing
 make package
 
-# Or run directly from source
+#Or run directly from source
 make run
 ```
+
+## Updates (Every Push to `main`)
+
+Every push to `main` runs `.github/workflows/release.yml`, which executes the 19-proof formal verification suite, packages `Spot.app` into `Spot-macos.zip` + `spot-update-manifest.json` (with SHA-256 digest and build number), and publishes a downloadable GitHub Release.
+
+Downloaded updates are verified by SHA-256 and stored locally in `~/Library/Application Support/Spot/updates/archives/` (retaining the 10 most recent `main` builds for instant rollback):
+
+```bash
+# Check if a newer `main` push is available
+spot --check-update     # or: make check-update
+
+# Download, verify SHA-256, store locally, and install to /Applications/Spot.app
+spot --update           # or: make update
+
+# Download & store latest `main` build without installing yet
+spot --download-update
+
+# List locally stored update archives or roll back to a previous build
+spot --list-updates     # or: make list-updates
+spot --rollback <sha_or_build_number>
+```
+
+You can also check, download, and install `main` updates directly from the **Spot #\<build\>** badge in the bottom-left sidebar.
 
 ## Shortcuts
 

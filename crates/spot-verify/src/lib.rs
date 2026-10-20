@@ -18,16 +18,18 @@ use spot_audio::{verify_log_bin_edges_partition, SpectrumAnalyzer};
 use spot_core::{
     advance_queue_verified, coprime_shuffle_step, delete_last_word_verified,
     episode_to_playable_track_verified, format_connected_account_label, gcd_usize,
-    is_opaque_spotify_user_id, merge_devices_verified, normalize_spotify_episode_uri,
-    normalize_spotify_show_uri, resolve_playable_track_candidate, sanitize_pcm_sample,
-    sanitize_position_secs, sanitize_spotify_biography, sanitize_unit_float,
-    should_toggle_play_pause_on_space_verified, step_gated_stereo_frame_verified,
-    summarize_artist_bio, AlbumPlaybackQueue, ArtworkTheme, AudioDevice, FormalInvariant,
-    InstantAudioGate, NavHistoryMachine, NavRouteTarget, PlaybackContext, PlaybackState, Playlist,
-    PodcastEpisode, PodcastShowDetail, PodcastShowSummary, RecentListenedItem, RecentListenedKind,
-    RecentListenedStore, RecentSearchEntry, RecentSearchKind,
-    RecentSearchStore, RepeatMode, SpectrumFrame, Track, TrayMenuSnapshot, VerifiedTransportAction,
-    INSTANT_PAUSE_RAMP_FRAMES, RECENTLY_LISTENED_TOP_LIMIT, SPECTRUM_BANDS,
+    git_shas_match_verified, is_opaque_spotify_user_id, merge_devices_verified,
+    normalize_git_sha_verified, normalize_spotify_episode_uri, normalize_spotify_show_uri,
+    resolve_playable_track_candidate, sanitize_pcm_sample, sanitize_position_secs,
+    sanitize_spotify_biography, sanitize_unit_float, should_toggle_play_pause_on_space_verified,
+    step_gated_stereo_frame_verified, summarize_artist_bio, verify_update_digest_verified,
+    AlbumPlaybackQueue, ArtworkTheme, AudioDevice, FormalInvariant, InstantAudioGate,
+    NavHistoryMachine, NavRouteTarget, PlaybackContext, PlaybackState, Playlist, PodcastEpisode,
+    PodcastShowDetail, PodcastShowSummary, RecentListenedItem, RecentListenedKind,
+    RecentListenedStore, RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode,
+    SpectrumFrame, StoredUpdateEntry, Track, TrayMenuSnapshot, UpdateAvailability,
+    UpdateCatalogStore, UpdateReleaseManifest, VerifiedTransportAction, INSTANT_PAUSE_RAMP_FRAMES,
+    MAX_STORED_UPDATES, RECENTLY_LISTENED_TOP_LIMIT, SPECTRUM_BANDS,
 };
 use spot_spotify::sink::AtomicVolumeScaler;
 use stateright::{Checker, Model, Property};
@@ -2980,6 +2982,256 @@ pub fn prove_instant_audio_gate_and_spacebar_play_pause() -> ProofCertificate {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct UpdaterModelState {
+    pub installed_build: u64,
+    pub installed_sha: String,
+    pub remote_build: Option<u64>,
+    pub remote_sha: Option<String>,
+    pub stored_builds: Vec<(u64, String)>,
+    pub invariants_ok: bool,
+    pub corrupted_rejected_ok: bool,
+    pub availability_is_update: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum UpdaterModelAction {
+    ObserveMainPush(u8),
+    DownloadRemoteValid,
+    DownloadRemoteCorrupted,
+    InstallLatestStored,
+    RollbackToBuild(u8),
+}
+
+pub struct UpdaterModel;
+
+impl UpdaterModel {
+    fn sample_release(idx: u8) -> UpdateReleaseManifest {
+        let build = (idx as u64) + 1;
+        let hex_digit = char::from_digit((idx as u32 % 15) + 1, 16).unwrap();
+        let sha: String = std::iter::repeat(hex_digit).take(40).collect();
+        let short_sha = sha[..7].to_string();
+        let digest: String = std::iter::repeat(hex_digit).take(64).collect();
+        UpdateReleaseManifest {
+            version: "0.1.0".to_string(),
+            build_number: build,
+            commit_sha: sha,
+            short_sha: short_sha.clone(),
+            tag: format!("main-b{build}-{short_sha}"),
+            commit_title: format!("Main push #{build}"),
+            published_at: format!("2026-10-19T12:0{idx}:00Z"),
+            asset_name: "Spot-macos.zip".to_string(),
+            download_url: format!(
+                "https://github.com/cartermp/spot/releases/download/main-b{build}-{short_sha}/Spot-macos.zip"
+            ),
+            sha256: digest,
+            size_bytes: 15_000_000 + (build * 1024),
+        }
+    }
+
+    fn release_for_build(build: u64) -> UpdateReleaseManifest {
+        Self::sample_release((build.saturating_sub(1) as u8).min(5))
+    }
+
+    fn materialize(s: &UpdaterModelState) -> UpdateCatalogStore {
+        let remote = s.remote_build.map(Self::release_for_build);
+        let stored: Vec<StoredUpdateEntry> = s
+            .stored_builds
+            .iter()
+            .map(|(b, _)| {
+                let m = Self::release_for_build(*b);
+                let archive_filename = m.canonical_archive_filename();
+                let verified_sha256 = m.sha256.clone();
+                StoredUpdateEntry {
+                    manifest: m,
+                    archive_filename,
+                    verified_sha256,
+                }
+            })
+            .collect();
+        UpdateCatalogStore::from_loaded(s.installed_build, &s.installed_sha, remote, stored, 3)
+    }
+
+    fn project(store: &UpdateCatalogStore, corrupted_rejected_ok: bool) -> UpdaterModelState {
+        let invariants_ok = store.check_invariants().is_ok();
+        let availability = store.evaluate_availability();
+        let availability_is_update = matches!(availability, UpdateAvailability::UpdateAvailable { .. });
+        UpdaterModelState {
+            installed_build: store.installed_build_number(),
+            installed_sha: store.installed_short_sha().to_string(),
+            remote_build: store.latest_remote().map(|m| m.build_number),
+            remote_sha: store.latest_remote().map(|m| m.short_sha.clone()),
+            stored_builds: store
+                .stored_updates()
+                .iter()
+                .map(|e| (e.manifest.build_number, e.manifest.short_sha.clone()))
+                .collect(),
+            invariants_ok,
+            corrupted_rejected_ok,
+            availability_is_update,
+        }
+    }
+}
+
+impl Model for UpdaterModel {
+    type State = UpdaterModelState;
+    type Action = UpdaterModelAction;
+
+    fn init_states(&self) -> Vec<Self::State> {
+        let r0 = Self::sample_release(0);
+        let store = UpdateCatalogStore::new(r0.build_number, &r0.commit_sha, 3);
+        vec![Self::project(&store, true)]
+    }
+
+    fn actions(&self, _state: &Self::State, actions: &mut Vec<Self::Action>) {
+        for idx in 0..5u8 {
+            actions.push(UpdaterModelAction::ObserveMainPush(idx));
+            actions.push(UpdaterModelAction::RollbackToBuild(idx));
+        }
+        actions.push(UpdaterModelAction::DownloadRemoteValid);
+        actions.push(UpdaterModelAction::DownloadRemoteCorrupted);
+        actions.push(UpdaterModelAction::InstallLatestStored);
+    }
+
+    fn next_state(&self, last: &Self::State, action: Self::Action) -> Option<Self::State> {
+        let mut store = Self::materialize(last);
+        let mut corrupted_rejected_ok = last.corrupted_rejected_ok;
+
+        match action {
+            UpdaterModelAction::ObserveMainPush(idx) => {
+                let rel = Self::sample_release(idx);
+                let _ = store.observe_remote_release(rel);
+            }
+            UpdaterModelAction::DownloadRemoteValid => {
+                if let Some(remote) = store.latest_remote().cloned() {
+                    let digest = remote.sha256.clone();
+                    let res = store.record_downloaded_update(remote, &digest);
+                    if res.is_err() {
+                        corrupted_rejected_ok = false;
+                    }
+                }
+            }
+            UpdaterModelAction::DownloadRemoteCorrupted => {
+                if let Some(remote) = store.latest_remote().cloned() {
+                    let bad_digest =
+                        "0000000000000000000000000000000000000000000000000000000000000000";
+                    let prev_stored = store.stored_updates().to_vec();
+                    let res = store.record_downloaded_update(remote, bad_digest);
+                    if res.is_ok() || store.stored_updates() != prev_stored.as_slice() {
+                        corrupted_rejected_ok = false;
+                    }
+                }
+            }
+            UpdaterModelAction::InstallLatestStored => {
+                if let Some(top) = store.stored_updates().first().cloned() {
+                    store.mark_installed(top.manifest.build_number, &top.manifest.commit_sha);
+                }
+            }
+            UpdaterModelAction::RollbackToBuild(idx) => {
+                let target_build = (idx as u64) + 1;
+                if let Some(found) = store
+                    .stored_updates()
+                    .iter()
+                    .find(|e| e.manifest.build_number == target_build)
+                    .cloned()
+                {
+                    store.mark_installed(found.manifest.build_number, &found.manifest.commit_sha);
+                }
+            }
+        }
+
+        Some(Self::project(&store, corrupted_rejected_ok))
+    }
+
+    fn properties(&self) -> Vec<Property<Self>> {
+        vec![
+            Property::<Self>::always(
+                "INV-U1..U4: UpdateCatalogStore invariants & SHA-256 corruption rejection hold in all states",
+                |_, s| s.invariants_ok && s.corrupted_rejected_ok && s.stored_builds.len() <= 3,
+            ),
+            Property::<Self>::sometimes(
+                "Liveness: Main push detected, downloaded, and installed to latest build #5",
+                |_, s| s.installed_build == 5 && !s.availability_is_update,
+            ),
+        ]
+    }
+}
+
+/// Proof 19 (`MC-UPDATER-19`): Formally verifies the `main` release & local update storage subsystem:
+/// - **INV-U1 (Monotonic Update Availability)**: Only newer `main` commits with `build_number >= installed_build`
+///   and a distinct commit SHA trigger `UpdateAvailable`; downgrades and self-updates are suppressed.
+/// - **INV-U2 (Cryptographic SHA-256 Digest Gate)**: Any downloaded archive whose SHA-256 does not
+///   match the release manifest is rejected and never enters `UpdateCatalogStore`.
+/// - **INV-U3 (Bounded & Pairwise-Unique Archive Store)**: Stored updates are capped at `max_stored`
+///   (default `MAX_STORED_UPDATES = 10`), sorted newest-first by `build_number`, with unique commit SHAs.
+/// - **INV-U4 (Install & Rollback Convergence)**: Installing a stored build updates the active commit/build
+///   and transitions `evaluate_availability()` to `UpToDate` when matching `latest_remote`.
+pub fn prove_update_catalog_and_release_pipeline() -> ProofCertificate {
+    let t0 = Instant::now();
+    let checker = UpdaterModel.checker().threads(1).spawn_bfs().join();
+    checker.assert_properties();
+    let mut explored = checker.unique_state_count();
+
+    // Deterministic algebraic & boundary checks for SHA normalization, digest matching, and capacity eviction
+    assert!(normalize_git_sha_verified("7991bb1").is_some());
+    assert!(normalize_git_sha_verified("bd4eb8f1234567890abcdef1234567890abcdef1").is_some());
+    assert!(normalize_git_sha_verified("short").is_none());
+    assert!(normalize_git_sha_verified("zzzzzzz").is_none());
+    assert!(git_shas_match_verified(
+        "bd4eb8f",
+        "BD4EB8F1234567890ABCDEF1234567890ABCDEF1"
+    ));
+
+    let valid_sha256 = "a3f5c8e90123456789abcdef0123456789abcdef0123456789abcdef01234567";
+    let upper_sha256 = valid_sha256.to_ascii_uppercase();
+    assert!(verify_update_digest_verified(valid_sha256, &upper_sha256));
+    assert!(!verify_update_digest_verified(valid_sha256, "deadbeef"));
+
+    let mut full_store = UpdateCatalogStore::new(1, "1111111", MAX_STORED_UPDATES);
+    for idx in 1..=14u64 {
+        let sha = format!("{idx:040x}");
+        let short_sha = sha[..7].to_string();
+        let digest = format!("{idx:064x}");
+        let manifest = UpdateReleaseManifest {
+            version: "0.1.0".into(),
+            build_number: idx,
+            commit_sha: sha,
+            short_sha: short_sha.clone(),
+            tag: format!("main-b{idx}-{short_sha}"),
+            commit_title: format!("Commit {idx}"),
+            published_at: "2026-10-19T00:00:00Z".into(),
+            asset_name: "Spot-macos.zip".into(),
+            download_url: format!("https://github.com/cartermp/spot/releases/download/main-b{idx}-{short_sha}/Spot-macos.zip"),
+            sha256: digest.clone(),
+            size_bytes: 10_000_000,
+        };
+        let (stored, evicted) = full_store
+            .record_downloaded_update(manifest, &digest)
+            .expect("valid SHA-256 must store");
+        assert_eq!(
+            stored.archive_filename,
+            format!("Spot-b{idx}-{short_sha}.zip")
+        );
+        if idx > MAX_STORED_UPDATES as u64 {
+            assert_eq!(evicted.len(), 1);
+        }
+        assert!(full_store.check_invariants().is_ok());
+        explored += 1;
+    }
+    assert_eq!(full_store.stored_updates().len(), MAX_STORED_UPDATES);
+    assert_eq!(full_store.stored_updates()[0].manifest.build_number, 14);
+
+    ProofCertificate {
+        id: "MC-UPDATER-19",
+        subsystem: "spot-core / spot-app (Main Release & Update Storage)",
+        method: "Stateright BFS + Cryptographic SHA-256 & Bounded Store Proof",
+        theorem: "INV-U1..U4: Main Push Freshness, SHA-256 Digest Gate, Bounded Archive Store & Install",
+        states_or_cases_explored: explored,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        verified: true,
+    }
+}
+
 /// Runs the complete Spot formal verification suite and returns a structured [`VerificationSuiteReport`].
 pub fn run_all_formal_proofs() -> VerificationSuiteReport {
     let suite_start = Instant::now();
@@ -3002,6 +3254,7 @@ pub fn run_all_formal_proofs() -> VerificationSuiteReport {
         prove_album_discography_and_playlist_isolation_stateright(),
         prove_tray_and_player_progress_sync_invariant(),
         prove_instant_audio_gate_and_spacebar_play_pause(),
+        prove_update_catalog_and_release_pipeline(),
     ];
 
     let total_states_or_cases = certificates
@@ -3025,6 +3278,6 @@ mod tests {
     fn formal_verification_suite_proves_all_theorems() {
         let report = run_all_formal_proofs();
         assert!(report.all_verified());
-        assert_eq!(report.certificates.len(), 18);
+        assert_eq!(report.certificates.len(), 19);
     }
 }

@@ -4,15 +4,18 @@ pub mod formal;
 pub use formal::{
     advance_queue_verified, coprime_shuffle_step, delete_last_word_verified,
     episode_to_playable_track_verified, format_connected_account_label, gcd_usize,
-    is_opaque_spotify_user_id, merge_devices_verified, normalize_album_playback_queue,
-    normalize_spotify_episode_uri, normalize_spotify_show_uri, resolve_playable_track_candidate,
-    sanitize_pcm_sample, sanitize_position_secs, sanitize_spotify_biography, sanitize_unit_float,
-    select_device_verified, should_toggle_play_pause_on_space_verified,
-    step_gated_stereo_frame_verified, summarize_artist_bio, FormalInvariant, InstantAudioGate,
+    git_shas_match_verified, is_opaque_spotify_user_id, is_release_newer_verified,
+    merge_devices_verified, normalize_album_playback_queue, normalize_git_sha_verified,
+    normalize_sha256_hex_verified, normalize_spotify_episode_uri, normalize_spotify_show_uri,
+    resolve_playable_track_candidate, sanitize_pcm_sample, sanitize_position_secs,
+    sanitize_spotify_biography, sanitize_unit_float, select_device_verified,
+    should_toggle_play_pause_on_space_verified, step_gated_stereo_frame_verified,
+    summarize_artist_bio, verify_update_digest_verified, FormalInvariant, InstantAudioGate,
     InvariantViolation, NavHistoryMachine, NavRouteTarget, RecentListenedItem, RecentListenedKind,
     RecentListenedStore, RecentSearchEntry, RecentSearchKind, RecentSearchStore,
-    TrayMenuSnapshot, VerifiedTransportAction, INSTANT_PAUSE_RAMP_FRAMES,
-    INSTANT_SINK_MAX_BUFFERED_FRAMES, RECENTLY_LISTENED_TOP_LIMIT,
+    StoredUpdateEntry, TrayMenuSnapshot, UpdateAvailability, UpdateCatalogStore,
+    UpdateReleaseManifest, VerifiedTransportAction, INSTANT_PAUSE_RAMP_FRAMES,
+    INSTANT_SINK_MAX_BUFFERED_FRAMES, MAX_STORED_UPDATES, RECENTLY_LISTENED_TOP_LIMIT,
 };
 
 /// Number of logarithmically spaced frequency bands used by the ribbon visualizer.

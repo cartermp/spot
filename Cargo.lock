@@ -5953,6 +5953,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "spot-audio",
  "spot-core",
  "spot-spotify",

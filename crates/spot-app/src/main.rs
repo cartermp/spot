@@ -3,6 +3,7 @@ mod artwork;
 mod icons;
 mod theme;
 mod tray;
+mod updater;
 mod visualizer;
 
 use artwork::{download_and_decode_artwork, ArtworkCache, DecodedArtwork};
@@ -22,7 +23,8 @@ use spot_core::{
     EngineEvent, FormalInvariant, InvariantViolation, NavHistoryMachine, NavRouteTarget,
     NavSection, PlaybackContext, PlaybackState, PlayerCommand, PodcastEpisode, PodcastShowDetail,
     PodcastShowSummary, RecentListenedItem, RecentListenedKind, RecentListenedStore,
-    RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode, SpectrumFrame, Track,
+    RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode, SpectrumFrame,
+    StoredUpdateEntry, Track, UpdateAvailability, UpdateCatalogStore, UpdateReleaseManifest,
     VerifiedTransportAction, RECENTLY_LISTENED_TOP_LIMIT,
 };
 use spot_spotify::{spawn_engine, EngineHandle};
@@ -44,6 +46,15 @@ pub fn main() -> iced::Result {
             app_icon::export_icon_png(out_path, 1024)
                 .expect("failed to export 1024x1024 Spot app icon PNG");
             return Ok(());
+        }
+    }
+
+    match updater::handle_cli_update_args(&args) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            std::process::exit(1);
         }
     }
 
@@ -244,6 +255,12 @@ pub enum Message {
     RemoveRecentSearch(usize),
     ClearRecentSearches,
     ToggleTrackMenu,
+    CheckForMainUpdate,
+    MainUpdateChecked(Result<UpdateReleaseManifest, String>),
+    DownloadMainUpdate(UpdateReleaseManifest),
+    MainUpdateDownloaded(Result<(StoredUpdateEntry, PathBuf), String>),
+    InstallStoredMainUpdate(StoredUpdateEntry),
+    MainUpdateInstalled(Result<PathBuf, String>),
     ArtworkLoaded(Option<(String, DecodedArtwork)>),
 }
 
@@ -269,6 +286,9 @@ pub struct SpotApp {
     recent_searches: RecentSearchStore,
     recently_listened: RecentListenedStore,
     recently_listened_expanded: bool,
+    update_catalog: UpdateCatalogStore,
+    update_busy: bool,
+    update_status_note: Option<String>,
     search_artists: Vec<ArtistSummary>,
     search_albums: Vec<AlbumSummary>,
     search_shows: Vec<PodcastShowSummary>,
@@ -301,6 +321,7 @@ impl FormalInvariant for SpotApp {
         self.nav_history.check_invariants()?;
         self.recent_searches.check_invariants()?;
         self.recently_listened.check_invariants()?;
+        self.update_catalog.check_invariants()?;
         self.spectrum.check_invariants()?;
         if let Some(show) = &self.selected_show {
             show.check_invariants()?;
@@ -331,6 +352,7 @@ impl SpotApp {
 
         let recent_searches = load_recent_searches();
         let recently_listened = load_recently_listened();
+        let update_catalog = updater::load_update_catalog();
         let artwork = ArtworkCache::new();
         let sidebar_app_icon = app_icon::sidebar_badge_handle();
         let dock_icon_installed = app_icon::install_macos_dock_icon();
@@ -360,6 +382,9 @@ impl SpotApp {
             recent_searches,
             recently_listened,
             recently_listened_expanded: false,
+            update_catalog,
+            update_busy: false,
+            update_status_note: None,
             search_artists: Vec::new(),
             search_albums: Vec::new(),
             search_shows: Vec::new(),
@@ -378,7 +403,21 @@ impl SpotApp {
         debug_assert!(app.check_invariants().is_ok());
 
         let initial_artwork_tasks = app.spawn_missing_artwork_tasks();
-        (app, initial_artwork_tasks)
+        #[cfg(not(test))]
+        let startup_tasks = Task::batch([
+            initial_artwork_tasks,
+            Task::perform(
+                async {
+                    updater::fetch_latest_main_release()
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+                Message::MainUpdateChecked,
+            ),
+        ]);
+        #[cfg(test)]
+        let startup_tasks = initial_artwork_tasks;
+        (app, startup_tasks)
     }
 
     fn current_route(&self) -> &StageRoute {
@@ -1744,6 +1783,155 @@ impl SpotApp {
             Message::ToggleTrackMenu => {
                 self.show_track_details_banner = !self.show_track_details_banner;
             }
+            Message::CheckForMainUpdate => {
+                if !self.update_busy {
+                    self.update_busy = true;
+                    self.update_status_note = Some("Checking main releases…".to_string());
+                    tracing::info!("[Updater] Checking GitHub releases for latest main push");
+                    self.sync_tray();
+                    return Task::perform(
+                        async {
+                            updater::fetch_latest_main_release()
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::MainUpdateChecked,
+                    );
+                }
+            }
+            Message::MainUpdateChecked(res) => {
+                self.update_busy = false;
+                match res {
+                    Ok(manifest) => {
+                        let accepted = self.update_catalog.observe_remote_release(manifest.clone());
+                        let _ = updater::save_update_catalog(&self.update_catalog);
+                        debug_assert!(self.update_catalog.check_invariants().is_ok());
+                        match self.update_catalog.evaluate_availability() {
+                            UpdateAvailability::UpdateAvailable {
+                                manifest: avail,
+                                stored_archive_filename,
+                            } => {
+                                tracing::info!(
+                                    "[Updater] New main build available: #{} ({}) [accepted={}]",
+                                    avail.build_number,
+                                    avail.short_sha,
+                                    accepted
+                                );
+                                self.update_status_note = Some(if stored_archive_filename.is_some() {
+                                    format!("Ready to install · {}", avail.short_sha)
+                                } else {
+                                    format!("Click to download · {}", avail.short_sha)
+                                });
+                            }
+                            UpdateAvailability::UpToDate {
+                                installed_build,
+                                installed_short_sha,
+                            } => {
+                                tracing::info!(
+                                    "[Updater] Up to date with main (build #{installed_build}, {installed_short_sha})"
+                                );
+                                self.update_status_note = Some("Up to date with main".to_string());
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!("[Updater] Main update check note: {err}");
+                        self.update_status_note = Some("Up to date (local build)".to_string());
+                    }
+                }
+            }
+            Message::DownloadMainUpdate(manifest) => {
+                if !self.update_busy {
+                    self.update_busy = true;
+                    self.update_status_note = Some(format!(
+                        "Downloading #{} ({})…",
+                        manifest.build_number, manifest.short_sha
+                    ));
+                    tracing::info!(
+                        "[Updater] Downloading main build #{} ({}) from {}",
+                        manifest.build_number,
+                        manifest.short_sha,
+                        manifest.download_url
+                    );
+                    self.sync_tray();
+                    return Task::perform(
+                        async move {
+                            updater::download_and_store_update(manifest)
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::MainUpdateDownloaded,
+                    );
+                }
+            }
+            Message::MainUpdateDownloaded(res) => {
+                self.update_busy = false;
+                match res {
+                    Ok((entry, path)) => {
+                        tracing::info!(
+                            "[Updater] Stored verified main update #{} ({}) at {}",
+                            entry.manifest.build_number,
+                            entry.manifest.short_sha,
+                            path.display()
+                        );
+                        self.update_catalog = updater::load_update_catalog();
+                        debug_assert!(self.update_catalog.check_invariants().is_ok());
+                        self.update_status_note = Some(format!(
+                            "Stored #{} · Click to install",
+                            entry.manifest.build_number
+                        ));
+                    }
+                    Err(err) => {
+                        tracing::warn!("[Updater] Failed to download main update: {err}");
+                        self.update_status_note = Some("Download failed — retry".to_string());
+                    }
+                }
+            }
+            Message::InstallStoredMainUpdate(entry) => {
+                if !self.update_busy {
+                    self.update_busy = true;
+                    self.update_status_note = Some(format!(
+                        "Installing #{} ({})…",
+                        entry.manifest.build_number, entry.manifest.short_sha
+                    ));
+                    tracing::info!(
+                        "[Updater] Installing stored build #{} ({})",
+                        entry.manifest.build_number,
+                        entry.manifest.short_sha
+                    );
+                    self.sync_tray();
+                    return Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                updater::install_stored_update_entry(&entry)
+                                    .map_err(|e| e.to_string())
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()))
+                        },
+                        Message::MainUpdateInstalled,
+                    );
+                }
+            }
+            Message::MainUpdateInstalled(res) => {
+                self.update_busy = false;
+                match res {
+                    Ok(installed_path) => {
+                        tracing::info!(
+                            "[Updater] Installed Spot update to {}",
+                            installed_path.display()
+                        );
+                        self.update_catalog = updater::load_update_catalog();
+                        debug_assert!(self.update_catalog.check_invariants().is_ok());
+                        self.update_status_note =
+                            Some("Installed to /Applications · Relaunch".to_string());
+                    }
+                    Err(err) => {
+                        tracing::warn!("[Updater] Install failed: {err}");
+                        self.update_status_note = Some("Install failed — see logs".to_string());
+                    }
+                }
+            }
             Message::ArtworkLoaded(Some((url, decoded))) => {
                 tracing::info!("[UI] ArtworkLoaded -> cached texture for {}", url);
                 self.artwork.insert_remote(url, decoded);
@@ -2248,6 +2436,8 @@ impl SpotApp {
         .padding(Padding::from([8, 8]))
         .style(theme::subtle_row_button(false));
 
+        let update_card = self.view_update_card();
+
         let content = column![
             vertical_space().height(Length::Fixed(34.0)),
             brand_header,
@@ -2258,6 +2448,7 @@ impl SpotApp {
             playlists_header,
             playlists_scroll,
             horizontal_rule(1),
+            update_card,
             footer_card,
         ]
         .spacing(6)
@@ -2273,6 +2464,111 @@ impl SpotApp {
             .height(Length::Fill)
             .style(theme::sidebar_container)
             .into()
+    }
+
+    fn view_update_card(&self) -> Element<'_, Message> {
+        let availability = self.update_catalog.evaluate_availability();
+        let (headline, subline, has_update, action_msg) = match availability {
+            UpdateAvailability::UpdateAvailable {
+                manifest,
+                stored_archive_filename,
+            } => {
+                if let Some(stored) = self
+                    .update_catalog
+                    .find_stored(&manifest.commit_sha)
+                    .cloned()
+                {
+                    let _ = stored_archive_filename;
+                    (
+                        format!(
+                            "Update ready · #{} ({})",
+                            manifest.build_number, manifest.short_sha
+                        ),
+                        self.update_status_note
+                            .clone()
+                            .unwrap_or_else(|| "Stored · Click to install".to_string()),
+                        true,
+                        Message::InstallStoredMainUpdate(stored),
+                    )
+                } else {
+                    (
+                        format!(
+                            "Update available · #{} ({})",
+                            manifest.build_number, manifest.short_sha
+                        ),
+                        self.update_status_note
+                            .clone()
+                            .unwrap_or_else(|| "Download latest main build".to_string()),
+                        true,
+                        Message::DownloadMainUpdate(manifest),
+                    )
+                }
+            }
+            UpdateAvailability::UpToDate {
+                installed_build,
+                installed_short_sha,
+            } => {
+                let stored_count = self.update_catalog.stored_updates().len();
+                let default_sub = if stored_count > 0 {
+                    format!("{stored_count} stored · Check updates")
+                } else {
+                    "Check for main updates".to_string()
+                };
+                (
+                    format!("Spot #{installed_build} · {installed_short_sha}"),
+                    self.update_status_note.clone().unwrap_or(default_sub),
+                    false,
+                    Message::CheckForMainUpdate,
+                )
+            }
+        };
+
+        let dot_color = if has_update {
+            palette::EMERALD
+        } else {
+            palette::INK_MUTED
+        };
+        let update_dot = container(text(""))
+            .width(Length::Fixed(6.5))
+            .height(Length::Fixed(6.5))
+            .style(move |_| container::Style {
+                background: Some(iced::Background::Color(dot_color)),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        button(
+            row![
+                column![
+                    row![
+                        update_dot,
+                        text(headline).size(11.5).color(palette::INK_PRIMARY),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                    text(subline).size(10.5).color(palette::INK_SECONDARY),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                text(if has_update { "↓" } else { "↻" })
+                    .size(13)
+                    .color(if has_update {
+                        palette::EMERALD
+                    } else {
+                        palette::INK_SECONDARY
+                    }),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .on_press(action_msg)
+        .width(Length::Fill)
+        .padding(Padding::from([6, 8]))
+        .style(theme::subtle_row_button(has_update))
+        .into()
     }
 
     fn view_nav_item<'a>(
@@ -5109,5 +5405,64 @@ mod tests {
         assert!(!app.engine.audio_gate.is_playing());
         assert_eq!(app.podcast_filter_query, "the daily ");
         app.assert_invariants();
+    }
+
+    #[test]
+    fn main_update_detection_storage_and_integrity_preserve_invariants() {
+        let (mut app, _) = SpotApp::new();
+        app.assert_invariants();
+
+        let next_build = app.update_catalog.installed_build_number() + 10;
+        let fake_sha = "abcdef1234567890abcdef1234567890abcdef12";
+        let fake_digest = updater::sha256_hex_bytes(b"spot-macos-zip-payload");
+
+        let manifest = UpdateReleaseManifest {
+            version: "0.1.0".into(),
+            build_number: next_build,
+            commit_sha: fake_sha.into(),
+            short_sha: "abcdef1".into(),
+            tag: format!("main-b{next_build}-abcdef1"),
+            commit_title: "Add main update storage".into(),
+            published_at: "2026-10-19T23:30:00Z".into(),
+            asset_name: "Spot-macos.zip".into(),
+            download_url: "https://github.com/cartermp/spot/releases/download/test/Spot-macos.zip"
+                .into(),
+            sha256: fake_digest.clone(),
+            size_bytes: 22,
+        };
+
+        let _ = app.update(Message::MainUpdateChecked(Ok(manifest.clone())));
+        assert!(matches!(
+            app.update_catalog.evaluate_availability(),
+            UpdateAvailability::UpdateAvailable { .. }
+        ));
+        app.assert_invariants();
+
+        // Corrupted SHA-256 must be rejected by UpdateCatalogStore (INV-U2)
+        assert!(app
+            .update_catalog
+            .record_downloaded_update(
+                manifest.clone(),
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )
+            .is_err());
+        app.assert_invariants();
+
+        // Valid SHA-256 stores cleanly and transitions after install (INV-U3 & INV-U4)
+        let (stored, _) = app
+            .update_catalog
+            .record_downloaded_update(manifest, &fake_digest)
+            .expect("valid digest must store");
+        assert!(app.update_catalog.find_stored("abcdef1").is_some());
+        app.assert_invariants();
+
+        app.update_catalog
+            .mark_installed(stored.manifest.build_number, &stored.manifest.commit_sha);
+        assert!(matches!(
+            app.update_catalog.evaluate_availability(),
+            UpdateAvailability::UpToDate { .. }
+        ));
+        app.assert_invariants();
+        let _ = app.view();
     }
 }

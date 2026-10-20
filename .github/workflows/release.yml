@@ -1,0 +1,100 @@
+name: Release Main Update
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spot-main-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish-update:
+    name: Build & Publish Spot.app Update (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Spot Formal Verification Suite (19/19 proofs)
+        run: cargo run -p spot-verify
+
+      - name: Compute build metadata for this main push
+        id: meta
+        run: |
+          COMMIT_SHA="${GITHUB_SHA}"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          COMMIT_COUNT="$(git rev-list --count HEAD)"
+          if (( GITHUB_RUN_NUMBER > COMMIT_COUNT )); then
+            BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+          else
+            BUILD_NUMBER="${COMMIT_COUNT}"
+          fi
+          RELEASE_TAG="main-b${BUILD_NUMBER}-${SHORT_SHA}"
+          COMMIT_TITLE="$(git log -1 --format=%s HEAD)"
+          echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "commit_title=${COMMIT_TITLE}" >> "$GITHUB_OUTPUT"
+
+      - name: Package Spot.app, Spot-macos.zip, and spot-update-manifest.json
+        env:
+          SPOT_BUILD_COMMIT: ${{ steps.meta.outputs.commit_sha }}
+          SPOT_BUILD_NUMBER: ${{ steps.meta.outputs.build_number }}
+          SPOT_RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          SPOT_UPDATE_REPO: ${{ github.repository }}
+        run: ./scripts/package-macos.sh --zip
+
+      - name: Publish downloadable GitHub Release for main push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          BUILD_NUMBER: ${{ steps.meta.outputs.build_number }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+          COMMIT_SHA: ${{ steps.meta.outputs.commit_sha }}
+          COMMIT_TITLE: ${{ steps.meta.outputs.commit_title }}
+        run: |
+          SHA256="$(awk '{print $1}' dist/SHA256SUMS.txt)"
+          NOTES="$(cat <<EOF
+          ### Spot Main Update — Build #${BUILD_NUMBER} (\`${SHORT_SHA}\`)
+
+          - **Commit**: \`${COMMIT_SHA}\` — ${COMMIT_TITLE}
+          - **SHA-256 (\`Spot-macos.zip\`)**: \`${SHA256}\`
+
+          #### Install / Update
+          \`\`\`bash
+          spot --update
+          # or from the repo:
+          make update
+          \`\`\`
+          EOF
+          )"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              dist/Spot-macos.zip \
+              dist/spot-update-manifest.json \
+              dist/SHA256SUMS.txt \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/Spot-macos.zip \
+              dist/spot-update-manifest.json \
+              dist/SHA256SUMS.txt \
+              --title "Spot #${BUILD_NUMBER} (${SHORT_SHA}) — ${COMMIT_TITLE}" \
+              --notes "$NOTES" \
+              --latest
+          fi
