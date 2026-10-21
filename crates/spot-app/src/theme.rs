@@ -429,3 +429,110 @@ pub fn elegant_scrollbar(
     }
 }
 
+pub fn update_modal_backdrop(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(0.06, 0.08, 0.10, 0.44))),
+        ..Default::default()
+    }
+}
+
+pub fn update_modal_card(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgb(0.988, 0.988, 0.980))),
+        border: Border {
+            color: Color::from_rgba(0.08, 0.28, 0.19, 0.16),
+            width: 1.0,
+            radius: 20.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.03, 0.07, 0.09, 0.26),
+            offset: Vector::new(0.0, 18.0),
+            blur_radius: 46.0,
+        },
+        ..Default::default()
+    }
+}
+
+pub fn update_modal_version_strip(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgb(0.949, 0.955, 0.946))),
+        border: Border {
+            color: Color::from_rgba(0.078, 0.588, 0.294, 0.18),
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+pub fn update_modal_notes_box(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::WHITE)),
+        border: Border {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.065),
+            width: 1.0,
+            radius: 14.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.04, 0.06, 0.08, 0.035),
+            offset: Vector::new(0.0, 3.0),
+            blur_radius: 10.0,
+        },
+        ..Default::default()
+    }
+}
+
+pub fn update_modal_verified_banner(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(0.078, 0.588, 0.294, 0.10))),
+        border: Border {
+            color: Color::from_rgba(0.078, 0.588, 0.294, 0.30),
+            width: 1.0,
+            radius: 11.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+pub fn update_modal_primary_btn(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => Color::from_rgb(0.118, 0.388, 0.278),
+        button::Status::Pressed => Color::from_rgb(0.082, 0.290, 0.204),
+        button::Status::Disabled => Color::from_rgba(0.102, 0.337, 0.239, 0.45),
+        _ => Color::from_rgb(0.102, 0.337, 0.239),
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: Color::WHITE,
+        border: Border {
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.14),
+            width: 1.0,
+            radius: 11.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.04, 0.16, 0.11, 0.22),
+            offset: Vector::new(0.0, 4.0),
+            blur_radius: 12.0,
+        },
+    }
+}
+
+pub fn update_modal_secondary_btn(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => Color::from_rgb(0.914, 0.918, 0.906),
+        button::Status::Pressed => Color::from_rgb(0.878, 0.882, 0.870),
+        _ => Color::from_rgb(0.945, 0.945, 0.935),
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: palette::INK_PRIMARY,
+        border: Border {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.08),
+            width: 1.0,
+            radius: 11.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+
+

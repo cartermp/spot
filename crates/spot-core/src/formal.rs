@@ -3399,6 +3399,8 @@ pub struct UpdateReleaseManifest {
     pub short_sha: String,
     pub tag: String,
     pub commit_title: String,
+    #[serde(default)]
+    pub release_notes: String,
     pub published_at: String,
     pub asset_name: String,
     pub download_url: String,
@@ -3444,6 +3446,23 @@ impl UpdateReleaseManifest {
             clean_title
         };
 
+        let mut cleaned_notes = Vec::new();
+        for raw_line in self.release_notes.lines() {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.starts_with("co-authored-by:")
+                || lower.starts_with("copilot-session:")
+                || lower.starts_with("signed-off-by:")
+            {
+                continue;
+            }
+            cleaned_notes.push(trimmed.to_string());
+        }
+        self.release_notes = cleaned_notes.join("\n");
+
         let clean_pub: String = self
             .published_at
             .split_whitespace()
@@ -3479,6 +3498,91 @@ impl UpdateReleaseManifest {
     /// Canonical filename used when storing this update in `~/Library/Application Support/Spot/updates/archives/`.
     pub fn canonical_archive_filename(&self) -> String {
         format!("Spot-b{}-{}.zip", self.build_number, self.short_sha)
+    }
+
+    /// Human-readable archive size (e.g. `"14.8 MB"` or `"640 KB"`).
+    pub fn formatted_size(&self) -> String {
+        if self.size_bytes >= 1_000_000 {
+            let mb = (self.size_bytes as f64) / (1024.0 * 1024.0);
+            format!("{mb:.1} MB")
+        } else if self.size_bytes >= 1024 {
+            let kb = (self.size_bytes as f64) / 1024.0;
+            format!("{kb:.0} KB")
+        } else {
+            format!("{} B", self.size_bytes)
+        }
+    }
+
+    /// Human-readable publish date/time (e.g. `"2026-10-21 · 17:31 UTC"`).
+    pub fn formatted_published_at(&self) -> String {
+        let trimmed = self.published_at.trim();
+        if let Some((date_part, time_part)) = trimmed.split_once('T') {
+            let hm: String = time_part
+                .trim_end_matches('Z')
+                .chars()
+                .take(5)
+                .collect();
+            if !date_part.is_empty() && hm.len() == 5 {
+                return format!("{date_part} · {hm} UTC");
+            }
+        }
+        trimmed.to_string()
+    }
+
+    /// Returns crisp, human-readable bullet points describing what is included in this update.
+    pub fn description_bullets(&self) -> Vec<String> {
+        let mut bullets = Vec::new();
+        for line in self.release_notes.lines() {
+            let stripped = line
+                .trim()
+                .trim_start_matches(['-', '*', '•'])
+                .trim();
+            if stripped.is_empty()
+                || stripped.starts_with("###")
+                || stripped.starts_with("####")
+                || stripped.starts_with("```")
+                || stripped.eq_ignore_ascii_case("spot --update")
+                || stripped.eq_ignore_ascii_case("make update")
+                || stripped.starts_with("# or from the repo")
+                || stripped.starts_with("**SHA-256")
+            {
+                continue;
+            }
+            if !bullets.iter().any(|b: &String| b.eq_ignore_ascii_case(stripped)) {
+                bullets.push(stripped.to_string());
+            }
+        }
+
+        if bullets.is_empty() {
+            // Derive structured highlights from commit_title if comma/and separated
+            let parts: Vec<&str> = self
+                .commit_title
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.len() >= 2 {
+                for part in parts {
+                    let clean = part.trim_start_matches("and ").trim();
+                    if !clean.is_empty() {
+                        let mut chars = clean.chars();
+                        let capitalized = match chars.next() {
+                            Some(first) => {
+                                format!("{}{}", first.to_uppercase(), chars.as_str())
+                            }
+                            None => String::new(),
+                        };
+                        if !capitalized.is_empty() {
+                            bullets.push(capitalized);
+                        }
+                    }
+                }
+            } else if !self.commit_title.trim().is_empty() {
+                bullets.push(self.commit_title.trim().to_string());
+            }
+        }
+
+        bullets
     }
 }
 

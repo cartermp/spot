@@ -18,8 +18,17 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SPOT_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=SPOT_BUILD_NUMBER");
     println!("cargo:rerun-if-env-changed=GITHUB_RUN_NUMBER");
+    println!("cargo:rerun-if-changed=../../.git");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs");
+    if let Some(git_dir) = git_stdout(&["rev-parse", "--git-dir"]) {
+        println!("cargo:rerun-if-changed={git_dir}/HEAD");
+        println!("cargo:rerun-if-changed={git_dir}/logs/HEAD");
+    }
+    if let Some(common_dir) = git_stdout(&["rev-parse", "--git-common-dir"]) {
+        println!("cargo:rerun-if-changed={common_dir}/packed-refs");
+        println!("cargo:rerun-if-changed={common_dir}/refs/heads");
+    }
 
     let commit_sha = std::env::var("SPOT_BUILD_COMMIT")
         .ok()

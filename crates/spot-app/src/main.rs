@@ -9,8 +9,8 @@ mod visualizer;
 use artwork::{download_and_decode_artwork, ArtworkCache, DecodedArtwork};
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
-    button, column, container, horizontal_rule, horizontal_space, image, pick_list, row,
-    scrollable, slider, svg, text, text_input, vertical_space,
+    button, center, column, container, horizontal_rule, horizontal_space, image, mouse_area,
+    opaque, pick_list, row, scrollable, slider, stack, svg, text, text_input, vertical_space,
 };
 use iced::window;
 use iced::{Alignment, Element, Length, Padding, Size, Subscription, Task, Theme};
@@ -202,10 +202,30 @@ impl NavRouteTarget for StageRoute {
     }
 }
 
+/// Interactive lifecycle state of the Update Popup Modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateModalPhase {
+    /// A newer `main` build is available to download.
+    Available,
+    /// Currently downloading the release archive and verifying its SHA-256 digest (`INV-U2`).
+    Downloading { auto_restart_after: bool },
+    /// The release archive is downloaded and SHA-256 verified on disk — ready to install & restart.
+    DownloadedReady,
+    /// Extracting and installing `Spot.app` into `/Applications/Spot.app`.
+    Installing { restart_after: bool },
+    /// Update is installed on disk; user can restart immediately (or auto-restart is in progress).
+    InstalledReadyToRestart { installed_path: PathBuf },
+    /// App is already on the latest `main` build (shows build details & stored rollback archives).
+    UpToDateOverview,
+    /// Last update check, download, or install encountered an error.
+    Failed { error: String },
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     AnimationTick,
     ScrollActivity,
+    EscapePressed,
     SelectNav(NavSection),
     NavigateBack,
     NavigateForward,
@@ -256,12 +276,27 @@ pub enum Message {
     RemoveRecentSearch(usize),
     ClearRecentSearches,
     ToggleTrackMenu,
+    OpenUpdateModal,
+    CloseUpdateModal,
     CheckForMainUpdate,
     MainUpdateChecked(Result<UpdateReleaseManifest, String>),
-    DownloadMainUpdate(UpdateReleaseManifest),
-    MainUpdateDownloaded(Result<(StoredUpdateEntry, PathBuf), String>),
-    InstallStoredMainUpdate(StoredUpdateEntry),
-    MainUpdateInstalled(Result<PathBuf, String>),
+    DownloadMainUpdate {
+        manifest: UpdateReleaseManifest,
+        auto_restart_after: bool,
+    },
+    MainUpdateDownloaded {
+        result: Result<(StoredUpdateEntry, PathBuf), String>,
+        auto_restart_after: bool,
+    },
+    InstallStoredMainUpdate {
+        entry: StoredUpdateEntry,
+        restart_after: bool,
+    },
+    MainUpdateInstalled {
+        result: Result<PathBuf, String>,
+        restart_after: bool,
+    },
+    RestartSpotNow,
     ArtworkLoaded(Option<(String, DecodedArtwork)>),
 }
 
@@ -290,6 +325,10 @@ pub struct SpotApp {
     update_catalog: UpdateCatalogStore,
     update_busy: bool,
     update_status_note: Option<String>,
+    update_modal_open: bool,
+    update_modal_phase: UpdateModalPhase,
+    update_auto_prompted_sha: Option<String>,
+    last_installed_app_path: Option<PathBuf>,
     search_artists: Vec<ArtistSummary>,
     search_albums: Vec<AlbumSummary>,
     search_shows: Vec<PodcastShowSummary>,
@@ -355,6 +394,17 @@ impl SpotApp {
         let recent_searches = load_recent_searches();
         let recently_listened = load_recently_listened();
         let update_catalog = updater::load_update_catalog();
+        let initial_update_phase = match update_catalog.evaluate_availability() {
+            UpdateAvailability::UpdateAvailable {
+                stored_archive_filename: Some(_),
+                ..
+            } => UpdateModalPhase::DownloadedReady,
+            UpdateAvailability::UpdateAvailable {
+                stored_archive_filename: None,
+                ..
+            } => UpdateModalPhase::Available,
+            UpdateAvailability::UpToDate { .. } => UpdateModalPhase::UpToDateOverview,
+        };
         let artwork = ArtworkCache::new();
         let sidebar_app_icon = app_icon::sidebar_badge_handle();
         let dock_icon_installed = app_icon::install_macos_dock_icon();
@@ -387,6 +437,10 @@ impl SpotApp {
             update_catalog,
             update_busy: false,
             update_status_note: None,
+            update_modal_open: false,
+            update_modal_phase: initial_update_phase,
+            update_auto_prompted_sha: None,
+            last_installed_app_path: None,
             search_artists: Vec::new(),
             search_albums: Vec::new(),
             search_shows: Vec::new(),
@@ -1128,6 +1182,10 @@ impl SpotApp {
                 iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
                     Some(Message::ModifiersChanged(modifiers))
                 }
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::EscapePressed),
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Backspace),
                     modifiers,
@@ -2274,6 +2332,55 @@ impl SpotApp {
             Message::ToggleTrackMenu => {
                 self.show_track_details_banner = !self.show_track_details_banner;
             }
+            Message::EscapePressed => {
+                if self.update_modal_open && !self.update_busy {
+                    tracing::info!("[Updater] Closing update modal via Escape");
+                    self.update_modal_open = false;
+                }
+            }
+            Message::OpenUpdateModal => {
+                tracing::info!("[Updater] Opening update modal");
+                self.update_modal_open = true;
+                match self.update_catalog.evaluate_availability() {
+                    UpdateAvailability::UpdateAvailable {
+                        manifest,
+                        stored_archive_filename,
+                    } => {
+                        if self.update_catalog.find_stored(&manifest.commit_sha).is_some()
+                            || stored_archive_filename.is_some()
+                        {
+                            self.update_modal_phase = UpdateModalPhase::DownloadedReady;
+                        } else if !matches!(
+                            self.update_modal_phase,
+                            UpdateModalPhase::Downloading { .. }
+                                | UpdateModalPhase::Installing { .. }
+                                | UpdateModalPhase::InstalledReadyToRestart { .. }
+                        ) {
+                            self.update_modal_phase = UpdateModalPhase::Available;
+                        }
+                    }
+                    UpdateAvailability::UpToDate { .. } => {
+                        if !matches!(
+                            self.update_modal_phase,
+                            UpdateModalPhase::InstalledReadyToRestart { .. }
+                        ) {
+                            self.update_modal_phase = UpdateModalPhase::UpToDateOverview;
+                        }
+                        if !self.update_busy {
+                            return self.update(Message::CheckForMainUpdate);
+                        }
+                    }
+                }
+            }
+            Message::CloseUpdateModal => {
+                if !matches!(
+                    self.update_modal_phase,
+                    UpdateModalPhase::Installing { restart_after: true }
+                ) {
+                    tracing::info!("[Updater] Closing update modal");
+                    self.update_modal_open = false;
+                }
+            }
             Message::CheckForMainUpdate => {
                 if !self.update_busy {
                     self.update_busy = true;
@@ -2308,11 +2415,27 @@ impl SpotApp {
                                     avail.short_sha,
                                     accepted
                                 );
-                                self.update_status_note = Some(if stored_archive_filename.is_some() {
-                                    format!("Ready to install · {}", avail.short_sha)
+                                let is_stored = self
+                                    .update_catalog
+                                    .find_stored(&avail.commit_sha)
+                                    .is_some()
+                                    || stored_archive_filename.is_some();
+                                self.update_modal_phase = if is_stored {
+                                    UpdateModalPhase::DownloadedReady
                                 } else {
-                                    format!("Click to download · {}", avail.short_sha)
+                                    UpdateModalPhase::Available
+                                };
+                                self.update_status_note = Some(if is_stored {
+                                    format!("Ready to restart · {}", avail.short_sha)
+                                } else {
+                                    format!("View & download · {}", avail.short_sha)
                                 });
+                                if self.update_auto_prompted_sha.as_deref()
+                                    != Some(avail.commit_sha.as_str())
+                                {
+                                    self.update_auto_prompted_sha = Some(avail.commit_sha.clone());
+                                    self.update_modal_open = true;
+                                }
                             }
                             UpdateAvailability::UpToDate {
                                 installed_build,
@@ -2321,6 +2444,12 @@ impl SpotApp {
                                 tracing::info!(
                                     "[Updater] Up to date with main (build #{installed_build}, {installed_short_sha})"
                                 );
+                                if !matches!(
+                                    self.update_modal_phase,
+                                    UpdateModalPhase::InstalledReadyToRestart { .. }
+                                ) {
+                                    self.update_modal_phase = UpdateModalPhase::UpToDateOverview;
+                                }
                                 self.update_status_note = Some("Up to date with main".to_string());
                             }
                         }
@@ -2331,18 +2460,24 @@ impl SpotApp {
                     }
                 }
             }
-            Message::DownloadMainUpdate(manifest) => {
+            Message::DownloadMainUpdate {
+                manifest,
+                auto_restart_after,
+            } => {
                 if !self.update_busy {
                     self.update_busy = true;
+                    self.update_modal_open = true;
+                    self.update_modal_phase = UpdateModalPhase::Downloading { auto_restart_after };
                     self.update_status_note = Some(format!(
                         "Downloading #{} ({})…",
                         manifest.build_number, manifest.short_sha
                     ));
                     tracing::info!(
-                        "[Updater] Downloading main build #{} ({}) from {}",
+                        "[Updater] Downloading main build #{} ({}) from {} [auto_restart={}]",
                         manifest.build_number,
                         manifest.short_sha,
-                        manifest.download_url
+                        manifest.download_url,
+                        auto_restart_after
                     );
                     self.sync_tray();
                     return Task::perform(
@@ -2351,13 +2486,19 @@ impl SpotApp {
                                 .await
                                 .map_err(|e| e.to_string())
                         },
-                        Message::MainUpdateDownloaded,
+                        move |result| Message::MainUpdateDownloaded {
+                            result,
+                            auto_restart_after,
+                        },
                     );
                 }
             }
-            Message::MainUpdateDownloaded(res) => {
+            Message::MainUpdateDownloaded {
+                result,
+                auto_restart_after,
+            } => {
                 self.update_busy = false;
-                match res {
+                match result {
                     Ok((entry, path)) => {
                         tracing::info!(
                             "[Updater] Stored verified main update #{} ({}) at {}",
@@ -2367,28 +2508,48 @@ impl SpotApp {
                         );
                         self.update_catalog = updater::load_update_catalog();
                         debug_assert!(self.update_catalog.check_invariants().is_ok());
-                        self.update_status_note = Some(format!(
-                            "Stored #{} · Click to install",
-                            entry.manifest.build_number
-                        ));
+                        self.update_modal_open = true;
+                        if auto_restart_after {
+                            self.update_status_note = Some(format!(
+                                "Verified #{} · Installing & restarting…",
+                                entry.manifest.build_number
+                            ));
+                            return self.update(Message::InstallStoredMainUpdate {
+                                entry,
+                                restart_after: true,
+                            });
+                        } else {
+                            self.update_modal_phase = UpdateModalPhase::DownloadedReady;
+                            self.update_status_note = Some(format!(
+                                "Ready to restart · #{}",
+                                entry.manifest.build_number
+                            ));
+                        }
                     }
                     Err(err) => {
                         tracing::warn!("[Updater] Failed to download main update: {err}");
+                        self.update_modal_phase = UpdateModalPhase::Failed { error: err };
                         self.update_status_note = Some("Download failed — retry".to_string());
                     }
                 }
             }
-            Message::InstallStoredMainUpdate(entry) => {
+            Message::InstallStoredMainUpdate {
+                entry,
+                restart_after,
+            } => {
                 if !self.update_busy {
                     self.update_busy = true;
+                    self.update_modal_open = true;
+                    self.update_modal_phase = UpdateModalPhase::Installing { restart_after };
                     self.update_status_note = Some(format!(
                         "Installing #{} ({})…",
                         entry.manifest.build_number, entry.manifest.short_sha
                     ));
                     tracing::info!(
-                        "[Updater] Installing stored build #{} ({})",
+                        "[Updater] Installing stored build #{} ({}) [restart_after={}]",
                         entry.manifest.build_number,
-                        entry.manifest.short_sha
+                        entry.manifest.short_sha,
+                        restart_after
                     );
                     self.sync_tray();
                     return Task::perform(
@@ -2400,13 +2561,19 @@ impl SpotApp {
                             .await
                             .unwrap_or_else(|e| Err(e.to_string()))
                         },
-                        Message::MainUpdateInstalled,
+                        move |result| Message::MainUpdateInstalled {
+                            result,
+                            restart_after,
+                        },
                     );
                 }
             }
-            Message::MainUpdateInstalled(res) => {
+            Message::MainUpdateInstalled {
+                result,
+                restart_after,
+            } => {
                 self.update_busy = false;
-                match res {
+                match result {
                     Ok(installed_path) => {
                         tracing::info!(
                             "[Updater] Installed Spot update to {}",
@@ -2414,13 +2581,39 @@ impl SpotApp {
                         );
                         self.update_catalog = updater::load_update_catalog();
                         debug_assert!(self.update_catalog.check_invariants().is_ok());
+                        self.last_installed_app_path = Some(installed_path.clone());
+                        self.update_modal_phase = UpdateModalPhase::InstalledReadyToRestart {
+                            installed_path: installed_path.clone(),
+                        };
                         self.update_status_note =
-                            Some("Installed to /Applications · Relaunch".to_string());
+                            Some("Installed · Ready to restart".to_string());
+                        if restart_after {
+                            return self.update(Message::RestartSpotNow);
+                        }
                     }
                     Err(err) => {
                         tracing::warn!("[Updater] Install failed: {err}");
-                        self.update_status_note = Some("Install failed — see logs".to_string());
+                        self.update_modal_phase = UpdateModalPhase::Failed { error: err };
+                        self.update_status_note = Some("Install failed — see details".to_string());
                     }
+                }
+            }
+            Message::RestartSpotNow => {
+                tracing::info!("[Updater] Restarting Spot to apply newly installed update");
+                if self.state.is_playing {
+                    self.state.is_playing = false;
+                    self.engine.audio_gate.set_playing(false);
+                    let _ = self.engine.command_tx.send(PlayerCommand::TogglePlayPause);
+                }
+                // Release the macOS status bar tray icon cleanly before spawning the new process
+                self.tray = None;
+                if let Err(err) =
+                    updater::relaunch_spot_after_update(self.last_installed_app_path.as_deref())
+                {
+                    tracing::warn!("[Updater] Failed to relaunch Spot: {err}");
+                    self.update_modal_phase = UpdateModalPhase::Failed {
+                        error: err.to_string(),
+                    };
                 }
             }
             Message::ScrollActivity => {
@@ -2848,10 +3041,19 @@ impl SpotApp {
         };
         let queue_pane = self.view_queue_pane();
 
-        row![sidebar, center_stage, queue_pane]
+        let base_layout: Element<'_, Message> = row![sidebar, center_stage, queue_pane]
             .width(Length::Fill)
             .height(Length::Fill)
-            .into()
+            .into();
+
+        if self.update_modal_open {
+            stack![base_layout, self.view_update_modal()]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            base_layout
+        }
     }
 
     /// Column 1: Frosted warm-stone left sidebar.
@@ -3040,17 +3242,14 @@ impl SpotApp {
 
     fn view_update_card(&self) -> Element<'_, Message> {
         let availability = self.update_catalog.evaluate_availability();
-        let (headline, subline, has_update, action_msg) = match availability {
+        let (headline, subline, has_update) = match availability {
             UpdateAvailability::UpdateAvailable {
                 manifest,
                 stored_archive_filename,
             } => {
-                if let Some(stored) = self
-                    .update_catalog
-                    .find_stored(&manifest.commit_sha)
-                    .cloned()
+                if self.update_catalog.find_stored(&manifest.commit_sha).is_some()
+                    || stored_archive_filename.is_some()
                 {
-                    let _ = stored_archive_filename;
                     (
                         format!(
                             "Update ready · #{} ({})",
@@ -3058,9 +3257,8 @@ impl SpotApp {
                         ),
                         self.update_status_note
                             .clone()
-                            .unwrap_or_else(|| "Stored · Click to install".to_string()),
+                            .unwrap_or_else(|| "Verified · Click to install & restart".to_string()),
                         true,
-                        Message::InstallStoredMainUpdate(stored),
                     )
                 } else {
                     (
@@ -3070,9 +3268,8 @@ impl SpotApp {
                         ),
                         self.update_status_note
                             .clone()
-                            .unwrap_or_else(|| "Download latest main build".to_string()),
+                            .unwrap_or_else(|| "Click to view release & download".to_string()),
                         true,
-                        Message::DownloadMainUpdate(manifest),
                     )
                 }
             }
@@ -3082,15 +3279,14 @@ impl SpotApp {
             } => {
                 let stored_count = self.update_catalog.stored_updates().len();
                 let default_sub = if stored_count > 0 {
-                    format!("{stored_count} stored · Check updates")
+                    format!("{stored_count} stored · View update status")
                 } else {
-                    "Check for main updates".to_string()
+                    "Up to date · Check updates".to_string()
                 };
                 (
                     format!("Spot #{installed_build} · {installed_short_sha}"),
                     self.update_status_note.clone().unwrap_or(default_sub),
                     false,
-                    Message::CheckForMainUpdate,
                 )
             }
         };
@@ -3125,8 +3321,8 @@ impl SpotApp {
                 ]
                 .spacing(2)
                 .width(Length::Fill),
-                text(if has_update { "↓" } else { "↻" })
-                    .size(13)
+                text(if has_update { "↑" } else { "›" })
+                    .size(14)
                     .color(if has_update {
                         palette::EMERALD
                     } else {
@@ -3136,11 +3332,601 @@ impl SpotApp {
             .spacing(8)
             .align_y(Alignment::Center),
         )
-        .on_press(action_msg)
+        .on_press(Message::OpenUpdateModal)
         .width(Length::Fill)
         .padding(Padding::from([6, 8]))
         .style(theme::subtle_row_button(has_update))
         .into()
+    }
+
+    /// Elevated modal popup describing the `main` update, allowing SHA-256 verified download,
+    /// and installing + restarting Spot in place so changes take effect immediately.
+    fn view_update_modal(&self) -> Element<'_, Message> {
+        let installed_build = self.update_catalog.installed_build_number();
+        let installed_sha = self.update_catalog.installed_commit_sha();
+        let installed_short: String = installed_sha.chars().take(7).collect();
+
+        let availability = self.update_catalog.evaluate_availability();
+        let target_manifest: Option<UpdateReleaseManifest> = match &availability {
+            UpdateAvailability::UpdateAvailable { manifest, .. } => Some(manifest.clone()),
+            UpdateAvailability::UpToDate { .. } => self.update_catalog.latest_remote().cloned(),
+        };
+
+        let stored_entry: Option<StoredUpdateEntry> = target_manifest
+            .as_ref()
+            .and_then(|m| self.update_catalog.find_stored(&m.commit_sha).cloned());
+
+        let is_installed_ready = matches!(
+            self.update_modal_phase,
+            UpdateModalPhase::InstalledReadyToRestart { .. }
+        );
+
+        let (eyebrow_label, modal_title, modal_subtitle) = match (&availability, &self.update_modal_phase) {
+            (_, UpdateModalPhase::InstalledReadyToRestart { .. }) => (
+                "UPDATE INSTALLED  ·  RESTART REQUIRED",
+                "Ready to Relaunch Spot".to_string(),
+                "Your updated Spot bundle has been installed. Restart Spot now so the new build takes effect.".to_string(),
+            ),
+            (UpdateAvailability::UpdateAvailable { manifest, .. }, UpdateModalPhase::Downloading { auto_restart_after }) => (
+                "DOWNLOADING UPDATE",
+                format!("Downloading Spot Build #{}", manifest.build_number),
+                if *auto_restart_after {
+                    format!(
+                        "Fetching {} ({}) and verifying SHA-256 digest before automatic restart…",
+                        manifest.canonical_archive_filename(),
+                        manifest.formatted_size()
+                    )
+                } else {
+                    format!(
+                        "Fetching {} ({}) and verifying SHA-256 digest…",
+                        manifest.canonical_archive_filename(),
+                        manifest.formatted_size()
+                    )
+                },
+            ),
+            (UpdateAvailability::UpdateAvailable { manifest, .. }, UpdateModalPhase::Installing { restart_after }) => (
+                "INSTALLING UPDATE",
+                format!("Installing Spot Build #{}", manifest.build_number),
+                if *restart_after {
+                    "Replacing Spot.app and restarting your player…".to_string()
+                } else {
+                    "Extracting verified bundle into /Applications/Spot.app…".to_string()
+                },
+            ),
+            (UpdateAvailability::UpdateAvailable { manifest, .. }, _) if stored_entry.is_some() => (
+                "UPDATE READY TO INSTALL",
+                format!("Spot Build #{} is Ready", manifest.build_number),
+                "This main release has been downloaded and cryptographically verified. Install and restart Spot to apply it.".to_string(),
+            ),
+            (UpdateAvailability::UpdateAvailable { manifest, .. }, _) => (
+                "NEW MAIN RELEASE AVAILABLE",
+                format!("Spot Build #{} is Available", manifest.build_number),
+                "A newer build from main is ready. Download the update below and restart Spot to switch to the new build.".to_string(),
+            ),
+            (UpdateAvailability::UpToDate { .. }, _) => (
+                "SOFTWARE UPDATE",
+                format!("Spot Build #{installed_build} is Up to Date"),
+                "You are running the latest main build of Spot.".to_string(),
+            ),
+        };
+
+        let header_row = row![
+            image(self.sidebar_app_icon.clone())
+                .width(Length::Fixed(42.0))
+                .height(Length::Fixed(42.0)),
+            column![
+                text(eyebrow_label).size(10.5).color(palette::EMERALD),
+                text(modal_title)
+                    .font(SERIF_FONT)
+                    .size(28)
+                    .color(palette::INK_PRIMARY),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            button(text("✕").size(14).color(palette::INK_SECONDARY))
+                .on_press(Message::CloseUpdateModal)
+                .padding(Padding::from([6, 10]))
+                .style(theme::icon_ghost_button),
+        ]
+        .spacing(14)
+        .align_y(Alignment::Center);
+
+        // Version comparison strip
+        let version_strip: Element<'_, Message> = if let Some(manifest) = &target_manifest {
+            let is_newer = manifest.build_number > installed_build
+                || !manifest.commit_sha.eq_ignore_ascii_case(installed_sha);
+            container(
+                row![
+                    column![
+                        text("INSTALLED BUILD").size(9.5).color(palette::INK_MUTED),
+                        text(format!("Build #{installed_build} · {installed_short}"))
+                            .size(12.5)
+                            .color(palette::INK_SECONDARY),
+                    ]
+                    .spacing(2),
+                    horizontal_space(),
+                    text(if is_newer { "→" } else { "•" })
+                        .size(16)
+                        .color(palette::EMERALD),
+                    horizontal_space(),
+                    column![
+                        text(if is_newer {
+                            "LATEST ON MAIN"
+                        } else {
+                            "LATEST RELEASE"
+                        })
+                        .size(9.5)
+                        .color(palette::EMERALD),
+                        text(format!(
+                            "Build #{} · {} · {} · {}",
+                            manifest.build_number,
+                            manifest.short_sha,
+                            manifest.formatted_size(),
+                            manifest.formatted_published_at()
+                        ))
+                        .size(12.5)
+                        .color(palette::INK_PRIMARY),
+                    ]
+                    .spacing(2)
+                    .align_x(Horizontal::Right),
+                ]
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(Padding::from([10, 14]))
+            .style(theme::update_modal_version_strip)
+            .into()
+        } else {
+            container(
+                row![
+                    text(format!(
+                        "Installed: Spot v{} · Build #{installed_build} ({installed_short})",
+                        updater::BUILD_VERSION
+                    ))
+                    .size(12.5)
+                    .color(palette::INK_PRIMARY),
+                    horizontal_space(),
+                    text(if self.update_busy {
+                        "Checking GitHub Releases…"
+                    } else {
+                        "main channel"
+                    })
+                    .size(11.5)
+                    .color(palette::INK_SECONDARY),
+                ]
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(Padding::from([10, 14]))
+            .style(theme::update_modal_version_strip)
+            .into()
+        };
+
+        // Release description & "What's in this update" box
+        let description_card: Element<'_, Message> = if let Some(manifest) = &target_manifest {
+            let bullets = manifest.description_bullets();
+            let mut notes_col = column![
+                text("WHAT'S IN THIS UPDATE")
+                    .size(10.0)
+                    .color(palette::INK_MUTED),
+                text(manifest.commit_title.clone())
+                    .font(SERIF_FONT)
+                    .size(21)
+                    .color(palette::INK_PRIMARY),
+            ]
+            .spacing(6);
+
+            let mut bullets_col = column![].spacing(5);
+            for item in &bullets {
+                bullets_col = bullets_col.push(
+                    row![
+                        text("•").size(13).color(palette::EMERALD),
+                        text(item.clone())
+                            .size(13.0)
+                            .line_height(1.32)
+                            .color(palette::INK_PRIMARY)
+                            .width(Length::Fill),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Start),
+                );
+            }
+
+            let notes_scroll = self
+                .elegant_scrollable(bullets_col)
+                .height(Length::Fixed(if bullets.len() > 3 { 126.0 } else { 76.0 }));
+
+            let sha_preview = if manifest.sha256.len() >= 20 {
+                format!(
+                    "{}…{}",
+                    &manifest.sha256[..12],
+                    &manifest.sha256[manifest.sha256.len() - 8..]
+                )
+            } else {
+                manifest.sha256.clone()
+            };
+
+            let meta_footer = row![
+                text(format!("Tag: {}", manifest.tag))
+                    .size(11.0)
+                    .color(palette::INK_MUTED),
+                text("·").size(11.0).color(palette::INK_MUTED),
+                text(format!("SHA-256: {sha_preview}"))
+                    .size(11.0)
+                    .color(palette::INK_MUTED),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+
+            notes_col = notes_col
+                .push(notes_scroll)
+                .push(horizontal_rule(1))
+                .push(meta_footer);
+
+            container(notes_col)
+                .width(Length::Fill)
+                .padding(Padding::from([14, 16]))
+                .style(theme::update_modal_notes_box)
+                .into()
+        } else {
+            let mut stored_col = column![
+                text("RELEASE CHANNEL")
+                    .size(10.0)
+                    .color(palette::INK_MUTED),
+                text("Continuous Main Releases")
+                    .font(SERIF_FONT)
+                    .size(20)
+                    .color(palette::INK_PRIMARY),
+                text("Every push to main packages a signed macOS bundle with a SHA-256 manifest. Stored updates are cached locally in ~/Library/Application Support/Spot/updates/archives.")
+                    .size(12.5)
+                    .line_height(1.35)
+                    .color(palette::INK_SECONDARY),
+            ]
+            .spacing(6);
+
+            if !self.update_catalog.stored_updates().is_empty() {
+                stored_col = stored_col.push(horizontal_rule(1)).push(
+                    text(format!(
+                        "{} Verified Build(s) Stored Locally",
+                        self.update_catalog.stored_updates().len()
+                    ))
+                    .size(11.5)
+                    .color(palette::EMERALD),
+                );
+                for entry in self.update_catalog.stored_updates().iter().take(3) {
+                    let entry_clone = entry.clone();
+                    stored_col = stored_col.push(
+                        row![
+                            column![
+                                text(format!(
+                                    "Build #{} ({}) — {}",
+                                    entry.manifest.build_number,
+                                    entry.manifest.short_sha,
+                                    entry.manifest.commit_title
+                                ))
+                                .size(12.0)
+                                .color(palette::INK_PRIMARY),
+                                text(format!(
+                                    "{} · {}",
+                                    entry.archive_filename,
+                                    entry.manifest.formatted_size()
+                                ))
+                                .size(10.5)
+                                .color(palette::INK_MUTED),
+                            ]
+                            .spacing(1)
+                            .width(Length::Fill),
+                            button(
+                                text("Install & Restart")
+                                    .size(11.5)
+                                    .color(palette::EMERALD)
+                            )
+                            .on_press(Message::InstallStoredMainUpdate {
+                                entry: entry_clone,
+                                restart_after: true,
+                            })
+                            .padding(Padding::from([5, 10]))
+                            .style(theme::nav_pill_button(false)),
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                    );
+                }
+            }
+
+            container(stored_col)
+                .width(Length::Fill)
+                .padding(Padding::from([14, 16]))
+                .style(theme::update_modal_notes_box)
+                .into()
+        };
+
+        // Status / Verification / Error banner
+        let status_banner: Element<'_, Message> = match &self.update_modal_phase {
+            UpdateModalPhase::Failed { error } => container(
+                row![
+                    text("⚠").size(14).color(iced::Color::from_rgb8(0xB4, 0x3C, 0x28)),
+                    text(format!("Update error: {error}"))
+                        .size(12.0)
+                        .color(iced::Color::from_rgb8(0xB4, 0x3C, 0x28))
+                        .width(Length::Fill),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(Padding::from([9, 12]))
+            .style(theme::recent_search_song_chip_card)
+            .into(),
+            UpdateModalPhase::InstalledReadyToRestart { installed_path } => container(
+                row![
+                    text("✓").size(14).color(palette::EMERALD),
+                    text(format!(
+                        "Installed to {} — restart Spot to run the updated build.",
+                        installed_path.display()
+                    ))
+                    .size(12.0)
+                    .color(palette::INK_PRIMARY)
+                    .width(Length::Fill),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(Padding::from([9, 12]))
+            .style(theme::update_modal_verified_banner)
+            .into(),
+            UpdateModalPhase::Downloading { .. } | UpdateModalPhase::Installing { .. } => {
+                let status_line = self
+                    .update_status_note
+                    .clone()
+                    .unwrap_or_else(|| "Working…".to_string());
+                container(
+                    row![
+                        text("↻").size(14).color(palette::EMERALD),
+                        text(status_line)
+                            .size(12.0)
+                            .color(palette::INK_PRIMARY)
+                            .width(Length::Fill),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .padding(Padding::from([9, 12]))
+                .style(theme::update_modal_verified_banner)
+                .into()
+            }
+            _ if stored_entry.is_some() => container(
+                row![
+                    text("✓").size(14).color(palette::EMERALD),
+                    text("Downloaded & SHA-256 verified on disk — ready to install and restart Spot.")
+                        .size(12.0)
+                        .color(palette::INK_PRIMARY)
+                        .width(Length::Fill),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(Padding::from([9, 12]))
+            .style(theme::update_modal_verified_banner)
+            .into(),
+            _ => text(
+                "Note: Spot must restart after installing an update so the new native binary takes effect.",
+            )
+            .size(11.5)
+            .color(palette::INK_MUTED)
+            .into(),
+        };
+
+        // Footer buttons based on current phase
+        let actions_row: Element<'_, Message> = if is_installed_ready {
+            row![
+                button(
+                    text("Later")
+                        .size(13.0)
+                        .color(palette::INK_SECONDARY),
+                )
+                .on_press(Message::CloseUpdateModal)
+                .padding(Padding::from([10, 16]))
+                .style(theme::update_modal_secondary_btn),
+                horizontal_space(),
+                button(
+                    row![
+                        text("↻").size(14).color(iced::Color::WHITE),
+                        text("Restart Spot Now")
+                            .size(13.5)
+                            .color(iced::Color::WHITE),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::RestartSpotNow)
+                .padding(Padding::from([10, 20]))
+                .style(theme::update_modal_primary_btn),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into()
+        } else if let UpdateAvailability::UpdateAvailable { manifest, .. } = &availability {
+            if self.update_busy {
+                row![
+                    button(text("Hide").size(13.0).color(palette::INK_SECONDARY))
+                        .on_press(Message::CloseUpdateModal)
+                        .padding(Padding::from([10, 16]))
+                        .style(theme::update_modal_secondary_btn),
+                    horizontal_space(),
+                    button(
+                        text(match self.update_modal_phase {
+                            UpdateModalPhase::Installing { .. } => "Installing & Restarting…",
+                            _ => "Downloading Update…",
+                        })
+                        .size(13.5)
+                        .color(iced::Color::WHITE),
+                    )
+                    .padding(Padding::from([10, 20]))
+                    .style(theme::update_modal_primary_btn),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into()
+            } else if let Some(entry) = stored_entry {
+                row![
+                    button(text("Later").size(13.0).color(palette::INK_SECONDARY))
+                        .on_press(Message::CloseUpdateModal)
+                        .padding(Padding::from([10, 14]))
+                        .style(theme::icon_ghost_button),
+                    horizontal_space(),
+                    button(
+                        text("Install Only")
+                            .size(12.5)
+                            .color(palette::INK_PRIMARY),
+                    )
+                    .on_press(Message::InstallStoredMainUpdate {
+                        entry: entry.clone(),
+                        restart_after: false,
+                    })
+                    .padding(Padding::from([10, 14]))
+                    .style(theme::update_modal_secondary_btn),
+                    button(
+                        row![
+                            text("↻").size(14).color(iced::Color::WHITE),
+                            text("Install & Restart Spot")
+                                .size(13.5)
+                                .color(iced::Color::WHITE),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    )
+                    .on_press(Message::InstallStoredMainUpdate {
+                        entry,
+                        restart_after: true,
+                    })
+                    .padding(Padding::from([10, 20]))
+                    .style(theme::update_modal_primary_btn),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into()
+            } else {
+                let dl_label = format!("↓ Download Update ({})", manifest.formatted_size());
+                row![
+                    button(text("Later").size(13.0).color(palette::INK_SECONDARY))
+                        .on_press(Message::CloseUpdateModal)
+                        .padding(Padding::from([10, 14]))
+                        .style(theme::icon_ghost_button),
+                    horizontal_space(),
+                    button(
+                        text("⚡ Download & Restart")
+                            .size(12.5)
+                            .color(palette::INK_PRIMARY),
+                    )
+                    .on_press(Message::DownloadMainUpdate {
+                        manifest: manifest.clone(),
+                        auto_restart_after: true,
+                    })
+                    .padding(Padding::from([10, 14]))
+                    .style(theme::update_modal_secondary_btn),
+                    button(
+                        text(dl_label)
+                            .size(13.5)
+                            .color(iced::Color::WHITE),
+                    )
+                    .on_press(Message::DownloadMainUpdate {
+                        manifest: manifest.clone(),
+                        auto_restart_after: false,
+                    })
+                    .padding(Padding::from([10, 18]))
+                    .style(theme::update_modal_primary_btn),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into()
+            }
+        } else {
+            let mut footer = row![
+                button(text("Close").size(13.0).color(palette::INK_SECONDARY))
+                    .on_press(Message::CloseUpdateModal)
+                    .padding(Padding::from([10, 16]))
+                    .style(theme::update_modal_secondary_btn),
+                horizontal_space(),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center);
+
+            if let Some(entry) = stored_entry
+                .or_else(|| self.update_catalog.stored_updates().first().cloned())
+            {
+                footer = footer.push(
+                    button(
+                        text(format!(
+                            "↻ Reinstall #{} & Restart",
+                            entry.manifest.build_number
+                        ))
+                        .size(12.5)
+                        .color(palette::INK_PRIMARY),
+                    )
+                    .on_press(Message::InstallStoredMainUpdate {
+                        entry,
+                        restart_after: true,
+                    })
+                    .padding(Padding::from([10, 14]))
+                    .style(theme::update_modal_secondary_btn),
+                );
+            }
+
+            footer = footer.push(
+                button(
+                    row![
+                        text("↻").size(13).color(iced::Color::WHITE),
+                        text(if self.update_busy {
+                            "Checking Releases…"
+                        } else {
+                            "Check for Updates"
+                        })
+                        .size(13.0)
+                        .color(iced::Color::WHITE),
+                    ]
+                    .spacing(7)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::CheckForMainUpdate)
+                .padding(Padding::from([10, 18]))
+                .style(theme::update_modal_primary_btn),
+            );
+
+            footer.into()
+        };
+
+        let modal_card = container(
+            column![
+                header_row,
+                text(modal_subtitle)
+                    .size(13.0)
+                    .line_height(1.35)
+                    .color(palette::INK_SECONDARY),
+                version_strip,
+                description_card,
+                status_banner,
+                vertical_space().height(Length::Fixed(2.0)),
+                actions_row,
+            ]
+            .spacing(14),
+        )
+        .width(Length::Fixed(548.0))
+        .padding(Padding::from([22, 24]))
+        .style(theme::update_modal_card);
+
+        opaque(
+            mouse_area(
+                center(opaque(modal_card))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(theme::update_modal_backdrop),
+            )
+            .on_press(Message::CloseUpdateModal),
+        )
     }
 
     fn view_nav_item<'a>(
@@ -6385,6 +7171,8 @@ mod tests {
             short_sha: "abcdef1".into(),
             tag: format!("main-b{next_build}-abcdef1"),
             commit_title: "Add main update storage".into(),
+            release_notes: "- Elegant update popup modal\n- SHA-256 verified download and restart"
+                .into(),
             published_at: "2026-10-19T23:30:00Z".into(),
             asset_name: "Spot-macos.zip".into(),
             download_url: "https://github.com/cartermp/spot/releases/download/test/Spot-macos.zip"
@@ -6398,6 +7186,16 @@ mod tests {
             app.update_catalog.evaluate_availability(),
             UpdateAvailability::UpdateAvailable { .. }
         ));
+        assert!(app.update_modal_open);
+        assert_eq!(app.update_modal_phase, UpdateModalPhase::Available);
+        assert_eq!(manifest.description_bullets().len(), 2);
+        app.assert_invariants();
+
+        // Closing and re-opening the modal preserves invariants
+        let _ = app.update(Message::CloseUpdateModal);
+        assert!(!app.update_modal_open);
+        let _ = app.update(Message::OpenUpdateModal);
+        assert!(app.update_modal_open);
         app.assert_invariants();
 
         // Corrupted SHA-256 must be rejected by UpdateCatalogStore (INV-U2)

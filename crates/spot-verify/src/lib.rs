@@ -3073,6 +3073,7 @@ impl UpdaterModel {
             short_sha: short_sha.clone(),
             tag: format!("main-b{build}-{short_sha}"),
             commit_title: format!("Main push #{build}"),
+            release_notes: format!("- Feature highlight for build #{build}"),
             published_at: format!("2026-10-19T12:0{idx}:00Z"),
             asset_name: "Spot-macos.zip".to_string(),
             download_url: format!(
@@ -3253,6 +3254,7 @@ pub fn prove_update_catalog_and_release_pipeline() -> ProofCertificate {
             short_sha: short_sha.clone(),
             tag: format!("main-b{idx}-{short_sha}"),
             commit_title: format!("Commit {idx}"),
+            release_notes: String::new(),
             published_at: "2026-10-19T00:00:00Z".into(),
             asset_name: "Spot-macos.zip".into(),
             download_url: format!("https://github.com/cartermp/spot/releases/download/main-b{idx}-{short_sha}/Spot-macos.zip"),

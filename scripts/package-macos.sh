@@ -34,6 +34,10 @@ fi
 
 RELEASE_TAG="${SPOT_RELEASE_TAG:-main-b${BUILD_NUMBER}-${SHORT_SHA}}"
 COMMIT_TITLE="$(git log -1 --format=%s HEAD 2>/dev/null || echo "Spot main build #${BUILD_NUMBER}")"
+RELEASE_NOTES="$(git log -1 --format=%b HEAD 2>/dev/null | grep -v -E '^(Co-authored-by|Copilot-Session|Signed-off-by):' || true)"
+if [[ -z "${RELEASE_NOTES// /}" ]]; then
+  RELEASE_NOTES="$(git log -n 3 --format='- %s (%h)' HEAD 2>/dev/null || echo "- ${COMMIT_TITLE}")"
+fi
 PUBLISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 DIST_DIR="$ROOT_DIR/dist"
@@ -146,9 +150,9 @@ if [[ "$CREATE_ZIP" -eq 1 ]]; then
 
   printf "%s  %s\n" "$SHA256" "$ASSET_NAME" > "$SUMS_PATH"
 
-  python3 - "$MANIFEST_PATH" "$VERSION" "$BUILD_NUMBER" "$COMMIT_SHA" "$SHORT_SHA" "$RELEASE_TAG" "$COMMIT_TITLE" "$PUBLISHED_AT" "$ASSET_NAME" "$DOWNLOAD_URL" "$SHA256" "$SIZE_BYTES" <<'PY'
+  python3 - "$MANIFEST_PATH" "$VERSION" "$BUILD_NUMBER" "$COMMIT_SHA" "$SHORT_SHA" "$RELEASE_TAG" "$COMMIT_TITLE" "$RELEASE_NOTES" "$PUBLISHED_AT" "$ASSET_NAME" "$DOWNLOAD_URL" "$SHA256" "$SIZE_BYTES" <<'PY'
 import json, sys
-out_path, version, build_num, sha, short_sha, tag, title, pub_at, asset, url, sha256, size_b = sys.argv[1:]
+out_path, version, build_num, sha, short_sha, tag, title, notes, pub_at, asset, url, sha256, size_b = sys.argv[1:]
 manifest = {
     "version": version,
     "build_number": int(build_num),
@@ -156,6 +160,7 @@ manifest = {
     "short_sha": short_sha,
     "tag": tag,
     "commit_title": title,
+    "release_notes": notes.strip(),
     "published_at": pub_at,
     "asset_name": asset,
     "download_url": url,

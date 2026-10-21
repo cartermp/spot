@@ -160,6 +160,8 @@ struct GithubReleaseResponse {
     #[serde(default)]
     draft: bool,
     #[serde(default)]
+    body: String,
+    #[serde(default)]
     assets: Vec<GithubReleaseAsset>,
 }
 
@@ -232,7 +234,10 @@ pub async fn fetch_latest_main_release() -> Result<UpdateReleaseManifest> {
                 .get(&manifest_asset.browser_download_url)
                 .send().await?
                 .error_for_status()?;
-            let manifest: UpdateReleaseManifest = m_resp.json().await?;
+            let mut manifest: UpdateReleaseManifest = m_resp.json().await?;
+            if manifest.release_notes.trim().is_empty() && !release.body.trim().is_empty() {
+                manifest.release_notes = release.body.clone();
+            }
             if let Some(clean) = manifest.sanitize() {
                 return Ok(clean);
             }
@@ -372,17 +377,33 @@ pub fn install_stored_update_entry(entry: &StoredUpdateEntry) -> Result<PathBuf>
         bail!("extracted archive did not contain a valid Spot.app bundle");
     }
 
-    let install_root = std::env
+    let preferred_root = std::env
         ::var("SPOT_INSTALL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/Applications"));
-    std::fs::create_dir_all(&install_root)?;
-    let target_app = install_root.join("Spot.app");
 
-    if target_app.exists() {
-        std::fs
-            ::remove_dir_all(&target_app)
-            .with_context(|| format!("failed to replace {}", target_app.display()))?;
+    let install_root = if std::fs::create_dir_all(&preferred_root).is_ok() {
+        preferred_root
+    } else {
+        let user_apps = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Applications");
+        std::fs::create_dir_all(&user_apps)?;
+        user_apps
+    };
+    let mut target_app = install_root.join("Spot.app");
+
+    if target_app.exists() && std::fs::remove_dir_all(&target_app).is_err() {
+        let user_apps = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Applications");
+        std::fs::create_dir_all(&user_apps)?;
+        target_app = user_apps.join("Spot.app");
+        if target_app.exists() {
+            std::fs
+                ::remove_dir_all(&target_app)
+                .with_context(|| format!("failed to replace {}", target_app.display()))?;
+        }
     }
 
     let copy_status = std::process::Command
@@ -399,6 +420,8 @@ pub fn install_stored_update_entry(entry: &StoredUpdateEntry) -> Result<PathBuf>
         bail!("failed to install Spot.app to {}", target_app.display());
     }
 
+    let installed_bin = target_app.join("Contents/MacOS/spot");
+
     // Update ~/.local/bin/spot (or SPOT_BIN_DIR) symlink
     let bin_dir = std::env
         ::var("SPOT_BIN_DIR")
@@ -414,9 +437,35 @@ pub fn install_stored_update_entry(entry: &StoredUpdateEntry) -> Result<PathBuf>
         #[cfg(unix)]
         {
             let _ = std::os::unix::fs::symlink(
-                target_app.join("Contents/MacOS/spot"),
+                &installed_bin,
                 &link_path
             );
+        }
+    }
+
+    // If the currently running binary is a standalone executable (e.g. ./target/debug/spot or ./target/release/spot)
+    // and is writable, atomically replace it via a staged rename so subsequent direct invocations also run the new build.
+    if !cfg!(test) && std::env::var("SPOT_TEST_CACHE_DIR").is_err() {
+        if let Ok(cur_exe) = std::env::current_exe() {
+            if cur_exe != installed_bin
+                && cur_exe
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n == "spot")
+            {
+                let tmp_exe = cur_exe.with_extension("spot-update-new");
+                if std::fs::copy(&installed_bin, &tmp_exe).is_ok() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &tmp_exe,
+                            std::fs::Permissions::from_mode(0o755),
+                        );
+                    }
+                    let _ = std::fs::rename(&tmp_exe, &cur_exe);
+                }
+            }
         }
     }
 
@@ -426,6 +475,52 @@ pub fn install_stored_update_entry(entry: &StoredUpdateEntry) -> Result<PathBuf>
     save_update_catalog(&store)?;
 
     Ok(target_app)
+}
+
+/// Spawns a fresh instance of the newly installed `Spot` binary after a brief 180ms handoff
+/// and terminates the current process so the updated build takes effect immediately.
+pub fn relaunch_spot_after_update(installed_app: Option<&Path>) -> Result<()> {
+    let candidate_bin = installed_app
+        .map(|app| {
+            if app.ends_with("Spot.app") {
+                app.join("Contents/MacOS/spot")
+            } else {
+                app.to_path_buf()
+            }
+        })
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            let default_app_bin = PathBuf::from("/Applications/Spot.app/Contents/MacOS/spot");
+            if default_app_bin.is_file() {
+                Some(default_app_bin)
+            } else {
+                std::env::current_exe().ok()
+            }
+        })
+        .ok_or_else(|| anyhow!("could not locate updated Spot binary to relaunch"))?;
+
+    tracing::info!(
+        "[Updater] Relaunching Spot into updated binary at {}",
+        candidate_bin.display()
+    );
+
+    if cfg!(test) || std::env::var("SPOT_TEST_CACHE_DIR").is_ok() {
+        return Ok(());
+    }
+
+    let bin_str = candidate_bin
+        .to_str()
+        .ok_or_else(|| anyhow!("invalid UTF-8 in binary path"))?;
+
+    std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 0.18; exec \"$1\"", "--", bin_str])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to spawn updated Spot binary at {bin_str}"))?;
+
+    std::process::exit(0);
 }
 
 /// Handles CLI update flags (`--version`, `--check-update`, `--download-update`, `--update`,
