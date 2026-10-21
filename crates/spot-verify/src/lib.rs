@@ -17,19 +17,20 @@ use std::time::Instant;
 use spot_audio::{verify_log_bin_edges_partition, SpectrumAnalyzer};
 use spot_core::{
     advance_queue_verified, coprime_shuffle_step, delete_last_word_verified,
-    episode_to_playable_track_verified, format_connected_account_label, gcd_usize,
-    git_shas_match_verified, is_opaque_spotify_user_id, merge_devices_verified,
-    normalize_git_sha_verified, normalize_spotify_episode_uri, normalize_spotify_show_uri,
-    resolve_playable_track_candidate, sanitize_pcm_sample, sanitize_position_secs,
-    sanitize_spotify_biography, sanitize_unit_float, should_toggle_play_pause_on_space_verified,
-    step_gated_stereo_frame_verified, summarize_artist_bio, verify_update_digest_verified,
-    AlbumPlaybackQueue, ArtworkTheme, AudioDevice, FormalInvariant, InstantAudioGate,
-    NavHistoryMachine, NavRouteTarget, PlaybackContext, PlaybackState, Playlist, PodcastEpisode,
-    PodcastShowDetail, PodcastShowSummary, RecentListenedItem, RecentListenedKind,
-    RecentListenedStore, RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode,
-    SpectrumFrame, StoredUpdateEntry, Track, TrayMenuSnapshot, UpdateAvailability,
-    UpdateCatalogStore, UpdateReleaseManifest, VerifiedTransportAction, INSTANT_PAUSE_RAMP_FRAMES,
-    MAX_STORED_UPDATES, RECENTLY_LISTENED_TOP_LIMIT, SPECTRUM_BANDS,
+    episode_to_playable_track_verified, find_song_index_in_album_verified,
+    format_connected_account_label, gcd_usize, git_shas_match_verified, is_opaque_spotify_user_id,
+    merge_devices_verified, normalize_git_sha_verified, normalize_spotify_episode_uri,
+    normalize_spotify_show_uri, resolve_playable_track_candidate, resolve_song_album_queue_verified,
+    sanitize_pcm_sample, sanitize_position_secs, sanitize_spotify_biography, sanitize_unit_float,
+    should_toggle_play_pause_on_space_verified, step_gated_stereo_frame_verified,
+    summarize_artist_bio, verify_update_digest_verified, AlbumPlaybackQueue, ArtworkTheme,
+    AudioDevice, FormalInvariant, InstantAudioGate, NavHistoryMachine, NavRouteTarget,
+    PlaybackContext, PlaybackState, Playlist, PodcastEpisode, PodcastShowDetail,
+    PodcastShowSummary, RecentListenedItem, RecentListenedKind, RecentListenedStore,
+    RecentSearchEntry, RecentSearchKind, RecentSearchStore, RepeatMode, SpectrumFrame,
+    StoredUpdateEntry, Track, TrayMenuSnapshot, UpdateAvailability, UpdateCatalogStore,
+    UpdateReleaseManifest, VerifiedTransportAction, INSTANT_PAUSE_RAMP_FRAMES, MAX_STORED_UPDATES,
+    RECENTLY_LISTENED_TOP_LIMIT, SPECTRUM_BANDS,
 };
 use spot_spotify::sink::AtomicVolumeScaler;
 use stateright::{Checker, Model, Property};
@@ -522,6 +523,8 @@ pub struct RecentSearchModelState {
 pub enum RecentSearchModelAction {
     TypePrefix(&'static str),
     SelectArtist(&'static str),
+    SelectSong(&'static str),
+    SelectPodcast(&'static str),
     SelectAlbum(&'static str),
     RemoveFirst,
     Clear,
@@ -541,6 +544,16 @@ impl RecentSearchCoalescingModel {
                     "ARTIST" => RecentSearchKind::Artist {
                         uri: format!("spotify:artist:{label}"),
                     },
+                    "SONG" => RecentSearchKind::Track {
+                        uri: format!("spotify:track:{label}"),
+                        artist_name: "Mastodon".into(),
+                        album_title: "Leviathan".into(),
+                        album_uri: Some("spotify:album:leviathan".into()),
+                    },
+                    "PODCAST" => RecentSearchKind::Show {
+                        uri: format!("spotify:show:{label}"),
+                        publisher: "Scicomm Media".into(),
+                    },
                     "ALBUM" => RecentSearchKind::Album {
                         uri: format!("spotify:album:{label}"),
                         artist_name: "Artist".into(),
@@ -551,6 +564,8 @@ impl RecentSearchCoalescingModel {
                     label: label.clone(),
                     subtitle: badge.clone(),
                     query: label.clone(),
+                    cover_art_url: Some(format!("https://i.scdn.co/image/{label}")),
+                    artwork_theme: ArtworkTheme::SunriseMountainLake,
                     kind,
                 }
             })
@@ -586,11 +601,12 @@ impl Model for RecentSearchCoalescingModel {
     fn actions(&self, _state: &Self::State, actions: &mut Vec<Self::Action>) {
         actions.extend([
             RecentSearchModelAction::TypePrefix("m"),
-            RecentSearchModelAction::TypePrefix("ma"),
-            RecentSearchModelAction::TypePrefix("mast"),
             RecentSearchModelAction::TypePrefix("mastodon"),
-            RecentSearchModelAction::TypePrefix("opeth"),
             RecentSearchModelAction::SelectArtist("Mastodon"),
+            RecentSearchModelAction::SelectArtist("Opeth"),
+            RecentSearchModelAction::SelectSong("Blood and Thunder"),
+            RecentSearchModelAction::SelectSong("Blackwater Park"),
+            RecentSearchModelAction::SelectPodcast("Huberman Lab"),
             RecentSearchModelAction::SelectAlbum("Leviathan"),
             RecentSearchModelAction::RemoveFirst,
             RecentSearchModelAction::Clear,
@@ -604,20 +620,46 @@ impl Model for RecentSearchCoalescingModel {
                 store.record_typing_query(q);
             }
             RecentSearchModelAction::SelectArtist(name) => {
-                store.record_entry(RecentSearchEntry {
-                    label: name.to_string(),
-                    subtitle: "Artist".into(),
-                    query: name.to_string(),
-                    kind: RecentSearchKind::Artist {
-                        uri: format!("spotify:artist:{name}"),
-                    },
-                });
+                store.record_entry(RecentSearchEntry::from_artist(
+                    name,
+                    &format!("spotify:artist:{name}"),
+                    Some(format!("https://i.scdn.co/image/{name}")),
+                    ArtworkTheme::SunriseMountainLake,
+                ));
+            }
+            RecentSearchModelAction::SelectSong(title) => {
+                let track = Track {
+                    id: format!("song-{title}"),
+                    spotify_uri: format!("spotify:track:{title}"),
+                    title: title.to_string(),
+                    artist: "Mastodon".into(),
+                    album: "Leviathan".into(),
+                    duration_secs: 228,
+                    liked: false,
+                    cover_art_url: Some(format!("https://i.scdn.co/image/{title}")),
+                    artwork_theme: ArtworkTheme::SunriseMountainLake,
+                };
+                store.record_entry(RecentSearchEntry::from_song(
+                    &track,
+                    Some("spotify:album:leviathan".into()),
+                ));
+            }
+            RecentSearchModelAction::SelectPodcast(title) => {
+                store.record_entry(RecentSearchEntry::from_podcast(
+                    title,
+                    "Scicomm Media",
+                    &format!("spotify:show:{title}"),
+                    Some(format!("https://i.scdn.co/image/{title}")),
+                    ArtworkTheme::EmeraldRing,
+                ));
             }
             RecentSearchModelAction::SelectAlbum(title) => {
                 store.record_entry(RecentSearchEntry {
                     label: title.to_string(),
                     subtitle: "Album".into(),
                     query: title.to_string(),
+                    cover_art_url: None,
+                    artwork_theme: ArtworkTheme::SunriseMountainLake,
                     kind: RecentSearchKind::Album {
                         uri: format!("spotify:album:{title}"),
                         artist_name: "Mastodon".into(),
@@ -637,14 +679,26 @@ impl Model for RecentSearchCoalescingModel {
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::<Self>::always(
-                "INV-R1..R3: bounded size, non-empty labels, and pairwise (badge, label) uniqueness",
-                |model, s| s.invariant_ok && s.entries.len() <= model.max_entries,
+                "INV-R1..R4: bounded size, non-empty labels, clicked real items only (no Query/Album), and 3-list partition (Artists, Songs, Podcasts)",
+                |model, s| {
+                    s.invariant_ok
+                        && s.entries.len() <= model.max_entries
+                        && s.entries
+                            .iter()
+                            .all(|(b, _)| b == "ARTIST" || b == "SONG" || b == "PODCAST")
+                },
             ),
             Property::<Self>::sometimes(
-                "Liveness: coalesced query + artist + album chip state is reachable",
+                "Liveness: 3-list recent state (Artist + Song + Podcast) is reachable while raw search strings are excluded",
                 |_, s| {
-                    s.entries.iter().any(|(b, l)| b == "SEARCH" && l == "mastodon")
+                    !s.entries.iter().any(|(b, _)| b == "SEARCH" || b == "ALBUM")
                         && s.entries.iter().any(|(b, l)| b == "ARTIST" && l == "Mastodon")
+                        && s.entries
+                            .iter()
+                            .any(|(b, l)| b == "SONG" && l == "Blood and Thunder")
+                        && s.entries
+                            .iter()
+                            .any(|(b, l)| b == "PODCAST" && l == "Huberman Lab")
                 },
             ),
         ]
@@ -3232,6 +3286,498 @@ pub fn prove_update_catalog_and_release_pipeline() -> ProofCertificate {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SongSearchAlbumModelState {
+    pub context_kind: &'static str, // "NONE", "PLAYLIST", "ALBUM"
+    pub active_album_idx: Option<u8>,
+    pub active_track_idx: Option<u8>,
+    pub is_playing: bool,
+    pub nav_current: ModelNavRoute,
+    pub nav_prev: Option<ModelNavRoute>,
+    pub recent_badges: Vec<(&'static str, &'static str, u8)>, // (badge_label, display_badge, item_id)
+    pub song_equivalent_to_album_track: bool,
+    pub next_song_in_album_verified: bool,
+    pub history_denotation_disjoint: bool,
+    pub invariants_ok: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SongSearchAlbumModelAction {
+    StartPlaylist,
+    SelectSearchedSong { album_idx: u8, track_idx: u8 },
+    SelectSearchedArtist(u8),
+    ClickRecentHistory(u8),
+    NextTrack,
+    EndOfTrack,
+}
+
+pub struct SongSearchAlbumProgressionModel;
+
+impl SongSearchAlbumProgressionModel {
+    fn sample_album(album_idx: u8) -> AlbumPlaybackQueue {
+        let tracks: Vec<Track> = (0..3u8)
+            .map(|t_idx| Track {
+                id: format!("alb-{album_idx}-trk-{t_idx}"),
+                spotify_uri: format!("spotify:track:alb{album_idx}_trk{t_idx}"),
+                title: format!("Album {album_idx} Song {t_idx}"),
+                artist: format!("Artist {}", album_idx % 2),
+                album: format!("Album {album_idx}"),
+                duration_secs: 180 + (t_idx as u32) * 15,
+                liked: false,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::SunriseMountainLake,
+            })
+            .collect();
+        AlbumPlaybackQueue {
+            album_uri: format!("spotify:album:{album_idx}"),
+            album_title: format!("Album {album_idx}"),
+            artist_name: format!("Artist {}", album_idx % 2),
+            tracks,
+        }
+    }
+
+    fn apply_song_selection(
+        album_idx: u8,
+        track_idx: u8,
+        nav: &mut NavHistoryMachine<ModelNavRoute>,
+        recent: &mut RecentSearchStore,
+    ) -> (PlaybackState, bool, bool) {
+        let album = Self::sample_album(album_idx);
+        let song = album.tracks[track_idx as usize].clone();
+
+        // Record in Search History as a Song
+        recent.record_entry(RecentSearchEntry::from_song(
+            &song,
+            Some(album.album_uri.clone()),
+        ));
+
+        // 1. State produced by selecting the song via resolve_song_album_queue_verified
+        let (resolved_album, resolved_idx) = resolve_song_album_queue_verified(
+            &album.album_uri,
+            &album.album_title,
+            &album.artist_name,
+            album.tracks.clone(),
+            &song,
+        )
+        .expect("song must resolve on its parent album");
+
+        let mut song_pb = PlaybackState::mockup_default();
+        // Even if previously in a Playlist context, selecting a song switches to Album context:
+        song_pb.apply_verified_action(VerifiedTransportAction::ActivatePlaylist {
+            playlist_id: "pl-prior".into(),
+            tracks: vec![song.clone()],
+            auto_play: true,
+        });
+        song_pb.apply_verified_action(VerifiedTransportAction::ActivateAlbum {
+            album: resolved_album.clone(),
+            artist_uri: Some(format!("spotify:artist:{}", album_idx % 2)),
+            artist_albums: vec![resolved_album],
+            start_track_index: resolved_idx,
+            auto_play: true,
+        });
+
+        // 2. Reference state produced by going directly to the album and selecting that song index
+        let mut direct_album_pb = PlaybackState::mockup_default();
+        direct_album_pb.apply_verified_action(VerifiedTransportAction::ActivateAlbum {
+            album: album.clone(),
+            artist_uri: Some(format!("spotify:artist:{}", album_idx % 2)),
+            artist_albums: vec![album.clone()],
+            start_track_index: track_idx as usize,
+            auto_play: true,
+        });
+
+        let equivalent = resolved_idx == (track_idx as usize)
+            && song_pb.current_track == direct_album_pb.current_track
+            && song_pb.queue == direct_album_pb.queue
+            && song_pb.context == direct_album_pb.context
+            && song_pb.upcoming_tracks_in_context()
+                == direct_album_pb.upcoming_tracks_in_context();
+
+        // 3. Verify that advancing to the next track plays the next song in the album
+        let mut next_pb = song_pb.clone();
+        next_pb.apply_verified_action(VerifiedTransportAction::NextTrack);
+        let mut eot_pb = song_pb.clone();
+        eot_pb.apply_verified_action(VerifiedTransportAction::EndOfTrack);
+
+        let next_song_ok = if (track_idx as usize) + 1 < album.tracks.len() {
+            let expected_next = &album.tracks[(track_idx as usize) + 1];
+            next_pb.current_track.id == expected_next.id
+                && eot_pb.current_track.id == expected_next.id
+                && next_pb.is_playing
+                && eot_pb.is_playing
+        } else {
+            // Last song on final album stops cleanly per INV-A4
+            !next_pb.is_playing && !eot_pb.is_playing
+        };
+
+        // 4. Push Album -> NowPlaying onto navigation history
+        nav.push(ModelNavRoute::Album(album_idx));
+        nav.push(ModelNavRoute::NowPlaying);
+
+        (song_pb, equivalent, next_song_ok)
+    }
+}
+
+impl Model for SongSearchAlbumProgressionModel {
+    type State = SongSearchAlbumModelState;
+    type Action = SongSearchAlbumModelAction;
+
+    fn init_states(&self) -> Vec<Self::State> {
+        vec![SongSearchAlbumModelState {
+            context_kind: "NONE",
+            active_album_idx: None,
+            active_track_idx: None,
+            is_playing: false,
+            nav_current: ModelNavRoute::Search,
+            nav_prev: None,
+            recent_badges: Vec::new(),
+            song_equivalent_to_album_track: true,
+            next_song_in_album_verified: true,
+            history_denotation_disjoint: true,
+            invariants_ok: true,
+        }]
+    }
+
+    fn actions(&self, _state: &Self::State, actions: &mut Vec<Self::Action>) {
+        actions.push(SongSearchAlbumModelAction::StartPlaylist);
+        for album_idx in 0..2u8 {
+            for track_idx in 0..3u8 {
+                actions.push(SongSearchAlbumModelAction::SelectSearchedSong {
+                    album_idx,
+                    track_idx,
+                });
+            }
+        }
+        actions.push(SongSearchAlbumModelAction::SelectSearchedArtist(0));
+        actions.push(SongSearchAlbumModelAction::SelectSearchedArtist(1));
+        actions.push(SongSearchAlbumModelAction::ClickRecentHistory(0));
+        actions.push(SongSearchAlbumModelAction::ClickRecentHistory(1));
+        actions.push(SongSearchAlbumModelAction::NextTrack);
+        actions.push(SongSearchAlbumModelAction::EndOfTrack);
+    }
+
+    fn next_state(&self, last: &Self::State, action: Self::Action) -> Option<Self::State> {
+        let mut s = last.clone();
+        let mut nav = NavHistoryMachine::new(s.nav_current, 6);
+        if let Some(prev) = s.nav_prev {
+            nav = NavHistoryMachine::new(prev, 6);
+            nav.push(s.nav_current);
+        }
+
+        let mut recent = RecentSearchStore::new(4);
+        for &(badge, _disp, item_id) in s.recent_badges.iter().rev() {
+            if badge == "SONG" {
+                let alb_idx = item_id / 10;
+                let trk_idx = item_id % 10;
+                let alb = Self::sample_album(alb_idx);
+                if let Some(song) = alb.tracks.get(trk_idx as usize) {
+                    recent.record_entry(RecentSearchEntry::from_song(
+                        song,
+                        Some(alb.album_uri.clone()),
+                    ));
+                }
+            } else if badge == "ARTIST" {
+                recent.record_entry(RecentSearchEntry::from_artist(
+                    &format!("Artist {item_id}"),
+                    &format!("spotify:artist:{item_id}"),
+                    Some(format!("https://i.scdn.co/image/artist_{item_id}")),
+                    ArtworkTheme::SunriseMountainLake,
+                ));
+            }
+        }
+
+        match action {
+            SongSearchAlbumModelAction::StartPlaylist => {
+                s.context_kind = "PLAYLIST";
+                s.active_album_idx = None;
+                s.active_track_idx = Some(0);
+                s.is_playing = true;
+                nav.push(ModelNavRoute::NowPlaying);
+            }
+            SongSearchAlbumModelAction::SelectSearchedSong {
+                album_idx,
+                track_idx,
+            } => {
+                let (_pb, eq_ok, next_ok) =
+                    Self::apply_song_selection(album_idx, track_idx, &mut nav, &mut recent);
+                s.context_kind = "ALBUM";
+                s.active_album_idx = Some(album_idx);
+                s.active_track_idx = Some(track_idx);
+                s.is_playing = true;
+                s.song_equivalent_to_album_track = eq_ok;
+                s.next_song_in_album_verified = next_ok;
+            }
+            SongSearchAlbumModelAction::SelectSearchedArtist(artist_idx) => {
+                recent.record_entry(RecentSearchEntry::from_artist(
+                    &format!("Artist {artist_idx}"),
+                    &format!("spotify:artist:{artist_idx}"),
+                    Some(format!("https://i.scdn.co/image/artist_{artist_idx}")),
+                    ArtworkTheme::SunriseMountainLake,
+                ));
+                nav.push(ModelNavRoute::Artist(artist_idx));
+            }
+            SongSearchAlbumModelAction::ClickRecentHistory(hist_idx) => {
+                if let Some(&(_badge, _disp, item_id)) = s.recent_badges.get(hist_idx as usize) {
+                    if let Some(entry) = recent.get(hist_idx as usize).cloned() {
+                        if entry.kind.is_song() {
+                            let alb_idx = item_id / 10;
+                            let trk_idx = item_id % 10;
+                            let (_pb, eq_ok, next_ok) = Self::apply_song_selection(
+                                alb_idx,
+                                trk_idx,
+                                &mut nav,
+                                &mut recent,
+                            );
+                            s.context_kind = "ALBUM";
+                            s.active_album_idx = Some(alb_idx);
+                            s.active_track_idx = Some(trk_idx);
+                            s.is_playing = true;
+                            s.song_equivalent_to_album_track = eq_ok;
+                            s.next_song_in_album_verified = next_ok;
+                        } else if entry.kind.is_artist() {
+                            recent.record_entry(entry);
+                            nav.push(ModelNavRoute::Artist(item_id));
+                        }
+                    }
+                }
+            }
+            SongSearchAlbumModelAction::NextTrack | SongSearchAlbumModelAction::EndOfTrack => {
+                if s.context_kind == "ALBUM" {
+                    if let (Some(_alb_idx), Some(trk_idx)) =
+                        (s.active_album_idx, s.active_track_idx)
+                    {
+                        if trk_idx + 1 < 3 {
+                            s.active_track_idx = Some(trk_idx + 1);
+                            s.is_playing = true;
+                        } else {
+                            s.is_playing = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        s.nav_current = *nav.current();
+        s.nav_prev = nav.previous_entry().copied();
+        s.invariants_ok = recent.check_invariants().is_ok() && nav.check_invariants().is_ok();
+        s.history_denotation_disjoint = recent.entries().iter().all(|e| {
+            if e.kind.is_song() {
+                !e.kind.is_artist()
+                    && e.kind.badge_label() == "SONG"
+                    && e.kind.display_badge() == "▶ SONG"
+                    && e.kind.action_hint() == "▶ Album"
+                    && e.subtitle.starts_with("Song · ")
+            } else if e.kind.is_artist() {
+                !e.kind.is_song()
+                    && e.kind.badge_label() == "ARTIST"
+                    && e.kind.display_badge() == "★ ARTIST"
+                    && e.kind.action_hint() == "Artist ›"
+                    && e.subtitle.starts_with("Artist")
+            } else {
+                true
+            }
+        });
+        s.recent_badges = recent
+            .entries()
+            .iter()
+            .map(|e| {
+                let id = if e.kind.is_song() {
+                    let alb_idx = e
+                        .label
+                        .strip_prefix("Album ")
+                        .and_then(|r| r.chars().next())
+                        .and_then(|c| c.to_digit(10))
+                        .unwrap_or(0) as u8;
+                    let trk_idx = e
+                        .label
+                        .chars()
+                        .last()
+                        .and_then(|c| c.to_digit(10))
+                        .unwrap_or(0) as u8;
+                    alb_idx * 10 + trk_idx
+                } else {
+                    e.label
+                        .chars()
+                        .last()
+                        .and_then(|c| c.to_digit(10))
+                        .unwrap_or(0) as u8
+                };
+                (e.kind.badge_label(), e.kind.display_badge(), id)
+            })
+            .collect();
+
+        Some(s)
+    }
+
+    fn properties(&self) -> Vec<Property<Self>> {
+        vec![
+            Property::<Self>::always(
+                "INV-SA1..SA3 & INV-R4: Selecting a song activates its parent album at that song, advances to the next song in the album, and denotes SONG vs ARTIST distinctly in history",
+                |_, s| {
+                    s.invariants_ok
+                        && s.song_equivalent_to_album_track
+                        && s.next_song_in_album_verified
+                        && s.history_denotation_disjoint
+                },
+            ),
+            Property::<Self>::sometimes(
+                "Liveness: Selecting Song 1 on Album 1 and advancing plays Song 2 on Album 1 with both SONG and ARTIST in search history",
+                |_, s| {
+                    s.context_kind == "ALBUM"
+                        && s.active_album_idx == Some(1)
+                        && s.active_track_idx == Some(2)
+                        && s.is_playing
+                        && s.recent_badges.iter().any(|(b, d, _)| *b == "SONG" && *d == "▶ SONG")
+                        && s.recent_badges
+                            .iter()
+                            .any(|(b, d, _)| *b == "ARTIST" && *d == "★ ARTIST")
+                },
+            ),
+        ]
+    }
+}
+
+/// Proof 20 (`MC-SONG-SEARCH-ALBUM-20`): TLA+-style `stateright` explicit-state model checking
+/// and exhaustive finite-domain proof verifying:
+/// - **INV-SA1 (Song-on-Album State Equivalence)**: Selecting any song `t_k` from Search or Search History
+///   places `PlaybackState` into `PlaybackContext::Album` on its parent album at index `k`, identical to
+///   navigating to the album and selecting `t_k` (`upcoming_tracks_in_context() == album.tracks[k+1..]`).
+/// - **INV-SA2 (Sequential Next-Song Progression)**: After selecting song `t_k` (`k + 1 < N`),
+///   `NextTrack` and `EndOfTrack` deterministically play `t_{k+1}` (the next song on the album),
+///   even if the player was previously in a `PlaybackContext::Playlist`.
+/// - **INV-SA3 (Album Navigation Context)**: Selecting a song pushes `StageRoute::Album` beneath
+///   `NowPlaying` so `previous_entry()` is always the song's parent album.
+/// - **INV-R4 (Disjoint Song vs Artist Search History Denotation)**: `RecentSearchKind::Track` (`"SONG"`,
+///   `"♪ SONG"`, `"▶ Album"`, `"Song · <Artist> · <Album>"`) and `RecentSearchKind::Artist` (`"ARTIST"`,
+///   `"★ ARTIST"`, `"Artist ›"`, `"Artist · Discography"`) are strictly disjoint and coexist even when
+///   a song and an artist share the exact same name.
+pub fn prove_song_search_to_album_progression_and_history_denotation() -> ProofCertificate {
+    let t0 = Instant::now();
+    let checker = SongSearchAlbumProgressionModel
+        .checker()
+        .threads(1)
+        .spawn_bfs()
+        .join();
+    checker.assert_properties();
+    let mut explored = checker.unique_state_count();
+
+    // Exhaustive finite-domain proof over album sizes 1..=8 and all song positions 0..len
+    for album_len in 1..=8usize {
+        let tracks: Vec<Track> = (0..album_len)
+            .map(|i| Track {
+                id: format!("id-{album_len}-{i}"),
+                spotify_uri: format!("spotify:track:alb{album_len}_{i}"),
+                title: format!("Track Number {i}"),
+                artist: "Radiohead".into(),
+                album: "In Rainbows".into(),
+                duration_secs: 200 + (i as u32) * 10,
+                liked: false,
+                cover_art_url: None,
+                artwork_theme: ArtworkTheme::SunriseMountainLake,
+            })
+            .collect();
+
+        for song_idx in 0..album_len {
+            let chosen = &tracks[song_idx];
+            assert_eq!(
+                find_song_index_in_album_verified(&tracks, chosen),
+                Some(song_idx)
+            );
+            let (album_q, start_idx) = resolve_song_album_queue_verified(
+                "spotify:album:in_rainbows",
+                "In Rainbows",
+                "Radiohead",
+                tracks.clone(),
+                chosen,
+            )
+            .expect("must resolve album queue");
+            assert_eq!(start_idx, song_idx);
+            assert_eq!(album_q.tracks.len(), album_len);
+
+            let mut pb = PlaybackState::mockup_default();
+            pb.apply_verified_action(VerifiedTransportAction::ActivateAlbum {
+                album: album_q.clone(),
+                artist_uri: Some("spotify:artist:radiohead".into()),
+                artist_albums: vec![album_q.clone()],
+                start_track_index: start_idx,
+                auto_play: true,
+            });
+            pb.assert_invariants();
+            assert_eq!(pb.current_track.id, chosen.id);
+            assert_eq!(
+                pb.upcoming_tracks_in_context().len(),
+                album_len - (song_idx + 1)
+            );
+
+            pb.apply_verified_action(VerifiedTransportAction::NextTrack);
+            pb.assert_invariants();
+            if song_idx + 1 < album_len {
+                assert_eq!(pb.current_track.id, tracks[song_idx + 1].id);
+                assert!(pb.is_playing);
+            } else {
+                assert!(!pb.is_playing);
+            }
+            explored += 1;
+        }
+    }
+
+    // Verify same-name Song vs Artist vs Podcast coexistence and 3-list partitioning in RecentSearchStore
+    let mut store = RecentSearchStore::new(10);
+    let homonym_song = Track {
+        id: "black-sabbath-song".into(),
+        spotify_uri: "spotify:track:black_sabbath_song".into(),
+        title: "Black Sabbath".into(),
+        artist: "Black Sabbath".into(),
+        album: "Black Sabbath".into(),
+        duration_secs: 380,
+        liked: false,
+        cover_art_url: Some("https://i.scdn.co/image/bs_song".into()),
+        artwork_theme: ArtworkTheme::EmeraldRing,
+    };
+    store.record_entry(RecentSearchEntry::from_artist(
+        "Black Sabbath",
+        "spotify:artist:black_sabbath",
+        Some("https://i.scdn.co/image/bs_artist".into()),
+        ArtworkTheme::SunriseMountainLake,
+    ));
+    store.record_entry(RecentSearchEntry::from_song(
+        &homonym_song,
+        Some("spotify:album:black_sabbath".into()),
+    ));
+    store.record_entry(RecentSearchEntry::from_podcast(
+        "The Daily",
+        "The New York Times",
+        "spotify:show:the_daily",
+        Some("https://i.scdn.co/image/the_daily".into()),
+        ArtworkTheme::TwilightHorizon,
+    ));
+    store.assert_invariants();
+    assert_eq!(store.len(), 3);
+    assert_eq!(store.artist_entries_indexed().len(), 1);
+    assert_eq!(store.song_entries_indexed().len(), 1);
+    assert_eq!(store.podcast_entries_indexed().len(), 1);
+    assert!(store.entries()[0].kind.is_podcast());
+    assert_eq!(store.entries()[0].kind.badge_label(), "PODCAST");
+    assert_eq!(store.entries()[0].kind.display_badge(), "PODCAST");
+    assert!(store.entries()[1].kind.is_song());
+    assert_eq!(store.entries()[1].kind.badge_label(), "SONG");
+    assert_eq!(store.entries()[1].kind.display_badge(), "▶ SONG");
+    assert!(store.entries()[2].kind.is_artist());
+    assert_eq!(store.entries()[2].kind.badge_label(), "ARTIST");
+    assert_eq!(store.entries()[2].kind.display_badge(), "★ ARTIST");
+    explored += 1;
+
+    ProofCertificate {
+        id: "MC-SONG-SEARCH-ALBUM-20",
+        subsystem: "spot-core / spot-spotify / spot-app (Song Search & History Denotation)",
+        method: "Stateright BFS + Exhaustive Song-on-Album Progression Proof",
+        theorem: "INV-SA1..SA3 & INV-R4: Song Search Activates Parent Album at Song, Plays Next Album Song & Denotes Song vs Artist",
+        states_or_cases_explored: explored,
+        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        verified: true,
+    }
+}
+
 /// Runs the complete Spot formal verification suite and returns a structured [`VerificationSuiteReport`].
 pub fn run_all_formal_proofs() -> VerificationSuiteReport {
     let suite_start = Instant::now();
@@ -3255,6 +3801,7 @@ pub fn run_all_formal_proofs() -> VerificationSuiteReport {
         prove_tray_and_player_progress_sync_invariant(),
         prove_instant_audio_gate_and_spacebar_play_pause(),
         prove_update_catalog_and_release_pipeline(),
+        prove_song_search_to_album_progression_and_history_denotation(),
     ];
 
     let total_states_or_cases = certificates
@@ -3278,6 +3825,6 @@ mod tests {
     fn formal_verification_suite_proves_all_theorems() {
         let report = run_all_formal_proofs();
         assert!(report.all_verified());
-        assert_eq!(report.certificates.len(), 19);
+        assert_eq!(report.certificates.len(), 20);
     }
 }

@@ -35,8 +35,18 @@ pub mod palette {
     /// Subtle caption/timestamp ink (`#7B8089`).
     pub const INK_MUTED: Color = Color::from_rgb(0.482, 0.502, 0.537);
 
-    /// Signature Spot emerald accent (`#14964B`).
+    /// Signature Spot emerald accent (`#14964B`) — used for Artists & primary active states.
     pub const EMERALD: Color = Color::from_rgb(0.078, 0.588, 0.294);
+    /// Distinct warm copper-amber accent (`#B55811`) — used for Songs in Search & Search History.
+    pub const SONG_ACCENT: Color = Color::from_rgb(0.710, 0.345, 0.067);
+    /// Soft warm amber badge pill fill for Song chips.
+    pub const SONG_BADGE_BG: Color = Color::from_rgba(0.710, 0.345, 0.067, 0.13);
+    /// Soft emerald badge pill fill for Artist chips.
+    pub const ARTIST_BADGE_BG: Color = Color::from_rgba(0.078, 0.588, 0.294, 0.12);
+    /// Distinct deep indigo-slate accent (`#485EB0`) — used for Podcasts in Search & Search History.
+    pub const PODCAST_ACCENT: Color = Color::from_rgb(0.282, 0.369, 0.690);
+    /// Soft indigo badge pill fill for Podcast chips.
+    pub const PODCAST_BADGE_BG: Color = Color::from_rgba(0.282, 0.369, 0.690, 0.13);
     /// Deeper forest scrubber track fill (`#1C6B4A`).
     pub const SCRUBBER_FILL: Color = Color::from_rgb(0.110, 0.420, 0.290);
     /// Unfilled slider track (`#DCDEE0`).
@@ -275,14 +285,147 @@ pub fn artist_bio_card(_theme: &Theme) -> container::Style {
     }
 }
 
-pub fn recent_search_chip_card(_theme: &Theme) -> container::Style {
+pub fn recent_search_song_chip_card(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.70))),
+        background: Some(Background::Color(Color::from_rgba(1.0, 0.985, 0.965, 0.88))),
         border: Border {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.055),
+            color: Color::from_rgba(0.710, 0.345, 0.067, 0.28),
             width: 1.0,
             radius: 10.0.into(),
         },
         ..Default::default()
     }
 }
+
+pub fn recent_search_artist_chip_card(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(0.965, 0.995, 0.978, 0.88))),
+        border: Border {
+            color: Color::from_rgba(0.078, 0.588, 0.294, 0.26),
+            width: 1.0,
+            radius: 10.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+pub fn recent_search_podcast_chip_card(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(0.968, 0.975, 0.996, 0.88))),
+        border: Border {
+            color: Color::from_rgba(0.282, 0.369, 0.690, 0.25),
+            width: 1.0,
+            radius: 10.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+pub fn search_group_column_card(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.56))),
+        border: Border {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.055),
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// Minimal vertical scrollbar geometry (`7px` scroller inside an `11px` hover target).
+pub fn elegant_scrollbar_direction() -> iced::widget::scrollable::Direction {
+    iced::widget::scrollable::Direction::Vertical(
+        iced::widget::scrollable::Scrollbar::new()
+            .width(7.0)
+            .scroller_width(7.0)
+            .margin(2.0),
+    )
+}
+
+/// Whisper-thin disappearing scrollbar that:
+/// - Is completely invisible when not scrolling and not hovered (`scroll_alpha == 0.0`)
+/// - Appears as a barely-there `2.5px` translucent sliver while scrolling (via transparent GPU SDF inset border)
+/// - Expands to a `7.0px` pill with a subtle track rail when hovered or dragged
+pub fn elegant_scrollbar(
+    scroll_alpha: f32,
+) -> impl Fn(&Theme, iced::widget::scrollable::Status) -> iced::widget::scrollable::Style {
+    move |_theme, status| {
+        let (scrollbar_hovered, scrollbar_dragged) = match status {
+            iced::widget::scrollable::Status::Hovered {
+                is_horizontal_scrollbar_hovered,
+                is_vertical_scrollbar_hovered,
+            } => (
+                is_horizontal_scrollbar_hovered || is_vertical_scrollbar_hovered,
+                false,
+            ),
+            iced::widget::scrollable::Status::Dragged {
+                is_horizontal_scrollbar_dragged,
+                is_vertical_scrollbar_dragged,
+            } => (
+                true,
+                is_horizontal_scrollbar_dragged || is_vertical_scrollbar_dragged,
+            ),
+            iced::widget::scrollable::Status::Active => (false, false),
+        };
+
+        let clamped_alpha = scroll_alpha.clamp(0.0, 1.0);
+
+        let rail = if scrollbar_hovered || scrollbar_dragged {
+            // Expanded pill on hover/drag (`7.0px` wide)
+            let thumb_alpha = if scrollbar_dragged { 0.44 } else { 0.30 };
+            iced::widget::scrollable::Rail {
+                background: Some(Background::Color(Color::from_rgba(0.11, 0.14, 0.16, 0.04))),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 3.5.into(),
+                },
+                scroller: iced::widget::scrollable::Scroller {
+                    color: Color::from_rgba(0.11, 0.14, 0.16, thumb_alpha),
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 3.5.into(),
+                    },
+                },
+            }
+        } else if clamped_alpha > 0.005 {
+            // Barely-there `2.5px` sliver while scrolling (`7.0 - 2 * 2.25 = 2.5px` interior via transparent border)
+            iced::widget::scrollable::Rail {
+                background: None,
+                border: Border::default(),
+                scroller: iced::widget::scrollable::Scroller {
+                    color: Color::from_rgba(0.11, 0.14, 0.16, 0.18 * clamped_alpha),
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 2.25,
+                        radius: 3.5.into(),
+                    },
+                },
+            }
+        } else {
+            // Completely hidden when idle and not hovering over the scrollbar
+            iced::widget::scrollable::Rail {
+                background: None,
+                border: Border::default(),
+                scroller: iced::widget::scrollable::Scroller {
+                    color: Color::TRANSPARENT,
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 3.5.into(),
+                    },
+                },
+            }
+        };
+
+        iced::widget::scrollable::Style {
+            container: container::Style::default(),
+            vertical_rail: rail,
+            horizontal_rail: rail,
+            gap: None,
+        }
+    }
+}
+

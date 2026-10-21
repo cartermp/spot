@@ -3,11 +3,12 @@ use serde::{Deserialize, Serialize};
 pub mod formal;
 pub use formal::{
     advance_queue_verified, coprime_shuffle_step, delete_last_word_verified,
-    episode_to_playable_track_verified, format_connected_account_label, gcd_usize,
-    git_shas_match_verified, is_opaque_spotify_user_id, is_release_newer_verified,
-    merge_devices_verified, normalize_album_playback_queue, normalize_git_sha_verified,
-    normalize_sha256_hex_verified, normalize_spotify_episode_uri, normalize_spotify_show_uri,
-    resolve_playable_track_candidate, sanitize_pcm_sample, sanitize_position_secs,
+    episode_to_playable_track_verified, find_song_index_in_album_verified,
+    format_connected_account_label, gcd_usize, git_shas_match_verified, is_opaque_spotify_user_id,
+    is_release_newer_verified, merge_devices_verified, normalize_album_playback_queue,
+    normalize_git_sha_verified, normalize_sha256_hex_verified, normalize_spotify_episode_uri,
+    normalize_spotify_show_uri, resolve_playable_track_candidate,
+    resolve_song_album_queue_verified, sanitize_pcm_sample, sanitize_position_secs,
     sanitize_spotify_biography, sanitize_unit_float, select_device_verified,
     should_toggle_play_pause_on_space_verified, step_gated_stereo_frame_verified,
     summarize_artist_bio, verify_update_digest_verified, FormalInvariant, InstantAudioGate,
@@ -62,9 +63,10 @@ impl RepeatMode {
 }
 
 /// Visual theme seed for procedural/cached artwork generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ArtworkTheme {
     /// Warm peach moon / turquoise mountain lake ("Higher Ground - Lume")
+    #[default]
     SunriseMountainLake,
     /// Warm amber dusk canyon peaks ("Golden Hours - Kairo")
     GoldenCanyon,
@@ -516,6 +518,19 @@ impl PlaybackState {
         }
     }
 
+    /// Returns the remaining upcoming tracks in the current playback context after `current_track`.
+    pub fn upcoming_tracks_in_context(&self) -> &[Track] {
+        if let Some(pos) = self.queue.iter().position(|t| {
+            t.id == self.current_track.id
+                || (!self.current_track.spotify_uri.is_empty()
+                    && t.spotify_uri == self.current_track.spotify_uri)
+        }) {
+            &self.queue[(pos + 1)..]
+        } else {
+            &[]
+        }
+    }
+
     /// Returns `true` if `current_track` represents an active playable track or episode.
     pub fn has_active_track(&self) -> bool {
         !self.current_track.id.is_empty()
@@ -598,6 +613,7 @@ pub enum PlayerCommand {
     },
     LogoutSpotify,
     SearchCatalog(String),
+    HydrateRecentArtwork(Vec<(String, String, String)>),
     RefreshDevices,
 }
 
@@ -620,6 +636,7 @@ pub enum EngineEvent {
         episodes: Vec<PodcastEpisode>,
         tracks: Vec<Track>,
     },
+    RecentArtworkHydrated(Vec<(String, String, String)>),
     ArtistDetailLoaded(Box<ArtistDetail>),
     AlbumDetailLoaded(Box<AlbumDetail>),
     ShowDetailLoaded(Box<PodcastShowDetail>),

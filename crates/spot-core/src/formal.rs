@@ -659,17 +659,39 @@ impl PlaybackState {
                         "standalone-track".to_string()
                     };
                 }
-                let in_current_context = matches!(
-                    self.context,
-                    PlaybackContext::Album { .. }
-                        | PlaybackContext::Playlist { .. }
-                        | PlaybackContext::PodcastShow { .. }
-                ) && self.queue.iter().any(|t| {
-                    t.id == track.id
-                        || (!track.spotify_uri.is_empty() && t.spotify_uri == track.spotify_uri)
-                });
+                let in_same_album_context = match &self.context {
+                    PlaybackContext::Album {
+                        artist_albums,
+                        current_album_index,
+                        ..
+                    } => {
+                        let same_album = artist_albums
+                            .get(*current_album_index)
+                            .is_some_and(|alb| {
+                                track.album.trim().is_empty()
+                                    || alb.album_title.eq_ignore_ascii_case(track.album.trim())
+                            });
+                        same_album
+                            && self.queue.len() > 1
+                            && self.queue.iter().any(|t| {
+                                t.id == track.id
+                                    || (!track.spotify_uri.is_empty()
+                                        && t.spotify_uri == track.spotify_uri)
+                            })
+                    }
+                    PlaybackContext::PodcastShow { .. }
+                        if track.spotify_uri.starts_with("spotify:episode:") =>
+                    {
+                        self.queue.iter().any(|t| {
+                            t.id == track.id
+                                || (!track.spotify_uri.is_empty()
+                                    && t.spotify_uri == track.spotify_uri)
+                        })
+                    }
+                    _ => false,
+                };
 
-                if in_current_context {
+                if in_same_album_context {
                     if let Some(existing) = self.queue.iter().find(|t| {
                         t.id == track.id
                             || (!track.spotify_uri.is_empty() && t.spotify_uri == track.spotify_uri)
@@ -686,8 +708,8 @@ impl PlaybackState {
                     self.position_secs = 0.0;
                     self.is_playing = true;
                 } else {
-                    // Playing an individual track outside a playlist clears playlist context
-                    // and isolates `Up Next` to that track's album context.
+                    // Playing an individual song always switches out of any active playlist
+                    // into that song's parent album context.
                     self.clear_playlist_context();
                     let album_title = if track.album.trim().is_empty() {
                         track.title.clone()
@@ -1269,6 +1291,16 @@ impl<R: NavRouteTarget> NavHistoryMachine<R> {
     }
 
     #[inline]
+    pub fn previous_entry_mut(&mut self) -> Option<&mut R> {
+        if self.can_go_back() {
+            let prev_idx = self.index - 1;
+            self.entries.get_mut(prev_idx)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     pub fn next_entry(&self) -> Option<&R> {
         if self.can_go_forward() {
             self.entries.get(self.index + 1)
@@ -1376,10 +1408,25 @@ impl<R: NavRouteTarget> FormalInvariant for NavHistoryMachine<R> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RecentSearchKind {
     Query,
-    Artist { uri: String },
-    Album { uri: String, artist_name: String },
-    Show { uri: String, publisher: String },
-    Track { uri: String, artist_name: String },
+    Artist {
+        uri: String,
+    },
+    Album {
+        uri: String,
+        artist_name: String,
+    },
+    Show {
+        uri: String,
+        publisher: String,
+    },
+    Track {
+        uri: String,
+        artist_name: String,
+        #[serde(default)]
+        album_title: String,
+        #[serde(default)]
+        album_uri: Option<String>,
+    },
 }
 
 impl RecentSearchKind {
@@ -1389,8 +1436,50 @@ impl RecentSearchKind {
             RecentSearchKind::Artist { .. } => "ARTIST",
             RecentSearchKind::Album { .. } => "ALBUM",
             RecentSearchKind::Show { .. } => "PODCAST",
-            RecentSearchKind::Track { .. } => "TRACK",
+            RecentSearchKind::Track { .. } => "SONG",
         }
+    }
+
+    pub fn display_badge(&self) -> &'static str {
+        match self {
+            RecentSearchKind::Query => "SEARCH",
+            RecentSearchKind::Artist { .. } => "★ ARTIST",
+            RecentSearchKind::Album { .. } => "ALBUM",
+            RecentSearchKind::Show { .. } => "PODCAST",
+            RecentSearchKind::Track { .. } => "▶ SONG",
+        }
+    }
+
+    pub fn action_hint(&self) -> &'static str {
+        match self {
+            RecentSearchKind::Query => "Search ›",
+            RecentSearchKind::Artist { .. } => "Artist ›",
+            RecentSearchKind::Album { .. } => "Album ›",
+            RecentSearchKind::Show { .. } => "Show ›",
+            RecentSearchKind::Track { .. } => "▶ Album",
+        }
+    }
+
+    #[inline]
+    pub fn is_song(&self) -> bool {
+        matches!(self, RecentSearchKind::Track { .. })
+    }
+
+    #[inline]
+    pub fn is_artist(&self) -> bool {
+        matches!(self, RecentSearchKind::Artist { .. })
+    }
+
+    #[inline]
+    pub fn is_podcast(&self) -> bool {
+        matches!(self, RecentSearchKind::Show { .. })
+    }
+
+    /// Returns `true` iff this entry represents a real clicked Artist, Song, or Podcast
+    /// (excluding raw search query strings and ungrouped kinds).
+    #[inline]
+    pub fn is_real_clicked_item(&self) -> bool {
+        self.is_artist() || self.is_song() || self.is_podcast()
     }
 }
 
@@ -1401,9 +1490,88 @@ pub struct RecentSearchEntry {
     pub subtitle: String,
     pub query: String,
     pub kind: RecentSearchKind,
+    #[serde(default)]
+    pub cover_art_url: Option<String>,
+    #[serde(default)]
+    pub artwork_theme: ArtworkTheme,
 }
 
-/// Formally verified bounded store for Recently Searched items with prefix coalescing and deduplication.
+impl RecentSearchEntry {
+    pub fn from_song(track: &Track, album_uri: Option<String>) -> Self {
+        let title = track.title.trim();
+        let artist = if track.artist.trim().is_empty() {
+            "Artist"
+        } else {
+            track.artist.trim()
+        };
+        let album = track.album.trim();
+        let subtitle = if album.is_empty() {
+            format!("Song · {artist}")
+        } else {
+            format!("Song · {artist} · {album}")
+        };
+        Self {
+            label: title.to_string(),
+            subtitle,
+            query: title.to_string(),
+            kind: RecentSearchKind::Track {
+                uri: track.spotify_uri.trim().to_string(),
+                artist_name: artist.to_string(),
+                album_title: album.to_string(),
+                album_uri: album_uri.filter(|u| !u.trim().is_empty()),
+            },
+            cover_art_url: track.cover_art_url.clone(),
+            artwork_theme: track.artwork_theme,
+        }
+    }
+
+    pub fn from_artist(
+        name: &str,
+        uri: &str,
+        cover_art_url: Option<String>,
+        artwork_theme: ArtworkTheme,
+    ) -> Self {
+        let clean_name = name.trim();
+        Self {
+            label: clean_name.to_string(),
+            subtitle: "Artist · Discography".to_string(),
+            query: clean_name.to_string(),
+            kind: RecentSearchKind::Artist {
+                uri: uri.trim().to_string(),
+            },
+            cover_art_url,
+            artwork_theme,
+        }
+    }
+
+    pub fn from_podcast(
+        title: &str,
+        publisher: &str,
+        uri: &str,
+        cover_art_url: Option<String>,
+        artwork_theme: ArtworkTheme,
+    ) -> Self {
+        let clean_title = title.trim();
+        let clean_pub = if publisher.trim().is_empty() {
+            "Podcast"
+        } else {
+            publisher.trim()
+        };
+        Self {
+            label: clean_title.to_string(),
+            subtitle: format!("Podcast · {clean_pub}"),
+            query: clean_title.to_string(),
+            kind: RecentSearchKind::Show {
+                uri: uri.trim().to_string(),
+                publisher: clean_pub.to_string(),
+            },
+            cover_art_url,
+            artwork_theme,
+        }
+    }
+}
+
+/// Formally verified bounded store for Recently Searched items (real clicked Artists, Songs, and Podcasts only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentSearchStore {
     entries: Vec<RecentSearchEntry>,
@@ -1412,7 +1580,7 @@ pub struct RecentSearchStore {
 
 impl Default for RecentSearchStore {
     fn default() -> Self {
-        Self::new(10)
+        Self::new(30)
     }
 }
 
@@ -1426,7 +1594,8 @@ impl RecentSearchStore {
 
     pub fn from_loaded(raw: Vec<RecentSearchEntry>, max_entries: usize) -> Self {
         let mut store = Self::new(max_entries);
-        // Insert in reverse so index 0 of `raw` ends up at the front while enforcing all invariants.
+        // Insert in reverse so index 0 of `raw` ends up at the front while enforcing all invariants
+        // and automatically stripping any legacy search-query strings.
         for entry in raw.into_iter().rev() {
             store.record_entry(entry);
         }
@@ -1436,6 +1605,33 @@ impl RecentSearchStore {
     #[inline]
     pub fn entries(&self) -> &[RecentSearchEntry] {
         &self.entries
+    }
+
+    /// Returns `(store_index, entry)` for all clicked Artist entries in most-recent-first order.
+    pub fn artist_entries_indexed(&self) -> Vec<(usize, &RecentSearchEntry)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind.is_artist())
+            .collect()
+    }
+
+    /// Returns `(store_index, entry)` for all clicked Song entries in most-recent-first order.
+    pub fn song_entries_indexed(&self) -> Vec<(usize, &RecentSearchEntry)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind.is_song())
+            .collect()
+    }
+
+    /// Returns `(store_index, entry)` for all clicked Podcast entries in most-recent-first order.
+    pub fn podcast_entries_indexed(&self) -> Vec<(usize, &RecentSearchEntry)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind.is_podcast())
+            .collect()
     }
 
     #[inline]
@@ -1454,6 +1650,9 @@ impl RecentSearchStore {
     }
 
     pub fn record_entry(&mut self, mut entry: RecentSearchEntry) -> bool {
+        if !entry.kind.is_real_clicked_item() {
+            return false;
+        }
         let trimmed_label = entry.label.trim().to_string();
         if trimmed_label.is_empty() {
             return false;
@@ -1466,6 +1665,19 @@ impl RecentSearchStore {
             trimmed_query
         };
 
+        // Preserve existing cover_art_url if the re-selected entry didn't have one yet.
+        let prev_art = self
+            .entries
+            .iter()
+            .find(|existing| {
+                existing.kind.badge_label() == entry.kind.badge_label()
+                    && existing.label.eq_ignore_ascii_case(&entry.label)
+            })
+            .and_then(|existing| existing.cover_art_url.clone());
+        if entry.cover_art_url.is_none() {
+            entry.cover_art_url = prev_art;
+        }
+
         self.entries.retain(|existing| {
             !(existing.kind.badge_label() == entry.kind.badge_label()
                 && existing.label.eq_ignore_ascii_case(&entry.label))
@@ -1475,40 +1687,10 @@ impl RecentSearchStore {
         true
     }
 
-    /// Records a debounced search query while coalescing incremental typing prefixes
-    /// (e.g. `"ma"` -> `"mas"` -> `"mastodon"` updates the head entry in-place).
-    pub fn record_typing_query(&mut self, raw_query: &str) -> bool {
-        let query = raw_query.trim();
-        if query.chars().count() < 2 {
-            return false;
-        }
-
-        if let Some(first) = self.entries.first().cloned() {
-            if first.kind == RecentSearchKind::Query {
-                let prev_lower = first.label.to_lowercase();
-                let next_lower = query.to_lowercase();
-                if next_lower.starts_with(&prev_lower) || prev_lower.starts_with(&next_lower) {
-                    if next_lower.chars().count() >= prev_lower.chars().count() {
-                        // Replace the head prefix entry and deduplicate any older matching entry later in the list.
-                        self.entries.remove(0);
-                        return self.record_entry(RecentSearchEntry {
-                            label: query.to_string(),
-                            subtitle: first.subtitle,
-                            query: query.to_string(),
-                            kind: RecentSearchKind::Query,
-                        });
-                    }
-                    return false;
-                }
-            }
-        }
-
-        self.record_entry(RecentSearchEntry {
-            label: query.to_string(),
-            subtitle: "Search query".to_string(),
-            query: query.to_string(),
-            kind: RecentSearchKind::Query,
-        })
+    /// Raw search query strings are never stored in `RecentSearchStore`; only real clicked
+    /// Artists, Songs, and Podcasts are recorded (`INV-R4`).
+    pub fn record_typing_query(&mut self, _raw_query: &str) -> bool {
+        false
     }
 
     pub fn remove_at(&mut self, idx: usize) -> Option<RecentSearchEntry> {
@@ -1521,6 +1703,30 @@ impl RecentSearchStore {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// Sets `cover_art_url` on a matching `(badge_label, label)` entry if not already present.
+    pub fn set_cover_art_url(
+        &mut self,
+        badge_label: &str,
+        label: &str,
+        cover_art_url: String,
+    ) -> bool {
+        let trimmed = cover_art_url.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let mut updated = false;
+        for entry in &mut self.entries {
+            if entry.kind.badge_label().eq_ignore_ascii_case(badge_label)
+                && entry.label.eq_ignore_ascii_case(label)
+                && entry.cover_art_url.as_deref() != Some(trimmed)
+            {
+                entry.cover_art_url = Some(trimmed.to_string());
+                updated = true;
+            }
+        }
+        updated
     }
 }
 
@@ -1571,8 +1777,221 @@ impl FormalInvariant for RecentSearchStore {
             }
         }
 
+        // INV-R4: Real clicked entities only (no raw search strings) & exact 3-list partition (Artists, Songs, Podcasts).
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if !entry.kind.is_real_clicked_item() {
+                return Err(InvariantViolation {
+                    code: "INV-R4",
+                    subsystem: "RecentSearchStore",
+                    details: format!(
+                        "entry[{idx}] is not a real clicked Artist, Song, or Podcast: {:?}",
+                        entry.kind
+                    ),
+                });
+            }
+            if entry.kind.is_song() {
+                if entry.kind.badge_label() != "SONG"
+                    || entry.kind.display_badge() != "▶ SONG"
+                    || entry.kind.is_artist()
+                    || entry.kind.is_podcast()
+                {
+                    return Err(InvariantViolation {
+                        code: "INV-R4",
+                        subsystem: "RecentSearchStore",
+                        details: format!(
+                            "entry[{idx}] is a song but has invalid badge denotation: {:?}",
+                            entry.kind
+                        ),
+                    });
+                }
+            } else if entry.kind.is_artist()
+                && (entry.kind.badge_label() != "ARTIST"
+                    || entry.kind.display_badge() != "★ ARTIST"
+                    || entry.kind.is_song()
+                    || entry.kind.is_podcast())
+            {
+                return Err(InvariantViolation {
+                    code: "INV-R4",
+                    subsystem: "RecentSearchStore",
+                    details: format!(
+                        "entry[{idx}] is an artist but has invalid badge denotation: {:?}",
+                        entry.kind
+                    ),
+                });
+            } else if entry.kind.is_podcast()
+                && (entry.kind.badge_label() != "PODCAST"
+                    || entry.kind.display_badge() != "PODCAST"
+                    || entry.kind.is_song()
+                    || entry.kind.is_artist())
+            {
+                return Err(InvariantViolation {
+                    code: "INV-R4",
+                    subsystem: "RecentSearchStore",
+                    details: format!(
+                        "entry[{idx}] is a podcast but has invalid badge denotation: {:?}",
+                        entry.kind
+                    ),
+                });
+            }
+        }
+
+        let partitioned_count = self.artist_entries_indexed().len()
+            + self.song_entries_indexed().len()
+            + self.podcast_entries_indexed().len();
+        if partitioned_count != self.entries.len() {
+            return Err(InvariantViolation {
+                code: "INV-R4",
+                subsystem: "RecentSearchStore",
+                details: format!(
+                    "3-list partition count ({partitioned_count}) != entries.len() ({})",
+                    self.entries.len()
+                ),
+            });
+        }
+
         Ok(())
     }
+}
+
+fn normalize_song_title_key(title: &str) -> String {
+    let trimmed = title.trim().to_lowercase();
+    let without_dash = trimmed
+        .split(" - ")
+        .next()
+        .unwrap_or(&trimmed)
+        .trim();
+    without_dash
+        .split(" (remaster")
+        .next()
+        .unwrap_or(without_dash)
+        .trim()
+        .to_string()
+}
+
+/// Pure, formally verified lookup of a song's index within its parent album's tracklist.
+///
+/// Formal Guarantees:
+/// - **INV-SONG-IDX-1 (Bounds Soundness)**: Whenever `Some(idx)` is returned, `idx < album_tracks.len()`.
+/// - **INV-SONG-IDX-2 (Exact ID/URI Priority)**: If any track in `album_tracks` matches `target_song.id`
+///   or `target_song.spotify_uri`, the first such index is returned before title matching.
+/// - **INV-SONG-IDX-3 (Title Fallback)**: If IDs differ (e.g. single vs album URI), matches by
+///   case-insensitive title or normalized remaster-stripped title.
+pub fn find_song_index_in_album_verified(
+    album_tracks: &[Track],
+    target_song: &Track,
+) -> Option<usize> {
+    if album_tracks.is_empty() {
+        return None;
+    }
+
+    let target_id = target_song.id.trim();
+    let target_uri = target_song.spotify_uri.trim();
+    if !target_id.is_empty() || !target_uri.is_empty() {
+        if let Some(idx) = album_tracks.iter().position(|t| {
+            (!target_id.is_empty() && t.id.trim().eq_ignore_ascii_case(target_id))
+                || (!target_uri.is_empty()
+                    && t.spotify_uri.trim().eq_ignore_ascii_case(target_uri))
+        }) {
+            return Some(idx);
+        }
+    }
+
+    let target_title = target_song.title.trim();
+    if !target_title.is_empty() {
+        if let Some(idx) = album_tracks
+            .iter()
+            .position(|t| t.title.trim().eq_ignore_ascii_case(target_title))
+        {
+            return Some(idx);
+        }
+
+        let norm_target = normalize_song_title_key(target_title);
+        if norm_target.len() >= 2 {
+            if let Some(idx) = album_tracks
+                .iter()
+                .position(|t| normalize_song_title_key(&t.title) == norm_target)
+            {
+                return Some(idx);
+            }
+        }
+    }
+
+    None
+}
+
+/// Builds a normalized `AlbumPlaybackQueue` and the exact `start_track_index` for `target_song`
+/// on its parent album so that selecting a song from Search or Search History behaves identically
+/// to opening the album that the song is on and selecting that song on the album (and playing
+/// the next song in the album afterward).
+///
+/// Formal Guarantees:
+/// - **INV-SONG-ALBUM-1 (Valid Start Index)**: `start_idx < queue.tracks.len()`.
+/// - **INV-SONG-ALBUM-2 (Selected Song Active)**: `queue.tracks[start_idx]` corresponds to `target_song`
+///   at its position on the album.
+/// - **INV-SONG-ALBUM-3 (Sequential Next Song in Album)**: If `start_idx + 1 < queue.tracks.len()`,
+///   activating the returned `(queue, start_idx)` and advancing via `NextTrack` or `EndOfTrack`
+///   (with `shuffle == false` and `repeat != RepeatMode::Track`) deterministically plays
+///   `queue.tracks[start_idx + 1]`.
+pub fn resolve_song_album_queue_verified(
+    album_uri: &str,
+    album_title: &str,
+    artist_name: &str,
+    mut album_tracks: Vec<Track>,
+    target_song: &Track,
+) -> Option<(AlbumPlaybackQueue, usize)> {
+    let resolved_title = if !album_title.trim().is_empty() {
+        album_title.trim().to_string()
+    } else if !target_song.album.trim().is_empty() {
+        target_song.album.trim().to_string()
+    } else {
+        target_song.title.trim().to_string()
+    };
+
+    let resolved_artist = if !artist_name.trim().is_empty() {
+        artist_name.trim().to_string()
+    } else if !target_song.artist.trim().is_empty() {
+        target_song.artist.trim().to_string()
+    } else {
+        "Artist".to_string()
+    };
+
+    let resolved_uri = if !album_uri.trim().is_empty() {
+        album_uri.trim().to_string()
+    } else {
+        format!("spotify:album:{resolved_title}")
+    };
+
+    if album_tracks.is_empty() {
+        album_tracks.push(target_song.clone());
+    }
+
+    let raw_idx = match find_song_index_in_album_verified(&album_tracks, target_song) {
+        Some(idx) => {
+            if album_tracks[idx].cover_art_url.is_none() && target_song.cover_art_url.is_some() {
+                album_tracks[idx].cover_art_url = target_song.cover_art_url.clone();
+            }
+            idx
+        }
+        None => {
+            let mut inserted = target_song.clone();
+            inserted.album = resolved_title.clone();
+            album_tracks.insert(0, inserted);
+            0
+        }
+    };
+
+    let target_after_insert = album_tracks[raw_idx].clone();
+    let normalized = normalize_album_playback_queue(AlbumPlaybackQueue {
+        album_uri: resolved_uri,
+        album_title: resolved_title,
+        artist_name: resolved_artist,
+        tracks: album_tracks,
+    })?;
+
+    let final_idx = find_song_index_in_album_verified(&normalized.tracks, &target_after_insert)
+        .unwrap_or_else(|| raw_idx.min(normalized.tracks.len().saturating_sub(1)));
+
+    Some((normalized, final_idx))
 }
 
 /// Pure decision model for resolving an unlinked Spotify track (with `0` direct audio files)

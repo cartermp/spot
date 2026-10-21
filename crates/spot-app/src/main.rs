@@ -205,6 +205,7 @@ impl NavRouteTarget for StageRoute {
 #[derive(Debug, Clone)]
 pub enum Message {
     AnimationTick,
+    ScrollActivity,
     SelectNav(NavSection),
     NavigateBack,
     NavigateForward,
@@ -303,6 +304,7 @@ pub struct SpotApp {
     artist_top_tracks_expanded: bool,
     show_bio_expanded: bool,
     show_track_details_banner: bool,
+    scroll_reveal_ticks: u8,
 }
 
 impl FormalInvariant for SpotApp {
@@ -399,7 +401,10 @@ impl SpotApp {
             artist_top_tracks_expanded: false,
             show_bio_expanded: false,
             show_track_details_banner: false,
+            scroll_reveal_ticks: 0,
         };
+        app.backfill_recent_search_artwork();
+        app.dispatch_missing_recent_artwork_hydration();
         debug_assert!(app.check_invariants().is_ok());
 
         let initial_artwork_tasks = app.spawn_missing_artwork_tasks();
@@ -566,13 +571,20 @@ impl SpotApp {
         }
     }
 
-    fn resolve_artist_label(&self, artist_id_or_name: &str) -> String {
+    fn resolve_artist_meta(
+        &self,
+        artist_id_or_name: &str,
+    ) -> (String, Option<String>, spot_core::ArtworkTheme) {
         if let Some(found) = self.search_artists.iter().find(|a| {
             a.spotify_uri.eq_ignore_ascii_case(artist_id_or_name)
                 || a.id.eq_ignore_ascii_case(artist_id_or_name)
                 || a.name.eq_ignore_ascii_case(artist_id_or_name)
         }) {
-            return found.name.clone();
+            return (
+                found.name.clone(),
+                found.portrait_url.clone(),
+                found.artwork_theme,
+            );
         }
         if let Some(detail) = &self.selected_artist {
             if detail
@@ -582,7 +594,11 @@ impl SpotApp {
                 || detail.artist.id.eq_ignore_ascii_case(artist_id_or_name)
                 || detail.artist.name.eq_ignore_ascii_case(artist_id_or_name)
             {
-                return detail.artist.name.clone();
+                return (
+                    detail.artist.name.clone(),
+                    detail.artist.portrait_url.clone(),
+                    detail.artist.artwork_theme,
+                );
             }
         }
         if let Some(alb) = &self.selected_album {
@@ -590,15 +606,36 @@ impl SpotApp {
                 .artist_uri
                 .as_deref()
                 .is_some_and(|u| u.eq_ignore_ascii_case(artist_id_or_name))
+                || alb.album.artist_name.eq_ignore_ascii_case(artist_id_or_name)
             {
-                return alb.album.artist_name.clone();
+                return (
+                    alb.album.artist_name.clone(),
+                    alb.album.cover_art_url.clone(),
+                    alb.album.artwork_theme,
+                );
             }
         }
-        if artist_id_or_name.starts_with("spotify:artist:") {
+        if let Some(item) = self.recently_listened.entries().iter().find(|it| {
+            it.kind
+                .creator_name()
+                .eq_ignore_ascii_case(artist_id_or_name)
+        }) {
+            return (
+                item.kind.creator_name().to_string(),
+                item.cover_art_url.clone(),
+                item.artwork_theme,
+            );
+        }
+        let label = if artist_id_or_name.starts_with("spotify:artist:") {
             "Artist".to_string()
         } else {
             artist_id_or_name.to_string()
-        }
+        };
+        (
+            label,
+            None,
+            spot_core::ArtworkTheme::SunriseMountainLake,
+        )
     }
 
     fn resolve_album_meta(
@@ -663,6 +700,164 @@ impl SpotApp {
                 Some(self.state.current_track.artist.clone()),
                 None,
             )
+        }
+    }
+
+    fn resolve_song_album_target(
+        &self,
+        track: &Track,
+        explicit_album_uri: Option<&str>,
+    ) -> (String, String, String, Option<String>) {
+        let fallback_title = if !track.album.trim().is_empty() {
+            track.album.trim().to_string()
+        } else {
+            track.title.trim().to_string()
+        };
+        let fallback_artist = if !track.artist.trim().is_empty() {
+            track.artist.trim().to_string()
+        } else {
+            "Artist".to_string()
+        };
+        let mut artist_uri = self
+            .search_artists
+            .iter()
+            .find(|ar| ar.name.eq_ignore_ascii_case(&fallback_artist))
+            .map(|ar| ar.spotify_uri.clone())
+            .or_else(|| {
+                self.selected_artist.as_ref().and_then(|ad| {
+                    if ad.artist.name.eq_ignore_ascii_case(&fallback_artist) {
+                        Some(ad.artist.spotify_uri.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        if let Some(detail) = &self.selected_album {
+            if detail.album.title.eq_ignore_ascii_case(&fallback_title)
+                || explicit_album_uri
+                    .is_some_and(|u| detail.album.spotify_uri.eq_ignore_ascii_case(u))
+            {
+                return (
+                    detail.album.spotify_uri.clone(),
+                    detail.album.title.clone(),
+                    detail.album.artist_name.clone(),
+                    detail.artist_uri.clone().or(artist_uri),
+                );
+            }
+        }
+
+        if let Some(alb) = self.search_albums.iter().find(|a| {
+            a.title.eq_ignore_ascii_case(&fallback_title)
+                || explicit_album_uri.is_some_and(|u| a.spotify_uri.eq_ignore_ascii_case(u))
+        }) {
+            return (
+                alb.spotify_uri.clone(),
+                alb.title.clone(),
+                alb.artist_name.clone(),
+                artist_uri,
+            );
+        }
+
+        if let Some(artist_detail) = &self.selected_artist {
+            if let Some(alb) = artist_detail.albums.iter().find(|a| {
+                a.title.eq_ignore_ascii_case(&fallback_title)
+                    || explicit_album_uri.is_some_and(|u| a.spotify_uri.eq_ignore_ascii_case(u))
+            }) {
+                if artist_uri.is_none() {
+                    artist_uri = Some(artist_detail.artist.spotify_uri.clone());
+                }
+                return (
+                    alb.spotify_uri.clone(),
+                    alb.title.clone(),
+                    alb.artist_name.clone(),
+                    artist_uri,
+                );
+            }
+        }
+
+        if let Some(item) = self.recently_listened.entries().iter().find(|it| {
+            matches!(&it.kind, RecentListenedKind::Album { album_uri, .. }
+                if it.title.eq_ignore_ascii_case(&fallback_title)
+                    || explicit_album_uri.is_some_and(|u| album_uri.eq_ignore_ascii_case(u)))
+        }) {
+            return (
+                item.kind.target_uri().to_string(),
+                item.title.clone(),
+                item.kind.creator_name().to_string(),
+                artist_uri,
+            );
+        }
+
+        let resolved_uri = explicit_album_uri
+            .filter(|u| !u.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| fallback_title.clone());
+        (resolved_uri, fallback_title, fallback_artist, artist_uri)
+    }
+
+    fn resolve_recent_song_track(
+        &self,
+        title: &str,
+        uri: &str,
+        artist_name: &str,
+        album_title: &str,
+    ) -> Track {
+        let matches_song = |t: &Track| -> bool {
+            (!uri.trim().is_empty()
+                && (t.spotify_uri.eq_ignore_ascii_case(uri) || t.id.eq_ignore_ascii_case(uri)))
+                || (t.title.eq_ignore_ascii_case(title)
+                    && (artist_name.trim().is_empty()
+                        || t.artist.eq_ignore_ascii_case(artist_name)))
+        };
+
+        if let Some(found) = self.search_results.iter().find(|t| matches_song(t)) {
+            return found.clone();
+        }
+        if let Some(detail) = &self.selected_album {
+            if let Some(found) = detail.tracks.iter().find(|t| matches_song(t)) {
+                return found.clone();
+            }
+        }
+        if let Some(artist_detail) = &self.selected_artist {
+            if let Some(found) = artist_detail.top_tracks.iter().find(|t| matches_song(t)) {
+                return found.clone();
+            }
+        }
+        if let Some(found) = self.state.queue.iter().find(|t| matches_song(t)) {
+            return found.clone();
+        }
+
+        let clean_uri = if uri.trim().is_empty() {
+            format!("spotify:track:{}", title.trim())
+        } else {
+            uri.trim().to_string()
+        };
+        let clean_id = clean_uri
+            .strip_prefix("spotify:track:")
+            .unwrap_or(&clean_uri)
+            .to_string();
+        let clean_album = if !album_title.trim().is_empty() {
+            album_title.trim().to_string()
+        } else {
+            title.trim().to_string()
+        };
+        let clean_artist = if !artist_name.trim().is_empty() {
+            artist_name.trim().to_string()
+        } else {
+            "Artist".to_string()
+        };
+
+        Track {
+            id: clean_id,
+            spotify_uri: clean_uri,
+            title: title.trim().to_string(),
+            artist: clean_artist,
+            album: clean_album,
+            duration_secs: 210,
+            liked: false,
+            cover_art_url: None,
+            artwork_theme: spot_core::ArtworkTheme::SunriseMountainLake,
         }
     }
 
@@ -749,15 +944,179 @@ impl SpotApp {
 
     fn record_recent_search_entry(&mut self, entry: RecentSearchEntry) {
         if self.recent_searches.record_entry(entry) {
+            self.backfill_recent_search_artwork();
             debug_assert!(self.recent_searches.check_invariants().is_ok());
             save_recent_searches(self.recent_searches.entries());
         }
     }
 
-    fn record_recent_query_from_search(&mut self, query: &str) {
-        if self.recent_searches.record_typing_query(query) {
-            debug_assert!(self.recent_searches.check_invariants().is_ok());
+    fn backfill_recent_search_artwork(&mut self) -> bool {
+        let mut candidates: Vec<(String, String, String)> = Vec::new();
+        for entry in self.recent_searches.entries() {
+            if entry.cover_art_url.is_some() {
+                continue;
+            }
+            let badge = entry.kind.badge_label().to_string();
+            let resolved = match &entry.kind {
+                RecentSearchKind::Artist { uri } => self
+                    .search_artists
+                    .iter()
+                    .find(|a| {
+                        a.spotify_uri.eq_ignore_ascii_case(uri)
+                            || a.name.eq_ignore_ascii_case(&entry.label)
+                    })
+                    .and_then(|a| a.portrait_url.clone())
+                    .or_else(|| {
+                        self.selected_artist.as_ref().and_then(|d| {
+                            if d.artist.spotify_uri.eq_ignore_ascii_case(uri)
+                                || d.artist.name.eq_ignore_ascii_case(&entry.label)
+                            {
+                                d.artist.portrait_url.clone().or_else(|| {
+                                    d.albums.iter().find_map(|alb| alb.cover_art_url.clone())
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .or_else(|| {
+                        self.recently_listened
+                            .entries()
+                            .iter()
+                            .find(|it| {
+                                it.kind
+                                    .creator_name()
+                                    .eq_ignore_ascii_case(&entry.label)
+                            })
+                            .and_then(|it| it.cover_art_url.clone())
+                    }),
+                RecentSearchKind::Track {
+                    uri,
+                    artist_name,
+                    album_title,
+                    album_uri,
+                } => self
+                    .search_results
+                    .iter()
+                    .find(|t| {
+                        (!uri.is_empty() && t.spotify_uri.eq_ignore_ascii_case(uri))
+                            || t.title.eq_ignore_ascii_case(&entry.label)
+                    })
+                    .and_then(|t| t.cover_art_url.clone())
+                    .or_else(|| {
+                        self.selected_album.as_ref().and_then(|d| {
+                            if d.album.title.eq_ignore_ascii_case(album_title)
+                                || album_uri
+                                    .as_deref()
+                                    .is_some_and(|u| d.album.spotify_uri.eq_ignore_ascii_case(u))
+                            {
+                                d.album.cover_art_url.clone()
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .or_else(|| {
+                        self.search_albums
+                            .iter()
+                            .find(|a| {
+                                a.title.eq_ignore_ascii_case(album_title)
+                                    || album_uri
+                                        .as_deref()
+                                        .is_some_and(|u| a.spotify_uri.eq_ignore_ascii_case(u))
+                            })
+                            .and_then(|a| a.cover_art_url.clone())
+                    })
+                    .or_else(|| {
+                        self.recently_listened
+                            .entries()
+                            .iter()
+                            .find(|it| {
+                                it.title.eq_ignore_ascii_case(album_title)
+                                    || (!artist_name.is_empty()
+                                        && it
+                                            .kind
+                                            .creator_name()
+                                            .eq_ignore_ascii_case(artist_name))
+                            })
+                            .and_then(|it| it.cover_art_url.clone())
+                    }),
+                RecentSearchKind::Show { uri, .. } => self
+                    .search_shows
+                    .iter()
+                    .chain(self.podcast_directory.iter())
+                    .find(|s| {
+                        s.spotify_uri.eq_ignore_ascii_case(uri)
+                            || s.title.eq_ignore_ascii_case(&entry.label)
+                    })
+                    .and_then(|s| s.cover_art_url.clone())
+                    .or_else(|| {
+                        self.selected_show.as_ref().and_then(|d| {
+                            if d.show.spotify_uri.eq_ignore_ascii_case(uri)
+                                || d.show.title.eq_ignore_ascii_case(&entry.label)
+                            {
+                                d.show.cover_art_url.clone()
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .or_else(|| {
+                        self.recently_listened
+                            .entries()
+                            .iter()
+                            .find(|it| {
+                                it.title.eq_ignore_ascii_case(&entry.label)
+                                    || it.kind.target_uri().eq_ignore_ascii_case(uri)
+                            })
+                            .and_then(|it| it.cover_art_url.clone())
+                    }),
+                _ => None,
+            };
+            if let Some(url) = resolved {
+                candidates.push((badge, entry.label.clone(), url));
+            }
+        }
+
+        let mut changed = false;
+        for (badge, label, url) in candidates {
+            if self.recent_searches.set_cover_art_url(&badge, &label, url) {
+                changed = true;
+            }
+        }
+        if changed {
             save_recent_searches(self.recent_searches.entries());
+        }
+        changed
+    }
+
+    fn dispatch_missing_recent_artwork_hydration(&self) {
+        let missing: Vec<(String, String, String)> = self
+            .recent_searches
+            .entries()
+            .iter()
+            .filter(|e| e.cover_art_url.is_none())
+            .map(|e| {
+                let target = match &e.kind {
+                    RecentSearchKind::Artist { uri } => uri.clone(),
+                    RecentSearchKind::Track { album_uri, .. } => {
+                        album_uri.clone().unwrap_or_else(|| e.label.clone())
+                    }
+                    RecentSearchKind::Show { uri, .. } => uri.clone(),
+                    _ => e.query.clone(),
+                };
+                (
+                    e.kind.badge_label().to_string(),
+                    e.label.clone(),
+                    target,
+                )
+            })
+            .collect();
+        if !missing.is_empty() {
+            let _ = self
+                .engine
+                .command_tx
+                .send(PlayerCommand::HydrateRecentArtwork(missing));
         }
     }
 
@@ -801,6 +1160,7 @@ impl SpotApp {
         match message {
             Message::AnimationTick => {
                 self.text_input_edited_this_event = false;
+                self.scroll_reveal_ticks = self.scroll_reveal_ticks.saturating_sub(1);
                 if !self.dock_icon_installed {
                     self.dock_icon_installed = app_icon::install_macos_dock_icon();
                 }
@@ -891,8 +1251,10 @@ impl SpotApp {
                             | EngineEvent::TrackChanged(_)
                             | EngineEvent::QueueUpdated(_)
                             | EngineEvent::SearchResults { .. }
+                            | EngineEvent::RecentArtworkHydrated(_)
                             | EngineEvent::ArtistDetailLoaded(_)
                             | EngineEvent::AlbumDetailLoaded(_)
+                            | EngineEvent::ShowDetailLoaded(_)
                     ) {
                         needs_art_scan = true;
                     }
@@ -1015,23 +1377,169 @@ impl SpotApp {
             }
             Message::PlaySpecificTrack(track) => {
                 tracing::info!(
-                    "[UI] PlaySpecificTrack: '{}' by '{}' ({})",
+                    "[UI] PlaySpecificTrack: '{}' by '{}' on album '{}' ({})",
                     track.title,
                     track.artist,
+                    track.album,
                     track.spotify_uri
                 );
+                let (album_uri, album_title, artist_name, artist_uri) =
+                    self.resolve_song_album_target(&track, None);
                 if matches!(self.current_route(), StageRoute::Section(NavSection::Search)) {
-                    self.record_recent_search_entry(RecentSearchEntry {
-                        label: track.title.clone(),
-                        subtitle: format!("Track · {}", track.artist),
-                        query: format!("{} {}", track.title, track.artist),
-                        kind: RecentSearchKind::Track {
-                            uri: track.spotify_uri.clone(),
-                            artist_name: track.artist.clone(),
-                        },
-                    });
+                    if track.spotify_uri.starts_with("spotify:episode:") {
+                        let (show_title, publisher, show_opt) =
+                            self.resolve_show_meta(&track.album);
+                        let show_uri = show_opt
+                            .as_ref()
+                            .map(|s| s.spotify_uri.clone())
+                            .unwrap_or_else(|| format!("spotify:show:{show_title}"));
+                        let cover = track
+                            .cover_art_url
+                            .clone()
+                            .or_else(|| show_opt.and_then(|s| s.cover_art_url));
+                        self.record_recent_search_entry(RecentSearchEntry::from_podcast(
+                            &show_title,
+                            &publisher,
+                            &show_uri,
+                            cover,
+                            track.artwork_theme,
+                        ));
+                    } else {
+                        let opt_uri = if album_uri.starts_with("spotify:album:") {
+                            Some(album_uri.clone())
+                        } else {
+                            None
+                        };
+                        let mut track_with_art = track.clone();
+                        if track_with_art.cover_art_url.is_none() {
+                            track_with_art.cover_art_url = self
+                                .search_albums
+                                .iter()
+                                .find(|a| {
+                                    a.title.eq_ignore_ascii_case(&album_title)
+                                        || a.spotify_uri.eq_ignore_ascii_case(&album_uri)
+                                })
+                                .and_then(|a| a.cover_art_url.clone())
+                                .or_else(|| {
+                                    self.selected_album
+                                        .as_ref()
+                                        .and_then(|d| d.album.cover_art_url.clone())
+                                });
+                        }
+                        self.record_recent_search_entry(RecentSearchEntry::from_song(
+                            &track_with_art,
+                            opt_uri,
+                        ));
+                    }
                 }
                 self.record_recently_listened_from_track(&track);
+
+                if !track.spotify_uri.starts_with("spotify:episode:") {
+                    let already_loaded_album =
+                        self.selected_album.clone().filter(|d| {
+                            !d.tracks.is_empty()
+                                && (d.album.spotify_uri.eq_ignore_ascii_case(&album_uri)
+                                    || d.album.title.eq_ignore_ascii_case(&album_title)
+                                    || d.tracks.iter().any(|t| {
+                                        t.id == track.id
+                                            || (!track.spotify_uri.is_empty()
+                                                && t.spotify_uri == track.spotify_uri)
+                                    }))
+                        });
+
+                    if let Some(mut detail) = already_loaded_album {
+                        if let Some((active_album, start_idx)) =
+                            spot_core::resolve_song_album_queue_verified(
+                                &detail.album.spotify_uri,
+                                &detail.album.title,
+                                &detail.album.artist_name,
+                                detail.tracks.clone(),
+                                &track,
+                            )
+                        {
+                            detail.tracks = active_album.tracks.clone();
+                            self.selected_album = Some(detail.clone());
+                            self.state.apply_verified_action(
+                                VerifiedTransportAction::ActivateAlbum {
+                                    album: active_album.clone(),
+                                    artist_uri: detail.artist_uri.clone(),
+                                    artist_albums: vec![active_album],
+                                    start_track_index: start_idx,
+                                    auto_play: true,
+                                },
+                            );
+                        } else {
+                            self.state
+                                .apply_verified_action(VerifiedTransportAction::PlayTrack(
+                                    track.clone(),
+                                ));
+                        }
+                    } else {
+                        // Pre-populate `selected_album` for the song's album and activate immediately;
+                        // when `AlbumDetailLoaded` arrives from the engine, the full album tracklist
+                        // and `start_idx` will be populated seamlessly.
+                        let mut detail = spot_spotify::web_api::fallback_album_detail(
+                            &album_title,
+                            if album_uri.starts_with("spotify:album:") {
+                                Some(album_uri.clone())
+                            } else {
+                                None
+                            },
+                        );
+                        detail.album.title = album_title.clone();
+                        detail.album.artist_name = artist_name.clone();
+                        if detail.album.cover_art_url.is_none() {
+                            detail.album.cover_art_url = track.cover_art_url.clone();
+                        }
+                        if artist_uri.is_some() {
+                            detail.artist_uri = artist_uri.clone();
+                        }
+                        if let Some((active_album, start_idx)) =
+                            spot_core::resolve_song_album_queue_verified(
+                                &detail.album.spotify_uri,
+                                &detail.album.title,
+                                &detail.album.artist_name,
+                                detail.tracks.clone(),
+                                &track,
+                            )
+                        {
+                            detail.tracks = active_album.tracks.clone();
+                            self.selected_album = Some(detail.clone());
+                            self.state.apply_verified_action(
+                                VerifiedTransportAction::ActivateAlbum {
+                                    album: active_album.clone(),
+                                    artist_uri: detail.artist_uri.clone(),
+                                    artist_albums: vec![active_album],
+                                    start_track_index: start_idx,
+                                    auto_play: true,
+                                },
+                            );
+                        } else {
+                            self.selected_album = Some(detail);
+                            self.state
+                                .apply_verified_action(VerifiedTransportAction::PlayTrack(
+                                    track.clone(),
+                                ));
+                        }
+                    }
+
+                    // Push the song's parent Album route before NowPlaying so navigating to a song
+                    // from Search or Search History behaves identically to opening its album and
+                    // selecting that song on the album.
+                    self.push_route(StageRoute::Album {
+                        id_or_uri: album_uri,
+                        label: album_title,
+                        artist_name: Some(artist_name),
+                        artist_uri,
+                    });
+                } else {
+                    self.state
+                        .apply_verified_action(VerifiedTransportAction::PlayTrack(track.clone()));
+                }
+
+                self.engine
+                    .audio_gate
+                    .flush_and_set_playing(self.state.is_playing);
                 let _ = self
                     .engine
                     .command_tx
@@ -1047,7 +1555,8 @@ impl SpotApp {
                 self.push_route(StageRoute::Section(NavSection::NowPlaying));
             }
             Message::OpenArtist(artist_id_or_name) => {
-                let label = self.resolve_artist_label(&artist_id_or_name);
+                let (label, portrait_url, artwork_theme) =
+                    self.resolve_artist_meta(&artist_id_or_name);
                 tracing::info!(
                     "[UI] OpenArtist('{artist_id_or_name}') -> label='{}'",
                     label
@@ -1055,14 +1564,12 @@ impl SpotApp {
                 if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
                     && label != "Artist"
                 {
-                    self.record_recent_search_entry(RecentSearchEntry {
-                        label: label.clone(),
-                        subtitle: "Artist".to_string(),
-                        query: label.clone(),
-                        kind: RecentSearchKind::Artist {
-                            uri: artist_id_or_name.clone(),
-                        },
-                    });
+                    self.record_recent_search_entry(RecentSearchEntry::from_artist(
+                        &label,
+                        &artist_id_or_name,
+                        portrait_url,
+                        artwork_theme,
+                    ));
                 }
                 self.artist_bio_expanded = false;
                 self.artist_top_tracks_expanded = false;
@@ -1106,22 +1613,6 @@ impl SpotApp {
                     label,
                     artist_name
                 );
-                if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
-                    && label != "Album"
-                {
-                    let artist_str = artist_name
-                        .clone()
-                        .unwrap_or_else(|| "Album".to_string());
-                    self.record_recent_search_entry(RecentSearchEntry {
-                        label: label.clone(),
-                        subtitle: format!("Album · {artist_str}"),
-                        query: label.clone(),
-                        kind: RecentSearchKind::Album {
-                            uri: album_uri.clone(),
-                            artist_name: artist_str,
-                        },
-                    });
-                }
                 let already_same = self.selected_album.as_ref().is_some_and(|d| {
                     d.album.spotify_uri.eq_ignore_ascii_case(&album_uri)
                         || d.album.id.eq_ignore_ascii_case(&album_uri)
@@ -1205,19 +1696,6 @@ impl SpotApp {
                 let artist_str = artist_name
                     .clone()
                     .unwrap_or_else(|| "Album".to_string());
-                if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
-                    && label != "Album"
-                {
-                    self.record_recent_search_entry(RecentSearchEntry {
-                        label: label.clone(),
-                        subtitle: format!("Album · {artist_str}"),
-                        query: label.clone(),
-                        kind: RecentSearchKind::Album {
-                            uri: album_uri.clone(),
-                            artist_name: artist_str.clone(),
-                        },
-                    });
-                }
                 if label != "Album" {
                     let cover = self
                         .selected_album
@@ -1362,15 +1840,18 @@ impl SpotApp {
                 if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
                     && label != "Podcast"
                 {
-                    self.record_recent_search_entry(RecentSearchEntry {
-                        label: label.clone(),
-                        subtitle: format!("Podcast · {publisher}"),
-                        query: label.clone(),
-                        kind: RecentSearchKind::Show {
-                            uri: show_uri.clone(),
-                            publisher: publisher.clone(),
-                        },
-                    });
+                    let cover = summary_opt.as_ref().and_then(|s| s.cover_art_url.clone());
+                    let theme = summary_opt
+                        .as_ref()
+                        .map(|s| s.artwork_theme)
+                        .unwrap_or(spot_core::ArtworkTheme::SunriseMountainLake);
+                    self.record_recent_search_entry(RecentSearchEntry::from_podcast(
+                        &label,
+                        &publisher,
+                        &show_uri,
+                        cover,
+                        theme,
+                    ));
                 }
                 let already_same = self.selected_show.as_ref().is_some_and(|d| {
                     !d.episodes.is_empty()
@@ -1401,25 +1882,23 @@ impl SpotApp {
             Message::PlayShow(show_uri) => {
                 let (label, publisher, summary_opt) = self.resolve_show_meta(&show_uri);
                 tracing::info!("[UI] PlayShow('{show_uri}') -> label='{label}'");
+                let cover = summary_opt.as_ref().and_then(|s| s.cover_art_url.clone());
+                let theme = summary_opt
+                    .as_ref()
+                    .map(|s| s.artwork_theme)
+                    .unwrap_or(spot_core::ArtworkTheme::SunriseMountainLake);
                 if matches!(self.current_route(), StageRoute::Section(NavSection::Search))
                     && label != "Podcast"
                 {
-                    self.record_recent_search_entry(RecentSearchEntry {
-                        label: label.clone(),
-                        subtitle: format!("Podcast · {publisher}"),
-                        query: label.clone(),
-                        kind: RecentSearchKind::Show {
-                            uri: show_uri.clone(),
-                            publisher: publisher.clone(),
-                        },
-                    });
+                    self.record_recent_search_entry(RecentSearchEntry::from_podcast(
+                        &label,
+                        &publisher,
+                        &show_uri,
+                        cover.clone(),
+                        theme,
+                    ));
                 }
                 if label != "Podcast" {
-                    let cover = summary_opt.as_ref().and_then(|s| s.cover_art_url.clone());
-                    let theme = summary_opt
-                        .as_ref()
-                        .map(|s| s.artwork_theme)
-                        .unwrap_or(spot_core::ArtworkTheme::SunriseMountainLake);
                     self.record_recently_listened(RecentListenedItem {
                         title: label,
                         subtitle: format!("Podcast · {publisher}"),
@@ -1493,22 +1972,24 @@ impl SpotApp {
                     track.title,
                     track.spotify_uri
                 );
+                let (_, publisher, show_opt) = self.resolve_show_meta(&episode.show_uri);
+                let cover = episode
+                    .cover_art_url
+                    .clone()
+                    .or_else(|| show_opt.and_then(|s| s.cover_art_url));
                 if matches!(self.current_route(), StageRoute::Section(NavSection::Search)) {
-                    self.record_recent_search_entry(RecentSearchEntry {
-                        label: episode.show_title.clone(),
-                        subtitle: format!("Podcast · {}", episode.title),
-                        query: episode.show_title.clone(),
-                        kind: RecentSearchKind::Show {
-                            uri: episode.show_uri.clone(),
-                            publisher: episode.show_title.clone(),
-                        },
-                    });
+                    self.record_recent_search_entry(RecentSearchEntry::from_podcast(
+                        &episode.show_title,
+                        &publisher,
+                        &episode.show_uri,
+                        cover.clone(),
+                        episode.artwork_theme,
+                    ));
                 }
-                let (_, publisher, _) = self.resolve_show_meta(&episode.show_uri);
                 self.record_recently_listened(RecentListenedItem {
                     title: episode.show_title.clone(),
                     subtitle: format!("Podcast · {publisher}"),
-                    cover_art_url: episode.cover_art_url.clone(),
+                    cover_art_url: cover,
                     artwork_theme: episode.artwork_theme,
                     kind: RecentListenedKind::Podcast {
                         show_uri: episode.show_uri.clone(),
@@ -1711,12 +2192,6 @@ impl SpotApp {
                 let trimmed = self.search_query.trim().to_string();
                 if !trimmed.is_empty() {
                     tracing::info!("[UI] SubmitSearch -> '{trimmed}'");
-                    self.record_recent_search_entry(RecentSearchEntry {
-                        label: trimmed.clone(),
-                        subtitle: "Search".to_string(),
-                        query: trimmed.clone(),
-                        kind: RecentSearchKind::Query,
-                    });
                     let _ = self
                         .engine
                         .command_tx
@@ -1745,19 +2220,35 @@ impl SpotApp {
                     );
                     self.record_recent_search_entry(entry.clone());
                     match entry.kind {
-                        RecentSearchKind::Query | RecentSearchKind::Track { .. } => {
-                            self.search_query = entry.query.clone();
-                            let _ = self
-                                .engine
-                                .command_tx
-                                .send(PlayerCommand::SearchCatalog(entry.query));
+                        RecentSearchKind::Query => {}
+                        RecentSearchKind::Track {
+                            uri,
+                            artist_name,
+                            album_title,
+                            album_uri,
+                        } => {
+                            let mut track = self.resolve_recent_song_track(
+                                &entry.label,
+                                &uri,
+                                &artist_name,
+                                &album_title,
+                            );
+                            if track.cover_art_url.is_none() {
+                                track.cover_art_url = entry.cover_art_url.clone();
+                            }
+                            if let Some(alb_u) = album_uri.as_deref() {
+                                if track.album.trim().is_empty()
+                                    || track.album.eq_ignore_ascii_case(&entry.label)
+                                {
+                                    let (resolved_title, _, _) = self.resolve_album_meta(alb_u);
+                                    if resolved_title != "Album" {
+                                        track.album = resolved_title;
+                                    }
+                                }
+                            }
+                            return self.update(Message::PlaySpecificTrack(track));
                         }
                         RecentSearchKind::Artist { uri } => {
-                            self.search_query = entry.query.clone();
-                            let _ = self
-                                .engine
-                                .command_tx
-                                .send(PlayerCommand::SearchCatalog(entry.query));
                             return self.update(Message::OpenArtist(uri));
                         }
                         RecentSearchKind::Album { uri, .. } => {
@@ -1932,6 +2423,9 @@ impl SpotApp {
                     }
                 }
             }
+            Message::ScrollActivity => {
+                self.scroll_reveal_ticks = 42;
+            }
             Message::ArtworkLoaded(Some((url, decoded))) => {
                 tracing::info!("[UI] ArtworkLoaded -> cached texture for {}", url);
                 self.artwork.insert_remote(url, decoded);
@@ -1940,6 +2434,26 @@ impl SpotApp {
         }
         self.sync_tray();
         Task::none()
+    }
+
+    fn scroll_reveal_alpha(&self) -> f32 {
+        if self.scroll_reveal_ticks == 0 {
+            0.0
+        } else if self.scroll_reveal_ticks >= 18 {
+            1.0
+        } else {
+            (self.scroll_reveal_ticks as f32) / 18.0
+        }
+    }
+
+    fn elegant_scrollable<'a>(
+        &self,
+        content: impl Into<Element<'a, Message>>,
+    ) -> iced::widget::scrollable::Scrollable<'a, Message> {
+        scrollable(content)
+            .direction(theme::elegant_scrollbar_direction())
+            .style(theme::elegant_scrollbar(self.scroll_reveal_alpha()))
+            .on_scroll(|_| Message::ScrollActivity)
     }
 
     fn sync_tray(&mut self) {
@@ -2000,6 +2514,11 @@ impl SpotApp {
         }
         for item in self.recently_listened.entries() {
             if let Some(u) = &item.cover_art_url {
+                urls.push(u.clone());
+            }
+        }
+        for entry in self.recent_searches.entries() {
+            if let Some(u) = &entry.cover_art_url {
                 urls.push(u.clone());
             }
         }
@@ -2116,7 +2635,17 @@ impl SpotApp {
             }
             EngineEvent::ConnectionUpdated(conn) => {
                 tracing::info!("[UI] EngineEvent::ConnectionUpdated -> {:?}", conn);
+                let became_live = matches!(
+                    &conn,
+                    ConnectionStatus::Connected {
+                        live_session: true,
+                        ..
+                    }
+                );
                 self.state.connection = conn;
+                if became_live {
+                    self.dispatch_missing_recent_artwork_hydration();
+                }
             }
             EngineEvent::SearchResults {
                 query,
@@ -2135,20 +2664,23 @@ impl SpotApp {
                     episodes.len(),
                     tracks.len()
                 );
-                if query.trim().len() >= 2
-                    && (!artists.is_empty()
-                        || !albums.is_empty()
-                        || !shows.is_empty()
-                        || !episodes.is_empty()
-                        || !tracks.is_empty())
-                {
-                    self.record_recent_query_from_search(&query);
-                }
                 self.search_artists = artists;
                 self.search_albums = albums;
                 self.search_shows = shows;
                 self.search_episodes = episodes;
                 self.search_results = tracks;
+                self.backfill_recent_search_artwork();
+            }
+            EngineEvent::RecentArtworkHydrated(hydrated) => {
+                let mut changed = false;
+                for (badge, label, url) in hydrated {
+                    if self.recent_searches.set_cover_art_url(&badge, &label, url) {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    save_recent_searches(self.recent_searches.entries());
+                }
             }
             EngineEvent::ArtistDetailLoaded(detail) => {
                 tracing::info!(
@@ -2166,6 +2698,7 @@ impl SpotApp {
                     *id_or_uri = loaded_uri;
                     *label = loaded_name;
                 }
+                self.backfill_recent_search_artwork();
             }
             EngineEvent::AlbumDetailLoaded(detail) => {
                 tracing::info!(
@@ -2178,7 +2711,7 @@ impl SpotApp {
                 let loaded_uri = detail.album.spotify_uri.clone();
                 let loaded_artist_name = detail.album.artist_name.clone();
                 let loaded_artist_uri = detail.artist_uri.clone();
-                if self.state.is_playing
+                let is_playing_this_album = self.state.is_playing
                     && (self
                         .state
                         .current_track
@@ -2187,8 +2720,8 @@ impl SpotApp {
                         || detail
                             .tracks
                             .iter()
-                            .any(|t| t.spotify_uri == self.state.current_track.spotify_uri))
-                {
+                            .any(|t| t.spotify_uri == self.state.current_track.spotify_uri));
+                if is_playing_this_album {
                     self.record_recently_listened(RecentListenedItem {
                         title: detail.album.title.clone(),
                         subtitle: format!(
@@ -2202,6 +2735,30 @@ impl SpotApp {
                             artist_name: detail.album.artist_name.clone(),
                         },
                     });
+
+                    // If UI state was initialized with a 1-track stub before the full album tracklist
+                    // finished loading, immediately hydrate the album queue at the active song index.
+                    if self.state.queue.len() <= 1 && !detail.tracks.is_empty() {
+                        if let Some((active_album, start_idx)) =
+                            spot_core::resolve_song_album_queue_verified(
+                                &detail.album.spotify_uri,
+                                &detail.album.title,
+                                &detail.album.artist_name,
+                                detail.tracks.clone(),
+                                &self.state.current_track.clone(),
+                            )
+                        {
+                            self.state.apply_verified_action(
+                                VerifiedTransportAction::ActivateAlbum {
+                                    album: active_album.clone(),
+                                    artist_uri: detail.artist_uri.clone(),
+                                    artist_albums: vec![active_album],
+                                    start_track_index: start_idx,
+                                    auto_play: true,
+                                },
+                            );
+                        }
+                    }
                 }
                 self.selected_album = Some(*detail);
                 if let StageRoute::Album {
@@ -2217,7 +2774,21 @@ impl SpotApp {
                     if loaded_artist_uri.is_some() {
                         *artist_uri = loaded_artist_uri;
                     }
+                } else if let Some(StageRoute::Album {
+                    id_or_uri,
+                    label,
+                    artist_name,
+                    artist_uri,
+                }) = self.nav_history.previous_entry_mut()
+                {
+                    *id_or_uri = loaded_uri;
+                    *label = loaded_title;
+                    *artist_name = Some(loaded_artist_name);
+                    if loaded_artist_uri.is_some() {
+                        *artist_uri = loaded_artist_uri;
+                    }
                 }
+                self.backfill_recent_search_artwork();
             }
             EngineEvent::ShowDetailLoaded(detail) => {
                 tracing::info!(
@@ -2256,6 +2827,7 @@ impl SpotApp {
                     *id_or_uri = loaded_uri;
                     *label = loaded_title;
                 }
+                self.backfill_recent_search_artwork();
             }
         }
         self.engine.audio_gate.set_playing(self.state.is_playing);
@@ -2381,7 +2953,7 @@ impl SpotApp {
             );
         }
 
-        let playlists_scroll = scrollable(playlist_col).height(Length::Fill);
+        let playlists_scroll = self.elegant_scrollable(playlist_col).height(Length::Fill);
 
         let conn_label = self.state.connection.display_label();
         let is_live = self.state.connection.is_live_session();
@@ -2719,6 +3291,28 @@ impl SpotApp {
                     .style(theme::nav_pill_button(false)),
                 );
             }
+            StageRoute::Section(NavSection::NowPlaying) => {
+                if self.can_go_back() {
+                    let prev_label = self
+                        .nav_history
+                        .previous_entry()
+                        .map(|r| truncate_nav_label(r.label(), 24))
+                        .unwrap_or_else(|| "Back".to_string());
+                    nav_row = nav_row.push(
+                        button(
+                            row![
+                                text("←").size(13).color(palette::EMERALD),
+                                text(prev_label).size(12.5).color(palette::INK_PRIMARY),
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        )
+                        .on_press(Message::NavigateBack)
+                        .padding(Padding::from([6, 12]))
+                        .style(theme::nav_pill_button(false)),
+                    );
+                }
+            }
             StageRoute::Section(_) => {}
         }
 
@@ -3005,7 +3599,12 @@ impl SpotApp {
             .align_y(Alignment::Center)
             .width(Length::Fixed(450.0));
 
+        let top_nav_row = row![self.view_navigation_bar(), horizontal_space()]
+            .width(Length::Fill)
+            .align_y(Alignment::Center);
+
         let stage_column = column![
+            top_nav_row,
             vertical_space(),
             hero_art,
             vertical_space().height(Length::Fixed(18.0)),
@@ -3110,6 +3709,97 @@ impl SpotApp {
         }
     }
 
+    fn view_recent_search_entry_card<'a>(
+        &'a self,
+        idx: usize,
+        entry: &'a RecentSearchEntry,
+    ) -> Element<'a, Message> {
+        let is_song = entry.kind.is_song();
+        let is_artist = entry.kind.is_artist();
+        let (badge_fg, badge_bg) = if is_song {
+            (palette::SONG_ACCENT, palette::SONG_BADGE_BG)
+        } else if is_artist {
+            (palette::EMERALD, palette::ARTIST_BADGE_BG)
+        } else {
+            (palette::PODCAST_ACCENT, palette::PODCAST_BADGE_BG)
+        };
+
+        let badge_pill = container(text(entry.kind.display_badge()).size(9.5).color(badge_fg))
+            .padding(Padding::from([2, 7]))
+            .style(move |_| container::Style {
+                background: Some(iced::Background::Color(badge_bg)),
+                border: iced::Border {
+                    radius: 5.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        let title_text = if is_artist {
+            text(truncate_nav_label(&entry.label, 54))
+                .font(SERIF_FONT)
+                .size(16.0)
+                .color(palette::INK_PRIMARY)
+        } else {
+            text(truncate_nav_label(&entry.label, 54))
+                .size(14.0)
+                .color(palette::INK_PRIMARY)
+        };
+
+        let subtitle_text = text(truncate_nav_label(&entry.subtitle, 72))
+            .size(11.5)
+            .color(palette::INK_SECONDARY);
+
+        let thumb = image(
+            self.artwork
+                .thumb_or_url(entry.cover_art_url.as_deref(), entry.artwork_theme),
+        )
+        .width(Length::Fixed(44.0))
+        .height(Length::Fixed(44.0));
+
+        let chip_style: fn(&iced::Theme) -> container::Style = if is_song {
+            theme::recent_search_song_chip_card
+        } else if is_artist {
+            theme::recent_search_artist_chip_card
+        } else {
+            theme::recent_search_podcast_chip_card
+        };
+
+        container(
+            row![
+                button(
+                    row![
+                        thumb,
+                        column![
+                            row![badge_pill, title_text]
+                                .spacing(8)
+                                .align_y(Alignment::Center),
+                            subtitle_text,
+                        ]
+                        .spacing(3)
+                        .width(Length::Fill),
+                        text(entry.kind.action_hint()).size(11.5).color(badge_fg),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::SelectRecentSearch(idx))
+                .width(Length::Fill)
+                .padding(Padding::from([7, 10]))
+                .style(theme::subtle_row_button(false)),
+                button(text("×").size(14.0).color(palette::INK_MUTED))
+                    .on_press(Message::RemoveRecentSearch(idx))
+                    .padding(Padding::from([6, 10]))
+                    .style(theme::subtle_row_button(false)),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .style(chip_style)
+        .into()
+    }
+
     fn view_search_stage(&self) -> Element<'_, Message> {
         let header = row![
             text("Search & Discover")
@@ -3121,7 +3811,7 @@ impl SpotApp {
         .align_y(Alignment::Center);
 
         let input = text_input(
-            "Search artists, albums, podcasts, or tracks on Spotify...",
+            "Search songs, artists, or podcasts on Spotify...",
             &self.search_query,
         )
         .id(search_input_id())
@@ -3141,14 +3831,424 @@ impl SpotApp {
             );
         }
 
-        let mut content_col = column![].spacing(18);
+        let has_live_search = !self.search_query.trim().is_empty()
+            && (!self.search_artists.is_empty()
+                || !self.search_results.is_empty()
+                || !self.search_shows.is_empty()
+                || !self.search_episodes.is_empty());
 
-        // 0. Recently Searched section (persisted across sessions)
-        if !self.recent_searches.is_empty() {
+        let has_recents = !self.recent_searches.is_empty();
+
+        // 1. Live Search Results stacked vertically in 3 independently scrollable lists:
+        //    (1) Artists first, (2) Songs second, (3) Podcasts third.
+        let live_results_block: Option<Element<'_, Message>> = if has_live_search {
+            // Section 1: Artists (scrollable)
+            let artists_card: Element<'_, Message> = if self.search_artists.is_empty() {
+                container(
+                    row![
+                        text("Artists")
+                            .font(SERIF_FONT)
+                            .size(18)
+                            .color(palette::INK_PRIMARY),
+                        text("No matching artists")
+                            .size(12.0)
+                            .color(palette::INK_MUTED),
+                        horizontal_space(),
+                        text("0").size(11.5).color(palette::INK_MUTED),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .height(Length::Shrink)
+                .padding(Padding::from([8, 14]))
+                .style(theme::search_group_column_card)
+                .into()
+            } else {
+                let mut artists_list = column![].spacing(6);
+                for artist in &self.search_artists {
+                    let portrait = image(
+                        self.artwork
+                            .thumb_or_url(artist.portrait_url.as_deref(), artist.artwork_theme),
+                    )
+                    .width(Length::Fixed(44.0))
+                    .height(Length::Fixed(44.0));
+
+                    let artist_badge =
+                        container(text("★ ARTIST").size(9.5).color(palette::EMERALD))
+                            .padding(Padding::from([2, 7]))
+                            .style(|_| container::Style {
+                                background: Some(iced::Background::Color(palette::ARTIST_BADGE_BG)),
+                                border: iced::Border {
+                                    radius: 5.0.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            });
+
+                    let card = button(
+                        row![
+                            portrait,
+                            column![
+                                row![
+                                    artist_badge,
+                                    text(truncate_nav_label(&artist.name, 54))
+                                        .font(SERIF_FONT)
+                                        .size(16.0)
+                                        .color(palette::INK_PRIMARY),
+                                ]
+                                .spacing(8)
+                                .align_y(Alignment::Center),
+                                text(truncate_nav_label(&artist.subtitle(), 72))
+                                    .size(11.5)
+                                    .color(palette::INK_SECONDARY),
+                            ]
+                            .spacing(3)
+                            .width(Length::Fill),
+                            text("Albums ›").size(11.5).color(palette::EMERALD),
+                        ]
+                        .spacing(12)
+                        .align_y(Alignment::Center),
+                    )
+                    .on_press(Message::OpenArtist(artist.spotify_uri.clone()))
+                    .width(Length::Fill)
+                    .padding(Padding::from([7, 10]))
+                    .style(theme::subtle_row_button(false));
+
+                    artists_list = artists_list.push(card);
+                }
+
+                container(
+                    column![
+                        row![
+                            text("Artists")
+                                .font(SERIF_FONT)
+                                .size(19)
+                                .color(palette::INK_PRIMARY),
+                            horizontal_space(),
+                            text(format!("{}", self.search_artists.len()))
+                                .size(11.5)
+                                .color(palette::EMERALD),
+                        ]
+                        .align_y(Alignment::Center),
+                        self.elegant_scrollable(artists_list).height(Length::Fill),
+                    ]
+                    .spacing(7)
+                    .height(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::FillPortion(1))
+                .padding(Padding::from([10, 14]))
+                .style(theme::search_group_column_card)
+                .into()
+            };
+
+            // Section 2: Songs (scrollable)
+            let songs_card: Element<'_, Message> = if self.search_results.is_empty() {
+                container(
+                    row![
+                        text("Songs")
+                            .font(SERIF_FONT)
+                            .size(18)
+                            .color(palette::INK_PRIMARY),
+                        text("No matching songs")
+                            .size(12.0)
+                            .color(palette::INK_MUTED),
+                        horizontal_space(),
+                        text("0").size(11.5).color(palette::INK_MUTED),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .height(Length::Shrink)
+                .padding(Padding::from([8, 14]))
+                .style(theme::search_group_column_card)
+                .into()
+            } else {
+                let mut songs_list = column![].spacing(6);
+                for track in &self.search_results {
+                    let is_current = track.id == self.state.current_track.id
+                        || (!track.spotify_uri.is_empty()
+                            && track.spotify_uri == self.state.current_track.spotify_uri);
+                    let (album_target_uri, _, _, _) = self.resolve_song_album_target(track, None);
+                    let song_badge =
+                        container(text("▶ SONG").size(9.5).color(palette::SONG_ACCENT))
+                            .padding(Padding::from([2, 7]))
+                            .style(|_| container::Style {
+                                background: Some(iced::Background::Color(palette::SONG_BADGE_BG)),
+                                border: iced::Border {
+                                    radius: 5.0.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            });
+
+                    let row_item = row![
+                        button(
+                            row![
+                                image(self.artwork.thumb_or_url(
+                                    track.cover_art_url.as_deref(),
+                                    track.artwork_theme
+                                ))
+                                .width(Length::Fixed(44.0))
+                                .height(Length::Fixed(44.0)),
+                                column![
+                                    row![
+                                        song_badge,
+                                        text(truncate_nav_label(&track.title, 52))
+                                            .size(14.0)
+                                            .color(palette::INK_PRIMARY),
+                                    ]
+                                    .spacing(8)
+                                    .align_y(Alignment::Center),
+                                    text(truncate_nav_label(
+                                        &format!("Song · {} • {}", track.artist, track.album),
+                                        72
+                                    ))
+                                    .size(11.5)
+                                    .color(palette::INK_SECONDARY),
+                                ]
+                                .spacing(3)
+                                .width(Length::Fill),
+                                text("▶ On Album").size(11.5).color(palette::SONG_ACCENT),
+                                text(track.formatted_duration())
+                                    .size(12.0)
+                                    .color(palette::INK_MUTED),
+                            ]
+                            .spacing(12)
+                            .align_y(Alignment::Center),
+                        )
+                        .on_press(Message::PlaySpecificTrack(track.clone()))
+                        .width(Length::Fill)
+                        .padding(Padding::from([7, 10]))
+                        .style(theme::subtle_row_button(is_current)),
+                        button(text("Album ›").size(11.5).color(palette::INK_SECONDARY))
+                            .on_press(Message::OpenAlbum(album_target_uri))
+                            .padding(Padding::from([8, 10]))
+                            .style(theme::subtle_row_button(false)),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+
+                    songs_list = songs_list.push(row_item);
+                }
+
+                container(
+                    column![
+                        row![
+                            text("Songs")
+                                .font(SERIF_FONT)
+                                .size(19)
+                                .color(palette::INK_PRIMARY),
+                            horizontal_space(),
+                            text(format!("{}", self.search_results.len()))
+                                .size(11.5)
+                                .color(palette::SONG_ACCENT),
+                        ]
+                        .align_y(Alignment::Center),
+                        self.elegant_scrollable(songs_list).height(Length::Fill),
+                    ]
+                    .spacing(7)
+                    .height(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::FillPortion(1))
+                .padding(Padding::from([10, 14]))
+                .style(theme::search_group_column_card)
+                .into()
+            };
+
+            // Section 3: Podcasts (scrollable shows + episodes)
+            let podcast_total = self.search_shows.len() + self.search_episodes.len();
+            let podcasts_card: Element<'_, Message> = if podcast_total == 0 {
+                container(
+                    row![
+                        text("Podcasts")
+                            .font(SERIF_FONT)
+                            .size(18)
+                            .color(palette::INK_PRIMARY),
+                        text("No matching podcasts")
+                            .size(12.0)
+                            .color(palette::INK_MUTED),
+                        horizontal_space(),
+                        text("0").size(11.5).color(palette::INK_MUTED),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .height(Length::Shrink)
+                .padding(Padding::from([8, 14]))
+                .style(theme::search_group_column_card)
+                .into()
+            } else {
+                let mut podcasts_list = column![].spacing(6);
+                for show in &self.search_shows {
+                    let podcast_badge =
+                        container(text("PODCAST").size(9.5).color(palette::PODCAST_ACCENT))
+                            .padding(Padding::from([2, 7]))
+                            .style(|_| container::Style {
+                                background: Some(iced::Background::Color(
+                                    palette::PODCAST_BADGE_BG,
+                                )),
+                                border: iced::Border {
+                                    radius: 5.0.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            });
+
+                    let show_item = row![
+                        button(
+                            row![
+                                image(self.artwork.thumb_or_url(
+                                    show.cover_art_url.as_deref(),
+                                    show.artwork_theme
+                                ))
+                                .width(Length::Fixed(44.0))
+                                .height(Length::Fixed(44.0)),
+                                column![
+                                    row![
+                                        podcast_badge,
+                                        text(truncate_nav_label(&show.title, 52))
+                                            .size(14.0)
+                                            .color(palette::INK_PRIMARY),
+                                    ]
+                                    .spacing(8)
+                                    .align_y(Alignment::Center),
+                                    text(truncate_nav_label(
+                                        &format!(
+                                            "{} · {} · {} eps",
+                                            show.publisher, show.category, show.episode_count
+                                        ),
+                                        72
+                                    ))
+                                    .size(11.5)
+                                    .color(palette::INK_SECONDARY),
+                                ]
+                                .spacing(3)
+                                .width(Length::Fill),
+                                text("Episodes ›").size(11.5).color(palette::PODCAST_ACCENT),
+                            ]
+                            .spacing(12)
+                            .align_y(Alignment::Center),
+                        )
+                        .on_press(Message::OpenShow(show.spotify_uri.clone()))
+                        .width(Length::Fill)
+                        .padding(Padding::from([7, 10]))
+                        .style(theme::subtle_row_button(false)),
+                        button(text("▶").size(12.0).color(palette::EMERALD))
+                            .on_press(Message::PlayShow(show.spotify_uri.clone()))
+                            .padding(Padding::from([8, 10]))
+                            .style(theme::subtle_row_button(false)),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+
+                    podcasts_list = podcasts_list.push(show_item);
+                }
+
+                for ep in &self.search_episodes {
+                    let is_current = ep.spotify_uri == self.state.current_track.spotify_uri;
+                    let ep_badge =
+                        container(text("EPISODE").size(9.5).color(palette::PODCAST_ACCENT))
+                            .padding(Padding::from([2, 7]))
+                            .style(|_| container::Style {
+                                background: Some(iced::Background::Color(
+                                    palette::PODCAST_BADGE_BG,
+                                )),
+                                border: iced::Border {
+                                    radius: 5.0.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            });
+
+                    let ep_item = button(
+                        row![
+                            image(
+                                self.artwork
+                                    .thumb_or_url(ep.cover_art_url.as_deref(), ep.artwork_theme)
+                            )
+                            .width(Length::Fixed(44.0))
+                            .height(Length::Fixed(44.0)),
+                            column![
+                                row![
+                                    ep_badge,
+                                    text(truncate_nav_label(&ep.title, 52))
+                                        .size(14.0)
+                                        .color(palette::INK_PRIMARY),
+                                ]
+                                .spacing(8)
+                                .align_y(Alignment::Center),
+                                text(truncate_nav_label(
+                                    &format!("{} • {}", ep.show_title, ep.release_date),
+                                    72
+                                ))
+                                .size(11.5)
+                                .color(palette::INK_SECONDARY),
+                            ]
+                            .spacing(3)
+                            .width(Length::Fill),
+                            text(ep.formatted_duration())
+                                .size(12.0)
+                                .color(palette::INK_MUTED),
+                        ]
+                        .spacing(12)
+                        .align_y(Alignment::Center),
+                    )
+                    .on_press(Message::PlaySearchEpisode(ep.clone()))
+                    .width(Length::Fill)
+                    .padding(Padding::from([7, 10]))
+                    .style(theme::subtle_row_button(is_current));
+
+                    podcasts_list = podcasts_list.push(ep_item);
+                }
+
+                container(
+                    column![
+                        row![
+                            text("Podcasts")
+                                .font(SERIF_FONT)
+                                .size(19)
+                                .color(palette::INK_PRIMARY),
+                            horizontal_space(),
+                            text(format!("{podcast_total}"))
+                                .size(11.5)
+                                .color(palette::PODCAST_ACCENT),
+                        ]
+                        .align_y(Alignment::Center),
+                        self.elegant_scrollable(podcasts_list).height(Length::Fill),
+                    ]
+                    .spacing(7)
+                    .height(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::FillPortion(1))
+                .padding(Padding::from([10, 14]))
+                .style(theme::search_group_column_card)
+                .into()
+            };
+
+            Some(
+                column![artists_card, songs_card, podcasts_card]
+                    .spacing(10)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+            )
+        } else {
+            None
+        };
+
+        // 2. Recently Searched (only real clicked items) stacked vertically in 3 independently scrollable lists:
+        //    (1) Artists first, (2) Songs second, (3) Podcasts third, each with cover/portrait art.
+        let recents_block: Option<Element<'_, Message>> = if !has_live_search && has_recents {
             let recent_header = row![
                 text("Recently Searched")
                     .font(SERIF_FONT)
-                    .size(20)
+                    .size(21)
                     .color(palette::INK_PRIMARY),
                 horizontal_space(),
                 button(text("Clear All").size(11.5).color(palette::INK_MUTED))
@@ -3158,386 +4258,216 @@ impl SpotApp {
             ]
             .align_y(Alignment::Center);
 
-            let mut chips_grid = column![].spacing(7);
-            let indexed_recent: Vec<(usize, &RecentSearchEntry)> = self
-                .recent_searches
-                .entries()
-                .iter()
-                .enumerate()
-                .take(6)
-                .collect();
-            for chunk in indexed_recent.chunks(3) {
-                let mut r = row![].spacing(8);
-                for (idx, entry) in chunk {
-                    let badge_color = match entry.kind {
-                        RecentSearchKind::Artist { .. }
-                        | RecentSearchKind::Album { .. }
-                        | RecentSearchKind::Show { .. } => palette::EMERALD,
-                        _ => palette::INK_MUTED,
-                    };
-                    let chip = container(
-                        row![
-                            button(
-                                column![
-                                    text(entry.kind.badge_label())
-                                        .size(9.5)
-                                        .color(badge_color),
-                                    text(truncate_nav_label(&entry.label, 22))
-                                        .size(13.0)
-                                        .color(palette::INK_PRIMARY),
-                                ]
-                                .spacing(1)
-                                .width(Length::Fill),
-                            )
-                            .on_press(Message::SelectRecentSearch(*idx))
-                            .width(Length::Fill)
-                            .padding(Padding::from([6, 9]))
-                            .style(theme::subtle_row_button(false)),
-                            button(text("×").size(13.5).color(palette::INK_MUTED))
-                                .on_press(Message::RemoveRecentSearch(*idx))
-                                .padding(Padding::from([5, 8]))
-                                .style(theme::subtle_row_button(false)),
-                        ]
-                        .spacing(2)
-                        .align_y(Alignment::Center),
-                    )
-                    .width(Length::FillPortion(1))
-                    .style(theme::recent_search_chip_card);
+            let recent_artists = self.recent_searches.artist_entries_indexed();
+            let recent_songs = self.recent_searches.song_entries_indexed();
+            let recent_podcasts = self.recent_searches.podcast_entries_indexed();
 
-                    r = r.push(chip);
-                }
-                for _ in chunk.len()..3 {
-                    r = r.push(horizontal_space().width(Length::FillPortion(1)));
-                }
-                chips_grid = chips_grid.push(r);
-            }
-
-            content_col = content_col.push(column![recent_header, chips_grid].spacing(7));
-        }
-
-        // 1. Artists section
-        if !self.search_artists.is_empty() {
-            let mut artists_grid = column![].spacing(8);
-            for pair in self.search_artists.chunks(2).take(3) {
-                let mut r = row![].spacing(10);
-                for artist in pair {
-                    let portrait = image(
-                        self.artwork
-                            .thumb_or_url(artist.portrait_url.as_deref(), artist.artwork_theme),
-                    )
-                    .width(Length::Fixed(52.0))
-                    .height(Length::Fixed(52.0));
-
-                    let artist_card = button(
-                        row![
-                            portrait,
-                            column![
-                                text(&artist.name)
-                                    .font(SERIF_FONT)
-                                    .size(18)
-                                    .color(palette::INK_PRIMARY),
-                                text(artist.subtitle())
-                                    .size(11.5)
-                                    .color(palette::INK_SECONDARY),
-                            ]
-                            .spacing(2)
-                            .width(Length::Fill),
-                            text("Albums ›").size(12).color(palette::INK_MUTED),
-                        ]
-                        .spacing(12)
-                        .align_y(Alignment::Center),
-                    )
-                    .on_press(Message::OpenArtist(artist.spotify_uri.clone()))
-                    .width(Length::FillPortion(1))
-                    .padding(Padding::from([8, 10]))
-                    .style(theme::subtle_row_button(false));
-
-                    r = r.push(artist_card);
-                }
-                if pair.len() == 1 {
-                    r = r.push(horizontal_space().width(Length::FillPortion(1)));
-                }
-                artists_grid = artists_grid.push(r);
-            }
-
-            content_col = content_col.push(
-                column![
-                    text("Artists")
-                        .font(SERIF_FONT)
-                        .size(22)
-                        .color(palette::INK_PRIMARY),
-                    artists_grid,
-                ]
-                .spacing(8),
-            );
-        }
-
-        // 2. Albums section
-        if !self.search_albums.is_empty() {
-            let mut albums_grid = column![].spacing(8);
-            for pair in self.search_albums.chunks(2).take(3) {
-                let mut r = row![].spacing(10);
-                for alb in pair {
-                    let cover = image(
-                        self.artwork
-                            .thumb_or_url(alb.cover_art_url.as_deref(), alb.artwork_theme),
-                    )
-                    .width(Length::Fixed(52.0))
-                    .height(Length::Fixed(52.0));
-
-                    let alb_card = row![
-                        button(
-                            row![
-                                cover,
-                                column![
-                                    text(&alb.title).size(14).color(palette::INK_PRIMARY),
-                                    text(format!(
-                                        "{} · {} · {}",
-                                        alb.artist_name, alb.release_year, alb.album_type
-                                    ))
-                                    .size(11.5)
-                                    .color(palette::INK_SECONDARY),
-                                ]
-                                .spacing(2)
-                                .width(Length::Fill),
-                                text("Tracks ›").size(11.5).color(palette::INK_MUTED),
-                            ]
-                            .spacing(12)
-                            .align_y(Alignment::Center),
-                        )
-                        .on_press(Message::OpenAlbum(alb.spotify_uri.clone()))
-                        .width(Length::Fill)
-                        .padding(Padding::from([8, 10]))
-                        .style(theme::subtle_row_button(false)),
-                        button(text("▶").size(12).color(palette::EMERALD))
-                            .on_press(Message::PlayAlbum(alb.spotify_uri.clone()))
-                            .padding(Padding::from([10, 10]))
-                            .style(theme::subtle_row_button(false)),
+            // Recent List 1: Artists (top, scrollable)
+            let recent_artists_card: Element<'_, Message> = if recent_artists.is_empty() {
+                container(
+                    row![
+                        text("Artists")
+                            .font(SERIF_FONT)
+                            .size(18)
+                            .color(palette::INK_PRIMARY),
+                        text("Click an artist in search to save it here.")
+                            .size(12.0)
+                            .color(palette::INK_MUTED),
+                        horizontal_space(),
+                        text("0").size(11.5).color(palette::INK_MUTED),
                     ]
-                    .spacing(4)
-                    .align_y(Alignment::Center)
-                    .width(Length::FillPortion(1));
-
-                    r = r.push(alb_card);
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .height(Length::Shrink)
+                .padding(Padding::from([8, 14]))
+                .style(theme::search_group_column_card)
+                .into()
+            } else {
+                let mut recent_artists_col = column![].spacing(6);
+                for (idx, entry) in &recent_artists {
+                    recent_artists_col =
+                        recent_artists_col.push(self.view_recent_search_entry_card(*idx, entry));
                 }
-                if pair.len() == 1 {
-                    r = r.push(horizontal_space().width(Length::FillPortion(1)));
-                }
-                albums_grid = albums_grid.push(r);
-            }
-
-            content_col = content_col.push(
-                column![
-                    text("Albums")
-                        .font(SERIF_FONT)
-                        .size(22)
-                        .color(palette::INK_PRIMARY),
-                    albums_grid,
-                ]
-                .spacing(8),
-            );
-        }
-
-        // 2b. Podcasts section
-        if !self.search_shows.is_empty() {
-            let mut shows_grid = column![].spacing(8);
-            for pair in self.search_shows.chunks(2).take(3) {
-                let mut r = row![].spacing(10);
-                for show in pair {
-                    let cover = image(
-                        self.artwork
-                            .thumb_or_url(show.cover_art_url.as_deref(), show.artwork_theme),
-                    )
-                    .width(Length::Fixed(52.0))
-                    .height(Length::Fixed(52.0));
-
-                    let show_card = row![
-                        button(
-                            row![
-                                cover,
-                                column![
-                                    text(&show.title).size(14).color(palette::INK_PRIMARY),
-                                    text(format!(
-                                        "{} · {} · {} eps",
-                                        show.publisher, show.category, show.episode_count
-                                    ))
-                                    .size(11.5)
-                                    .color(palette::INK_SECONDARY),
-                                ]
-                                .spacing(2)
-                                .width(Length::Fill),
-                                text("Episodes ›").size(11.5).color(palette::INK_MUTED),
-                            ]
-                            .spacing(12)
-                            .align_y(Alignment::Center),
-                        )
-                        .on_press(Message::OpenShow(show.spotify_uri.clone()))
-                        .width(Length::Fill)
-                        .padding(Padding::from([8, 10]))
-                        .style(theme::subtle_row_button(false)),
-                        button(text("▶").size(12).color(palette::EMERALD))
-                            .on_press(Message::PlayShow(show.spotify_uri.clone()))
-                            .padding(Padding::from([10, 10]))
-                            .style(theme::subtle_row_button(false)),
+                container(
+                    column![
+                        row![
+                            text("Artists")
+                                .font(SERIF_FONT)
+                                .size(19)
+                                .color(palette::INK_PRIMARY),
+                            horizontal_space(),
+                            text(format!("{}", recent_artists.len()))
+                                .size(11.5)
+                                .color(palette::EMERALD),
+                        ]
+                        .align_y(Alignment::Center),
+                        self.elegant_scrollable(recent_artists_col)
+                            .height(Length::Fill),
                     ]
-                    .spacing(4)
-                    .align_y(Alignment::Center)
-                    .width(Length::FillPortion(1));
+                    .spacing(7)
+                    .height(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::FillPortion(1))
+                .padding(Padding::from([10, 14]))
+                .style(theme::search_group_column_card)
+                .into()
+            };
 
-                    r = r.push(show_card);
+            // Recent List 2: Songs (second, scrollable)
+            let recent_songs_card: Element<'_, Message> = if recent_songs.is_empty() {
+                container(
+                    row![
+                        text("Songs")
+                            .font(SERIF_FONT)
+                            .size(18)
+                            .color(palette::INK_PRIMARY),
+                        text("Click a song in search to save it here.")
+                            .size(12.0)
+                            .color(palette::INK_MUTED),
+                        horizontal_space(),
+                        text("0").size(11.5).color(palette::INK_MUTED),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .height(Length::Shrink)
+                .padding(Padding::from([8, 14]))
+                .style(theme::search_group_column_card)
+                .into()
+            } else {
+                let mut recent_songs_col = column![].spacing(6);
+                for (idx, entry) in &recent_songs {
+                    recent_songs_col =
+                        recent_songs_col.push(self.view_recent_search_entry_card(*idx, entry));
                 }
-                if pair.len() == 1 {
-                    r = r.push(horizontal_space().width(Length::FillPortion(1)));
+                container(
+                    column![
+                        row![
+                            text("Songs")
+                                .font(SERIF_FONT)
+                                .size(19)
+                                .color(palette::INK_PRIMARY),
+                            horizontal_space(),
+                            text(format!("{}", recent_songs.len()))
+                                .size(11.5)
+                                .color(palette::SONG_ACCENT),
+                        ]
+                        .align_y(Alignment::Center),
+                        self.elegant_scrollable(recent_songs_col)
+                            .height(Length::Fill),
+                    ]
+                    .spacing(7)
+                    .height(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::FillPortion(1))
+                .padding(Padding::from([10, 14]))
+                .style(theme::search_group_column_card)
+                .into()
+            };
+
+            // Recent List 3: Podcasts (third, scrollable)
+            let recent_podcasts_card: Element<'_, Message> = if recent_podcasts.is_empty() {
+                container(
+                    row![
+                        text("Podcasts")
+                            .font(SERIF_FONT)
+                            .size(18)
+                            .color(palette::INK_PRIMARY),
+                        text("Click a podcast in search to save it here.")
+                            .size(12.0)
+                            .color(palette::INK_MUTED),
+                        horizontal_space(),
+                        text("0").size(11.5).color(palette::INK_MUTED),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .height(Length::Shrink)
+                .padding(Padding::from([8, 14]))
+                .style(theme::search_group_column_card)
+                .into()
+            } else {
+                let mut recent_podcasts_col = column![].spacing(6);
+                for (idx, entry) in &recent_podcasts {
+                    recent_podcasts_col =
+                        recent_podcasts_col.push(self.view_recent_search_entry_card(*idx, entry));
                 }
-                shows_grid = shows_grid.push(r);
-            }
-
-            content_col = content_col.push(
-                column![
-                    text("Podcasts")
-                        .font(SERIF_FONT)
-                        .size(22)
-                        .color(palette::INK_PRIMARY),
-                    shows_grid,
-                ]
-                .spacing(8),
-            );
-        }
-
-        // 2c. Podcast Episodes section
-        if !self.search_episodes.is_empty() {
-            let mut episodes_col = column![].spacing(6);
-            for ep in &self.search_episodes {
-                let is_current = ep.spotify_uri == self.state.current_track.spotify_uri;
-                let row_item = row![
-                    button(
+                container(
+                    column![
                         row![
-                            image(
-                                self.artwork
-                                    .thumb_or_url(ep.cover_art_url.as_deref(), ep.artwork_theme)
-                            )
-                            .width(Length::Fixed(44.0))
-                            .height(Length::Fixed(44.0)),
-                            column![
-                                text(&ep.title).size(14.0).color(palette::INK_PRIMARY),
-                                text(format!(
-                                    "{} • {} • {}",
-                                    ep.show_title,
-                                    ep.release_date,
-                                    ep.formatted_duration()
-                                ))
-                                .size(12.0)
-                                .color(palette::INK_SECONDARY),
-                            ]
-                            .spacing(2)
-                            .width(Length::Fill),
-                            text("▶ Episode").size(11.5).color(palette::EMERALD),
+                            text("Podcasts")
+                                .font(SERIF_FONT)
+                                .size(19)
+                                .color(palette::INK_PRIMARY),
+                            horizontal_space(),
+                            text(format!("{}", recent_podcasts.len()))
+                                .size(11.5)
+                                .color(palette::PODCAST_ACCENT),
                         ]
-                        .spacing(12)
                         .align_y(Alignment::Center),
-                    )
-                    .on_press(Message::PlaySearchEpisode(ep.clone()))
-                    .width(Length::Fill)
-                    .padding(Padding::from([7, 10]))
-                    .style(theme::subtle_row_button(is_current)),
-                    button(text("Show ›").size(11.5).color(palette::INK_SECONDARY))
-                        .on_press(Message::OpenShow(ep.show_uri.clone()))
-                        .padding(Padding::from([8, 10]))
-                        .style(theme::subtle_row_button(false)),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center);
+                        self.elegant_scrollable(recent_podcasts_col)
+                            .height(Length::Fill),
+                    ]
+                    .spacing(7)
+                    .height(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::FillPortion(1))
+                .padding(Padding::from([10, 14]))
+                .style(theme::search_group_column_card)
+                .into()
+            };
 
-                episodes_col = episodes_col.push(row_item);
-            }
-
-            content_col = content_col.push(
+            Some(
                 column![
-                    text("Podcast Episodes")
-                        .font(SERIF_FONT)
-                        .size(22)
-                        .color(palette::INK_PRIMARY),
-                    episodes_col,
-                ]
-                .spacing(8),
-            );
-        }
-
-        // 3. Tracks section
-        if !self.search_results.is_empty() {
-            let mut tracks_col = column![].spacing(6);
-            for track in &self.search_results {
-                let is_current = track.id == self.state.current_track.id;
-                let row_item = row![
-                    button(
-                        row![
-                            image(
-                                self.artwork.thumb_or_url(
-                                    track.cover_art_url.as_deref(),
-                                    track.artwork_theme
-                                )
-                            )
-                            .width(Length::Fixed(44.0))
-                            .height(Length::Fixed(44.0)),
-                            column![
-                                text(&track.title).size(14.5).color(palette::INK_PRIMARY),
-                                text(format!("{} • {}", track.artist, track.album))
-                                    .size(12.5)
-                                    .color(palette::INK_SECONDARY),
-                            ]
-                            .spacing(2)
-                            .width(Length::Fill),
-                            text(track.formatted_duration())
-                                .size(12.5)
-                                .color(palette::INK_MUTED),
-                        ]
-                        .spacing(12)
-                        .align_y(Alignment::Center),
-                    )
-                    .on_press(Message::PlaySpecificTrack(track.clone()))
+                    recent_header,
+                    column![
+                        recent_artists_card,
+                        recent_songs_card,
+                        recent_podcasts_card
+                    ]
+                    .spacing(10)
                     .width(Length::Fill)
-                    .padding(Padding::from([7, 10]))
-                    .style(theme::subtle_row_button(is_current)),
-                    button(text("Artist ›").size(11.5).color(palette::INK_SECONDARY))
-                        .on_press(Message::OpenArtist(track.artist.clone()))
-                        .padding(Padding::from([8, 10]))
-                        .style(theme::subtle_row_button(false)),
+                    .height(Length::Fill),
                 ]
-                .spacing(6)
-                .align_y(Alignment::Center);
-
-                tracks_col = tracks_col.push(row_item);
-            }
-
-            content_col = content_col.push(
-                column![
-                    text("Tracks")
-                        .font(SERIF_FONT)
-                        .size(22)
-                        .color(palette::INK_PRIMARY),
-                    tracks_col,
-                ]
-                .spacing(8),
-            );
-        } else if self.search_query.trim().is_empty()
-            && self.recent_searches.is_empty()
-            && self.search_shows.is_empty()
-            && self.search_episodes.is_empty()
-        {
-            content_col = content_col.push(
-                text("Search above for artists, albums, podcasts, and tracks on Spotify.")
-                    .size(13.5)
-                    .color(palette::INK_MUTED),
-            );
-        }
+                .spacing(8)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            )
+        } else {
+            None
+        };
 
         let mut top_col = column![vertical_space().height(Length::Fixed(10.0)), header,].spacing(12);
         if let Some(banner) = self.view_spotify_auth_banner() {
             top_col = top_col.push(banner);
         }
+        top_col = top_col.push(search_bar_row);
+
+        if let Some(live_block) = live_results_block {
+            top_col = top_col.push(live_block);
+        }
+        if let Some(recents) = recents_block {
+            top_col = top_col.push(recents);
+        }
+        if !has_live_search && !has_recents {
+            top_col = top_col.push(
+                text("Search above for artists, songs, and podcasts on Spotify.")
+                    .size(13.5)
+                    .color(palette::INK_MUTED),
+            );
+        }
+
         top_col = top_col
-            .push(search_bar_row)
-            .push(scrollable(content_col).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
             .padding(Padding::from([20, 34]));
 
         container(top_col)
@@ -3661,7 +4591,7 @@ impl SpotApp {
             top_col = top_col.push(banner);
         }
         top_col = top_col
-            .push(scrollable(grid_col).height(Length::Fill))
+            .push(self.elegant_scrollable(grid_col).height(Length::Fill))
             .padding(Padding::from([20, 34]));
 
         container(top_col)
@@ -3881,7 +4811,7 @@ impl SpotApp {
             column![
                 vertical_space().height(Length::Fixed(10.0)),
                 self.view_navigation_bar(),
-                scrollable(stage_col).height(Length::Fill),
+                self.elegant_scrollable(stage_col).height(Length::Fill),
             ]
             .spacing(14)
             .padding(Padding::from([20, 34])),
@@ -4178,7 +5108,7 @@ impl SpotApp {
             .push(horizontal_rule(1))
             .push(albums_section);
 
-        let body_scroll = scrollable(stage_col).height(Length::Fill);
+        let body_scroll = self.elegant_scrollable(stage_col).height(Length::Fill);
 
         container(
             column![
@@ -4310,20 +5240,45 @@ impl SpotApp {
         .spacing(6);
 
         for (idx, track) in detail.tracks.iter().enumerate() {
-            let is_current = track.id == self.state.current_track.id;
+            let is_current = track.id == self.state.current_track.id
+                || (!track.spotify_uri.is_empty()
+                    && track.spotify_uri == self.state.current_track.spotify_uri)
+                || (track
+                    .title
+                    .eq_ignore_ascii_case(&self.state.current_track.title)
+                    && detail
+                        .album
+                        .title
+                        .eq_ignore_ascii_case(&self.state.current_track.album));
+            let leading: Element<'_, Message> = if is_current {
+                svg(icons::active_bars())
+                    .width(Length::Fixed(18.0))
+                    .height(Length::Fixed(18.0))
+                    .into()
+            } else {
+                text(format!("{:02}", idx + 1))
+                    .size(12)
+                    .color(palette::INK_MUTED)
+                    .width(Length::Fixed(24.0))
+                    .into()
+            };
             let track_row = row![
                 button(
                     row![
-                        text(format!("{:02}", idx + 1))
-                            .size(12)
-                            .color(palette::INK_MUTED)
-                            .width(Length::Fixed(24.0)),
+                        leading,
                         column![
                             text(&track.title).size(14.5).color(palette::INK_PRIMARY),
                             text(&track.artist).size(12.0).color(palette::INK_SECONDARY),
                         ]
                         .spacing(2)
                         .width(Length::Fill),
+                        text(if is_current && self.state.is_playing {
+                            "Playing"
+                        } else {
+                            ""
+                        })
+                        .size(11.5)
+                        .color(palette::EMERALD),
                         text(track.formatted_duration())
                             .size(12.5)
                             .color(palette::INK_MUTED),
@@ -4359,7 +5314,7 @@ impl SpotApp {
             column![
                 vertical_space().height(Length::Fixed(10.0)),
                 self.view_navigation_bar(),
-                scrollable(stage_col).height(Length::Fill),
+                self.elegant_scrollable(stage_col).height(Length::Fill),
             ]
             .spacing(14)
             .padding(Padding::from([20, 34])),
@@ -4637,7 +5592,7 @@ impl SpotApp {
             top_col = top_col.push(banner);
         }
         top_col = top_col
-            .push(scrollable(library_body).height(Length::Fill))
+            .push(self.elegant_scrollable(library_body).height(Length::Fill))
             .padding(Padding::from([20, 34]));
 
         container(top_col)
@@ -4788,7 +5743,7 @@ impl SpotApp {
                 bottom: 8.0,
                 left: 22.0,
             }),
-            scrollable(list).height(Length::Fill),
+            self.elegant_scrollable(list).height(Length::Fill),
         ]
         .spacing(10)
         .padding(Padding {
@@ -4832,14 +5787,19 @@ fn recent_searches_file_path() -> PathBuf {
 
 fn load_recent_searches() -> RecentSearchStore {
     if cfg!(test) {
-        return RecentSearchStore::new(10);
+        return RecentSearchStore::new(30);
     }
     let path = recent_searches_file_path();
     let Ok(bytes) = std::fs::read(&path) else {
-        return RecentSearchStore::new(10);
+        return RecentSearchStore::new(30);
     };
     let raw = serde_json::from_slice::<Vec<RecentSearchEntry>>(&bytes).unwrap_or_default();
-    RecentSearchStore::from_loaded(raw, 10)
+    let raw_len = raw.len();
+    let store = RecentSearchStore::from_loaded(raw, 30);
+    if store.len() != raw_len {
+        save_recent_searches(store.entries());
+    }
+    store
 }
 
 fn save_recent_searches(entries: &[RecentSearchEntry]) {
@@ -4912,23 +5872,25 @@ mod tests {
 
     #[test]
     fn recent_query_coalesces_incremental_typing_and_deduplicates() {
-        let mut recent = RecentSearchStore::new(10);
-        assert!(recent.record_typing_query("ma"));
-        assert!(recent.record_typing_query("mast"));
-        assert!(recent.record_typing_query("mastodon"));
-        assert_eq!(recent.len(), 1);
-        assert_eq!(recent.entries()[0].label, "mastodon");
+        let mut recent = RecentSearchStore::new(30);
+        // Raw search strings must never be recorded in recent_searches (INV-R4)
+        assert!(!recent.record_typing_query("ma"));
+        assert!(!recent.record_typing_query("mast"));
+        assert!(!recent.record_typing_query("mastodon"));
+        assert_eq!(recent.len(), 0);
         recent.assert_invariants();
 
-        recent.record_entry(RecentSearchEntry {
-            label: "Mastodon".into(),
-            subtitle: "Progressive Metal".into(),
-            query: "mastodon".into(),
-            kind: RecentSearchKind::Artist {
-                uri: "spotify:artist:1DvfQQ39HxvCJ3GvfeIFuT".into(),
-            },
-        });
-        assert_eq!(recent.len(), 2);
+        // Only real clicked items (Artist, Song, Podcast) are recorded and partitioned into 3 lists
+        recent.record_entry(RecentSearchEntry::from_artist(
+            "Mastodon",
+            "spotify:artist:1DvfQQ39HxvCJ3GvfeIFuT",
+            Some("https://i.scdn.co/image/mastodon".into()),
+            spot_core::ArtworkTheme::SunriseMountainLake,
+        ));
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent.artist_entries_indexed().len(), 1);
+        assert_eq!(recent.song_entries_indexed().len(), 0);
+        assert_eq!(recent.podcast_entries_indexed().len(), 0);
         assert!(matches!(
             recent.entries()[0].kind,
             RecentSearchKind::Artist { .. }
@@ -5464,5 +6426,149 @@ mod tests {
         ));
         app.assert_invariants();
         let _ = app.view();
+    }
+
+    #[test]
+    fn song_search_navigates_to_song_on_album_plays_next_song_and_denotes_song_vs_artist_in_history()
+    {
+        use spot_core::{AlbumDetail, AlbumSummary, ArtistSummary, ArtworkTheme};
+        let (mut app, _) = SpotApp::new();
+
+        // 1. Go to Search and populate search results with Artist + Album + Songs
+        let _ = app.update(Message::SelectNav(NavSection::Search));
+        let song_1 = Track {
+            id: "ir-1".into(),
+            spotify_uri: "spotify:track:ir1".into(),
+            title: "15 Step".into(),
+            artist: "Radiohead".into(),
+            album: "In Rainbows".into(),
+            duration_secs: 237,
+            liked: false,
+            cover_art_url: None,
+            artwork_theme: ArtworkTheme::SunriseMountainLake,
+        };
+        let song_2 = Track {
+            id: "ir-2".into(),
+            spotify_uri: "spotify:track:ir2".into(),
+            title: "Bodysnatchers".into(),
+            artist: "Radiohead".into(),
+            album: "In Rainbows".into(),
+            duration_secs: 242,
+            liked: false,
+            cover_art_url: None,
+            artwork_theme: ArtworkTheme::SunriseMountainLake,
+        };
+        let song_3 = Track {
+            id: "ir-3".into(),
+            spotify_uri: "spotify:track:ir3".into(),
+            title: "Nude".into(),
+            artist: "Radiohead".into(),
+            album: "In Rainbows".into(),
+            duration_secs: 255,
+            liked: false,
+            cover_art_url: None,
+            artwork_theme: ArtworkTheme::SunriseMountainLake,
+        };
+
+        let in_rainbows_summary = AlbumSummary {
+            id: "in_rainbows".into(),
+            spotify_uri: "spotify:album:in_rainbows".into(),
+            title: "In Rainbows".into(),
+            artist_name: "Radiohead".into(),
+            release_year: "2007".into(),
+            album_type: "Album".into(),
+            track_count: 3,
+            cover_art_url: None,
+            artwork_theme: ArtworkTheme::SunriseMountainLake,
+        };
+
+        app.apply_engine_event(EngineEvent::SearchResults {
+            query: "bodysnatchers".into(),
+            artists: vec![ArtistSummary {
+                id: "radiohead".into(),
+                spotify_uri: "spotify:artist:radiohead".into(),
+                name: "Radiohead".into(),
+                genres: vec!["Art Rock".into()],
+                followers: Some(9_500_000),
+                portrait_url: None,
+                artwork_theme: ArtworkTheme::SunriseMountainLake,
+            }],
+            albums: vec![in_rainbows_summary.clone()],
+            shows: Vec::new(),
+            episodes: Vec::new(),
+            tracks: vec![song_2.clone(), song_1.clone(), song_3.clone()],
+        });
+        let _ = app.view();
+        app.assert_invariants();
+
+        // 2. Click Artist in Search to record an Artist in Search History, then go back to Search
+        let _ = app.update(Message::OpenArtist("spotify:artist:radiohead".into()));
+        assert_eq!(app.recent_searches.entries()[0].kind.badge_label(), "ARTIST");
+        assert_eq!(
+            app.recent_searches.entries()[0].kind.display_badge(),
+            "★ ARTIST"
+        );
+        assert!(app.recent_searches.entries()[0].kind.is_artist());
+        let _ = app.update(Message::SelectNav(NavSection::Search));
+
+        // 3. Click Song 2 ("Bodysnatchers") in Search
+        let _ = app.update(Message::PlaySpecificTrack(song_2.clone()));
+        app.assert_invariants();
+
+        // Verify Search History recorded the Song distinctly from the Artist
+        assert_eq!(app.recent_searches.entries()[0].label, "Bodysnatchers");
+        assert_eq!(app.recent_searches.entries()[0].kind.badge_label(), "SONG");
+        assert_eq!(
+            app.recent_searches.entries()[0].kind.display_badge(),
+            "▶ SONG"
+        );
+        assert!(app.recent_searches.entries()[0].kind.is_song());
+        assert_eq!(
+            app.recent_searches.entries()[0].subtitle,
+            "Song · Radiohead · In Rainbows"
+        );
+        assert_eq!(app.recent_searches.artist_entries_indexed().len(), 1);
+        assert_eq!(app.recent_searches.song_entries_indexed().len(), 1);
+        assert_eq!(app.recent_searches.podcast_entries_indexed().len(), 0);
+
+        // Verify navigation stack has Album("In Rainbows") directly beneath NowPlaying
+        assert!(matches!(
+            app.current_route(),
+            StageRoute::Section(NavSection::NowPlaying)
+        ));
+        assert!(matches!(
+            app.nav_history.previous_entry(),
+            Some(StageRoute::Album { label, .. }) if label == "In Rainbows"
+        ));
+
+        // 4. Simulate full AlbumDetailLoaded arriving for "In Rainbows"
+        app.apply_engine_event(EngineEvent::AlbumDetailLoaded(Box::new(AlbumDetail {
+            album: in_rainbows_summary,
+            artist_uri: Some("spotify:artist:radiohead".into()),
+            tracks: vec![song_1.clone(), song_2.clone(), song_3.clone()],
+        })));
+        app.assert_invariants();
+
+        // Active song is "Bodysnatchers" (track index 1 on "In Rainbows") and Up Next is "Nude" (track index 2)
+        assert_eq!(app.state.current_track.title, "Bodysnatchers");
+        assert!(app.state.is_playing);
+        assert_eq!(app.state.upcoming_tracks_in_context().len(), 1);
+        assert_eq!(app.state.upcoming_tracks_in_context()[0].title, "Nude");
+
+        // 5. Advancing to next track plays the next song in the album ("Nude")
+        let _ = app.update(Message::NextTrack);
+        assert_eq!(app.state.current_track.title, "Nude");
+        assert!(app.state.is_playing);
+        app.assert_invariants();
+
+        // 6. Navigate back to Search and click the Song in Search History -> takes us back to "Bodysnatchers" on "In Rainbows"
+        let _ = app.update(Message::SelectNav(NavSection::Search));
+        let _ = app.view();
+        let _ = app.update(Message::SelectRecentSearch(0));
+        assert_eq!(app.state.current_track.title, "Bodysnatchers");
+        assert_eq!(app.state.upcoming_tracks_in_context()[0].title, "Nude");
+        let _ = app. update(Message::NextTrack);
+        assert_eq!(app.state.current_track.title, "Nude");
+        app.assert_invariants();
     }
 }

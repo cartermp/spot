@@ -696,21 +696,44 @@ async fn handle_command(
 
         PlayerCommand::PlayTrack(track) => {
             info!(
-                "[Engine] Command: PlayTrack -> '{}' by '{}' (uri={}, cover={:?})",
-                track.title, track.artist, track.spotify_uri, track.cover_art_url
+                "[Engine] Command: PlayTrack -> '{}' by '{}' on album '{}' (uri={}, cover={:?})",
+                track.title, track.artist, track.album, track.spotify_uri, track.cover_art_url
             );
-            let was_in_active_context = matches!(
-                state.context,
-                PlaybackContext::Playlist { .. }
-                    | PlaybackContext::Album { .. }
-                    | PlaybackContext::PodcastShow { .. }
-            ) && state.queue.iter().any(|t| {
-                t.id == track.id
-                    || (!track.spotify_uri.is_empty() && t.spotify_uri == track.spotify_uri)
-            });
+            let was_in_same_album_context = match &state.context {
+                PlaybackContext::Album {
+                    artist_albums,
+                    current_album_index,
+                    ..
+                } => {
+                    let same_album = artist_albums
+                        .get(*current_album_index)
+                        .is_some_and(|alb| {
+                            track.album.trim().is_empty()
+                                || alb.album_title.eq_ignore_ascii_case(track.album.trim())
+                        });
+                    same_album
+                        && state.queue.len() > 1
+                        && state.queue.iter().any(|t| {
+                            t.id == track.id
+                                || (!track.spotify_uri.is_empty()
+                                    && t.spotify_uri == track.spotify_uri)
+                        })
+                }
+                PlaybackContext::PodcastShow { .. }
+                    if track.spotify_uri.starts_with("spotify:episode:") =>
+                {
+                    state.queue.iter().any(|t| {
+                        t.id == track.id
+                            || (!track.spotify_uri.is_empty()
+                                && t.spotify_uri == track.spotify_uri)
+                    })
+                }
+                _ => false,
+            };
 
             state.apply_verified_action(VerifiedTransportAction::PlayTrack(track.clone()));
             audio_gate.flush_and_set_playing(state.is_playing);
+            let initial_loaded_uri = state.current_track.spotify_uri.clone();
             if let Some(active_player) = player.as_ref() {
                 load_track_on_player(
                     active_player,
@@ -724,37 +747,32 @@ async fn handle_command(
             }
             let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
 
-            // When playing a track from Search or Top Tracks on a live session outside the
-            // current context, hydrate its parent album into `Up Next` and load the artist's
-            // discography so advancing moves through the album and then the artist's albums.
-            if !was_in_active_context
-                && live_session.is_some()
-                && !track.spotify_uri.starts_with("spotify:episode:")
-            {
+            // When playing a song from Search, Search History, or Top Tracks, resolve its parent
+            // album, emit `AlbumDetailLoaded`, and activate that album at the song's exact index
+            // so `Up Next` is the album's tracklist and the next song in the album plays next.
+            if !was_in_same_album_context && !track.spotify_uri.starts_with("spotify:episode:") {
                 if let Some(parent_album_uri) = web_client
                     .resolve_track_parent_album_uri(live_session.as_ref(), &track)
                     .await
                 {
-                    let detail = web_client
+                    ensure_fresh_web_token(web_client, live_session).await;
+                    let mut detail = web_client
                         .fetch_album_detail(live_session.as_ref(), &parent_album_uri)
                         .await;
-                    if !detail.tracks.is_empty() {
-                        let start_idx = detail
-                            .tracks
-                            .iter()
-                            .position(|t| {
-                                t.id == track.id
-                                    || (!track.spotify_uri.is_empty()
-                                        && t.spotify_uri == track.spotify_uri)
-                                    || t.title.eq_ignore_ascii_case(&track.title)
-                            })
-                            .unwrap_or(0);
-                        let active_album = AlbumPlaybackQueue {
-                            album_uri: detail.album.spotify_uri.clone(),
-                            album_title: detail.album.title.clone(),
-                            artist_name: detail.album.artist_name.clone(),
-                            tracks: detail.tracks.clone(),
-                        };
+                    if let Some((active_album, start_idx)) =
+                        spot_core::resolve_song_album_queue_verified(
+                            &detail.album.spotify_uri,
+                            &detail.album.title,
+                            &detail.album.artist_name,
+                            detail.tracks.clone(),
+                            &track,
+                        )
+                    {
+                        detail.tracks = active_album.tracks.clone();
+                        detail.album.track_count = detail.tracks.len();
+                        let _ =
+                            event_tx.send(EngineEvent::AlbumDetailLoaded(Box::new(detail.clone())));
+
                         state.apply_verified_action(VerifiedTransportAction::ActivateAlbum {
                             album: active_album.clone(),
                             artist_uri: detail.artist_uri.clone(),
@@ -762,29 +780,44 @@ async fn handle_command(
                             start_track_index: start_idx,
                             auto_play: true,
                         });
+                        if state.current_track.spotify_uri != initial_loaded_uri {
+                            if let Some(active_player) = player.as_ref() {
+                                load_track_on_player(
+                                    active_player,
+                                    live_session.as_ref(),
+                                    &state.current_track,
+                                    true,
+                                    0.0,
+                                    audio_gate,
+                                );
+                                *player_has_loaded_track = true;
+                            }
+                        }
                         let _ = event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
 
-                        let artist_lookup = detail
-                            .artist_uri
-                            .as_deref()
-                            .unwrap_or(&detail.album.artist_name);
-                        let discography = web_client
-                            .fetch_artist_discography_queues(
-                                live_session.as_ref(),
-                                artist_lookup,
-                                &active_album,
-                            )
-                            .await;
-                        if !discography.is_empty() {
-                            state.apply_verified_action(
-                                VerifiedTransportAction::SetArtistDiscography {
-                                    artist_name: detail.album.artist_name.clone(),
-                                    artist_uri: detail.artist_uri.clone(),
-                                    albums: discography,
-                                },
-                            );
-                            let _ =
-                                event_tx.send(EngineEvent::StateSynced(Box::new(state.clone())));
+                        if live_session.is_some() {
+                            let artist_lookup = detail
+                                .artist_uri
+                                .as_deref()
+                                .unwrap_or(&detail.album.artist_name);
+                            let discography = web_client
+                                .fetch_artist_discography_queues(
+                                    live_session.as_ref(),
+                                    artist_lookup,
+                                    &active_album,
+                                )
+                                .await;
+                            if !discography.is_empty() {
+                                state.apply_verified_action(
+                                    VerifiedTransportAction::SetArtistDiscography {
+                                        artist_name: detail.album.artist_name.clone(),
+                                        artist_uri: detail.artist_uri.clone(),
+                                        albums: discography,
+                                    },
+                                );
+                                let _ = event_tx
+                                    .send(EngineEvent::StateSynced(Box::new(state.clone())));
+                            }
                         }
                     }
                 }
@@ -1096,6 +1129,68 @@ async fn handle_command(
                 });
             });
             *search_abort_handle = Some(jh.abort_handle());
+        }
+
+        PlayerCommand::HydrateRecentArtwork(items) => {
+            if !items.is_empty() {
+                let client = web_client.clone();
+                let sess = live_session.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let mut hydrated: Vec<(String, String, String)> = Vec::new();
+                    for (badge, label, target_uri_or_query) in items {
+                        let resolved_url = match badge.as_str() {
+                            "ARTIST" => {
+                                let detail = client
+                                    .fetch_artist_detail(sess.as_ref(), &target_uri_or_query)
+                                    .await;
+                                detail.artist.portrait_url.or_else(|| {
+                                    detail.albums.iter().find_map(|a| a.cover_art_url.clone())
+                                })
+                            }
+                            "PODCAST" => {
+                                let detail = client
+                                    .fetch_show_detail(sess.as_ref(), &target_uri_or_query)
+                                    .await;
+                                detail.show.cover_art_url
+                            }
+                            "SONG" => {
+                                if target_uri_or_query.starts_with("spotify:album:") {
+                                    let detail = client
+                                        .fetch_album_detail(
+                                            sess.as_ref(),
+                                            &target_uri_or_query,
+                                        )
+                                        .await;
+                                    detail.album.cover_art_url
+                                } else {
+                                    let results = client
+                                        .search_catalog_with_session(sess.as_ref(), &label)
+                                        .await;
+                                    results
+                                        .tracks
+                                        .iter()
+                                        .find(|t| t.title.eq_ignore_ascii_case(&label))
+                                        .and_then(|t| t.cover_art_url.clone())
+                                        .or_else(|| {
+                                            results
+                                                .tracks
+                                                .first()
+                                                .and_then(|t| t.cover_art_url.clone())
+                                        })
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(url) = resolved_url {
+                            hydrated.push((badge, label, url));
+                        }
+                    }
+                    if !hydrated.is_empty() {
+                        let _ = tx.send(EngineEvent::RecentArtworkHydrated(hydrated));
+                    }
+                });
+            }
         }
 
         PlayerCommand::RefreshDevices => {

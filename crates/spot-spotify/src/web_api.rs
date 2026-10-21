@@ -750,7 +750,7 @@ impl SpotifyWebClient {
                     };
 
                     let track_uris: Vec<SpotifyUri> =
-                        meta_album.tracks().take(24).cloned().collect();
+                        meta_album.tracks().take(60).cloned().collect();
                     let mut set = tokio::task::JoinSet::new();
                     for (idx, t_uri) in track_uris.into_iter().enumerate() {
                         let s = sess.clone();
@@ -1420,6 +1420,11 @@ async fn search_via_spclient(session: &Session, query: &str) -> Option<CatalogSe
 
     let mut track_uris: Vec<SpotifyUri> = Vec::new();
     let mut episode_uris: Vec<SpotifyUri> = Vec::new();
+    if query.trim().starts_with("spotify:track:") {
+        if let Ok(uri) = SpotifyUri::from_uri(query.trim()) {
+            track_uris.push(uri);
+        }
+    }
     if let Some(ctx) = &ctx_opt {
         for page in &ctx.pages {
             for track in &page.tracks {
@@ -1427,7 +1432,7 @@ async fn search_via_spclient(session: &Session, query: &str) -> Option<CatalogSe
                     if let Ok(uri) = SpotifyUri::from_uri(uri_str) {
                         match &uri {
                             SpotifyUri::Track { .. } => {
-                                if !track_uris.contains(&uri) && track_uris.len() < 10 {
+                                if !track_uris.contains(&uri) && track_uris.len() < 12 {
                                     track_uris.push(uri);
                                 }
                             }
@@ -1441,7 +1446,7 @@ async fn search_via_spclient(session: &Session, query: &str) -> Option<CatalogSe
                     }
                 }
             }
-            if track_uris.len() >= 10 {
+            if track_uris.len() >= 12 {
                 break;
             }
         }
@@ -1515,7 +1520,7 @@ async fn search_via_spclient(session: &Session, query: &str) -> Option<CatalogSe
 
         // Collect unique albums directly from the track's embedded album metadata
         if let Ok(alb_uri_str) = meta_track.album.id.to_uri() {
-            if !albums.iter().any(|a| a.spotify_uri == alb_uri_str) && albums.len() < 8 {
+            if !albums.iter().any(|a| a.spotify_uri == alb_uri_str) && albums.len() < 12 {
                 let alb_id = alb_uri_str
                     .strip_prefix("spotify:album:")
                     .unwrap_or(&alb_uri_str)
@@ -1554,6 +1559,20 @@ async fn search_via_spclient(session: &Session, query: &str) -> Option<CatalogSe
             cover_url,
         ));
     }
+
+    // Prioritize songs whose title directly matches the query while preserving relative Spotify rank
+    tracks.sort_by_key(|t| {
+        let title_low = t.title.trim().to_ascii_lowercase();
+        if title_low == query_lower {
+            0_u8
+        } else if title_low.starts_with(&query_lower) {
+            1_u8
+        } else if title_low.contains(&query_lower) {
+            2_u8
+        } else {
+            3_u8
+        }
+    });
 
     // Prioritize artists whose name matches the search query
     unique_artist_uris.sort_by_key(|(_, _, matches)| !*matches);
